@@ -24,7 +24,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'hand_eye_calibration = hand_eye_calibration.node:main'
+            'hand_eye_calibration = hand_eye_calibration.node:main',
+            'hand_eye_calibration_publisher = hand_eye_calibration.publish_node:main',
         ],
     },
 )

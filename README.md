@@ -1,6 +1,24 @@
 # ROS2 hand-eye calibration
 This is a minimal ROS2 port of the functionality in the easy_handeye calibration package. The original README can be found below.
 
+## Python Dependencies Installation
+
+**⚠️ IMPORTANT:** This package requires specific Python package versions compatible with ROS2 Humble.
+
+See [INSTALL.md](INSTALL.md) for detailed installation instructions.
+
+**Quick install:**
+```bash
+pip3 install -r src/ros2_handeye_calibration/requirements.txt
+```
+
+Or install manually (all packages together):
+```bash
+pip3 install "numpy>=1.21.6,<1.28.0" "opencv-contrib-python>=4.5.0,<4.10.0" "scipy>=1.11.4" "transforms3d>=0.4.0"
+```
+
+**Why?** ROS2 Humble requires NumPy 1.x (not 2.x) for C API compatibility. Installing packages together prevents dependency conflicts.
+
 ## Usage
 **Launch file**
 ```bash
@@ -26,6 +44,24 @@ For each `Trigger` service call, the ROS node will query the TF tree. When the n
 
 **Note**: Ideally, you should collect at least 15 samples, and check for convergence of the calibration estimate.    
 **Note**: Please encure the robot is still when triggering each capture.
+
+**Saving calibration**
+Once you have enough samples and a stable estimate, save it to a YAML file:
+```bash
+ros2 service call /hand_eye_calibration/save_calibration std_srvs/srv/Trigger {}
+```
+By default the file is written to `~/.ros/hand_eye_calibration.yaml`. Override with the `calibration_file` launch argument when starting `calibration.launch.py`.
+
+**Publishing calibration as TF**
+To publish the saved calibration as a static transform (e.g. `camera_optical_frame` → `base_link` for eye-on-base), run the publisher:
+```bash
+ros2 launch hand_eye_calibration publish.launch.py
+```
+Launch arguments:
+- **calibration_file**: path to the YAML file (default: `~/.ros/hand_eye_calibration.yaml`)
+- **use_sim_time**: set to `true` when using Gazebo/sim time (default: `true`)
+
+You can include `publish.launch.py` in your own launch (e.g. Piper sim) so the calibration TF is available at startup.
 
 
 ------------------------------------------------

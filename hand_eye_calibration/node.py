@@ -3,6 +3,9 @@
 Collect poses and perform calibration
 """
 
+import os
+import yaml
+
 import rclpy
 
 from rclpy.node import Node
@@ -67,6 +70,7 @@ class DataCollector(Node):
         self.declare_parameter('robot_effector_frame', "")
         # options are eye-in-hand or eye-on-base
         self.declare_parameter('calibration_type', "eye-on-base")
+        self.declare_parameter('calibration_file', os.path.expanduser("~/.ros/hand_eye_calibration.yaml"))
 
         self.tracking_base_frame = str(self.get_parameter('tracking_base_frame').value)
         self.tracking_marker_frame = str(self.get_parameter('tracking_marker_frame').value)
@@ -76,9 +80,15 @@ class DataCollector(Node):
 
         self.capture_point_service_name = mname + "/capture_point"
         self.capture_point_service = self.create_service(
-            Trigger, 
-            self.capture_point_service_name, 
+            Trigger,
+            self.capture_point_service_name,
             self.capture_point_service_callback)
+
+        self.save_calibration_service_name = mname + "/save_calibration"
+        self.save_calibration_service = self.create_service(
+            Trigger,
+            self.save_calibration_service_name,
+            self.save_calibration_service_callback)
 
         # Transform listener.
         self.tf_buffer = Buffer()
@@ -111,6 +121,16 @@ class DataCollector(Node):
         except TransformException as ex:
             self.get_logger().error("Could not get transforms")
             self.get_logger().error(str(ex))
+            if self.tracking_marker_frame in str(ex) and "does not exist" in str(ex):
+                self.get_logger().error(
+                    f"Frame '{self.tracking_marker_frame}' not in TF. "
+                    "Ensure: 1) ArUco node is running (e.g. ros2 launch aruco_ros single.launch.py); "
+                    "2) Sim with camera_info_fix + image_fix, or _fixed topics; "
+                    "3) Marker visible to camera; 4) Wait for detection before capture_point."
+                )
+            resp.success = False
+            resp.message = str(ex)
+            return resp
 
         self.get_logger().info("robot: " + tf_to_string(robot))
         self.get_logger().info("tracking: " + tf_to_string(tracking))
@@ -122,7 +142,7 @@ class DataCollector(Node):
         if cal is None:
             msg = "Not enough samples yet..."
         else:
-            self.get_logger().info("Current estimate of: " + self.tracking_base_frame + " -> " + self.robot_base_frame)
+            self.get_logger().info("Current estimate of: " + self.tracking_base_frame + " -> " + self.robot_effector_frame)
             self.get_logger().info("transform: " + tf_list_to_string(cal))
             self.get_logger().info("as euler: " + urdf_list_to_string(tf_to_urdf_tf(cal)))
             msg = "Current estimate: " + tf_list_to_string(cal) + " as euler: " + urdf_list_to_string(tf_to_urdf_tf(cal))
@@ -136,9 +156,41 @@ class DataCollector(Node):
             return None
         else:
             self.get_logger().info("Estimating ...")
-            cal = CalibrationBackend.compute_calibration(samples_robot=self.robot_samples, 
+            cal = CalibrationBackend.compute_calibration(samples_robot=self.robot_samples,
                                                          samples_tracking=self.tracking_samples)
             return cal
+
+    def save_calibration_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
+        """Save current calibration estimate to YAML file for later publishing."""
+        cal = self.get_calibration()
+        if cal is None:
+            resp.success = False
+            resp.message = "Not enough samples (need at least 4). Capture more points first."
+            return resp
+        cal_file = os.path.expanduser(str(self.get_parameter('calibration_file').value))
+        try:
+            data = {
+                'calibration_type': self.calibration_type,
+                'tracking_base_frame': self.tracking_base_frame,
+                'tracking_marker_frame': self.tracking_marker_frame,
+                'robot_base_frame': self.robot_base_frame,
+                'robot_effector_frame': self.robot_effector_frame,
+                'transform': {
+                    'tx': cal[0], 'ty': cal[1], 'tz': cal[2],
+                    'qx': cal[3], 'qy': cal[4], 'qz': cal[5], 'qw': cal[6],
+                },
+            }
+            os.makedirs(os.path.dirname(os.path.abspath(cal_file)) or '.', exist_ok=True)
+            with open(cal_file, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False)
+            self.get_logger().info("Calibration saved to %s" % cal_file)
+            resp.success = True
+            resp.message = "Saved to " + cal_file
+        except Exception as e:
+            self.get_logger().error("Failed to save calibration: %s" % str(e))
+            resp.success = False
+            resp.message = str(e)
+        return resp
 
 
 def main():
@@ -149,8 +201,10 @@ def main():
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
