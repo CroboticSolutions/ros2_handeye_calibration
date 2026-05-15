@@ -98,25 +98,36 @@ class DataCollector(Node):
         self.tracking_samples = list()
 
     def capture_point_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
-        # get transforms 
-        time = self.get_clock().now() - Duration(seconds=1)
+        # Prefer slightly past time so TF buffer has data; avoid negative time when
+        # use_sim_time is true but /clock never publishes (clock stuck at zero).
+        now = self.get_clock().now()
+        if now.nanoseconds >= 1_000_000_000:
+            lookup_time = now - Duration(seconds=1)
+        else:
+            self.get_logger().warning(
+                'Clock near epoch (use_sim_time without /clock?). Using current time for TF lookup.'
+            )
+            lookup_time = now
 
         try:
             # here we trick the library (it is actually made for eye_in_hand only). Trust me, I'm an engineer
             if self.calibration_type == "eye-in-hand":
                 robot = self.tf_buffer.lookup_transform(self.robot_base_frame,
-                                                    self.robot_effector_frame, time,
+                                                    self.robot_effector_frame, lookup_time,
                                                     Duration(seconds=2))
             elif self.calibration_type == "eye-on-base":
                 robot = self.tf_buffer.lookup_transform(self.robot_effector_frame,
-                                                    self.robot_base_frame, time,
+                                                    self.robot_base_frame, lookup_time,
                                                     Duration(seconds=2))
             else:
                 msg = "Invalid calibration_type: " + self.calibration_type + ". Options are eye-in-hand or eye-on-base"
                 self.get_logger().error(msg)
+                resp.success = False
+                resp.message = msg
+                return resp
 
             tracking = self.tf_buffer.lookup_transform(self.tracking_base_frame,
-                                                    self.tracking_marker_frame, time,
+                                                    self.tracking_marker_frame, lookup_time,
                                                     Duration(seconds=2))
         except TransformException as ex:
             self.get_logger().error("Could not get transforms")

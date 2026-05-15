@@ -19,15 +19,15 @@ def generate_launch_description():
         name='hand_eye_calibration_publisher',
         output='screen',
         parameters=[
-            {'use_sim_time': launch.substitutions.LaunchConfiguration('use_sim_time', default='true')},
+            {'use_sim_time': launch.substitutions.LaunchConfiguration('use_sim_time', default='false')},
             {'calibration_file': launch.substitutions.LaunchConfiguration('calibration_file')},
         ],
     )
 
     use_sim_time = DeclareLaunchArgument(
         'use_sim_time',
-        default_value='true',
-        description='Use simulation time for TF',
+        default_value='false',
+        description='true when using Gazebo/sim with /clock; false for real hardware',
     )
 
     return LaunchDescription([

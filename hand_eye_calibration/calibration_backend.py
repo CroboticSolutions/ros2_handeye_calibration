@@ -65,6 +65,9 @@ class CalibrationBackend:
         hand_camera_rot, hand_camera_tr = cv2.calibrateHandEye(hand_world_rot, hand_world_tr, marker_camera_rot,
                                                                marker_camera_tr, method=method)
 
-        (hcqw, hcqx, hcqy, hcqz) = [float(i) for i in Rot.from_matrix(hand_camera_rot).as_quat()]
-        (hctx, hcty, hctz) = [float(i) for i in hand_camera_tr]
+        hand_camera_rot = np.asarray(hand_camera_rot, dtype=np.float64)
+        hand_camera_tr = np.asarray(hand_camera_tr, dtype=np.float64).reshape(-1)
+        # scipy Rotation.as_quat() is scalar-last: (qx, qy, qz, qw) — same as geometry_msgs / node samples
+        hcqx, hcqy, hcqz, hcqw = (float(x) for x in Rot.from_matrix(hand_camera_rot).as_quat())
+        (hctx, hcty, hctz) = (float(x) for x in hand_camera_tr)
         return [hctx, hcty, hctz, hcqx, hcqy, hcqz, hcqw]
