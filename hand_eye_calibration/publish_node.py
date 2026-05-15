@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 Load hand-eye calibration from YAML and publish it as a static TF.
+
+If the camera is already mounted in the Piper URDF (see
+`piper_description/urdf/include/piper_oak_d_sr_handeye_macros.xacro`), that model
+already expresses link6→oak_right_camera_optical_frame. Skip this publisher then
+to avoid duplicate static transforms.
 """
 
 import os

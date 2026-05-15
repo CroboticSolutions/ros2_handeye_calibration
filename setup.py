@@ -31,6 +31,7 @@ setup(
         'console_scripts': [
             'hand_eye_calibration = hand_eye_calibration.node:main',
             'hand_eye_calibration_publisher = hand_eye_calibration.publish_node:main',
+            'handeye_depthai_mount_args = hand_eye_calibration.depthai_mount_cli:main',
         ],
     },
 )

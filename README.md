@@ -59,9 +59,52 @@ ros2 launch hand_eye_calibration publish.launch.py
 ```
 Launch arguments:
 - **calibration_file**: path to the YAML file (default: `~/.ros/hand_eye_calibration.yaml`)
-- **use_sim_time**: set to `true` when using Gazebo/sim time (default: `true`)
+- **use_sim_time**: set to `true` when using Gazebo/sim time (default: `false` in `publish.launch.py`)
 
-You can include `publish.launch.py` in your own launch (e.g. Piper sim) so the calibration TF is available at startup.
+You can include `publish.launch.py` in your own launch (e.g. Piper sim or hardware drivers) **only when** camera frames come from YAML static TF (**Option B**), not when the calibrated mount is already in **`piper_description`** (**Option C**).
+
+### Piper + OAK-D-SR (eye-in-hand): where the calibration lives
+
+For **eye-in-hand**, the YAML stores the pose of `tracking_base_frame` (e.g. `oak_right_camera_optical_frame`) relative to `robot_effector_frame` (e.g. `link6`). You should expose that in TF in **one** of these ways:
+
+**Option A — Recommended (single TF publisher, no clash)**  
+Bake the hand-eye result into the depthai mount pose so `robot_state_publisher` still publishes the full camera chain under `depthai_descriptions`, but the mount from the robot flange matches calibration:
+
+1. After `colcon build` + `source install/setup.bash`, run:
+
+   ```bash
+   handeye_depthai_mount_args ~/.ros/hand_eye_calibration.yaml
+   ```
+
+2. Launch OAK with **`parent_frame:=link6`** (or whatever `robot_effector_frame` is in your YAML) and paste the printed **`cam_pos_*` / `cam_roll` / `cam_pitch` / `cam_yaw`** arguments (see `arm_api2` → `oak_depthai_sr_rgbd.launch.py`).
+
+   This keeps `oak_right_camera_frame` → `oak_right_camera_optical_frame` etc. consistent with `depthai_descriptions` while aligning the camera to the robot.
+
+   The helper assumes **OAK-D-SR** nominal geometry from `depthai_descriptions` and that calibration was taken with the usual setup (nominal depthai mount from parent link into `oak-d_frame`). If you used non-zero `cam_pos_*` during calibration, you must fold that old mount into the math manually.
+
+**Option C — Baked URDF (`piper_description`, sim + robot)**  
+`piper_description` includes **`piper_mount_oak_d_sr_handeye`** (see `piper_description/urdf/include/piper_oak_d_sr_handeye_macros.xacro`): a fixed joint **effector (`link6`) → `oak-d-base-frame`** with pose derived from **`~/.ros/hand_eye_calibration.yaml`**, then the nominal **`depthai_descriptions`** chain to `oak_right_camera_*`. Gazebo Harmonic (Gazebo Sim) models use **`oak_gazebo_rgbd_sensor=true`** so the `<gazebo reference="oak_right_camera_frame">` RGBD sensor appears; plain `piper_description.xacro` passes **`oak_gazebo_rgbd_sensor=false`** so no Sim sensor leaks into Classic Gazebo / hardware uploads.
+
+Do **not** run `publish.launch.py` alongside Option C—the same **`link6` → `oak_right_camera_optical_frame`** edge would be published twice (RViz/Gazebo TF will disagree with the calibrated pose).
+
+After **re-saving** `~/.ros/hand_eye_calibration.yaml`, redo the **`piper_hand_eye_link6_mount`** fixed joint numerically:
+
+- Read **`transform`** **`tx ty tz`** and quaternion **`qx qy qz qw`** plus frames from the YAML (**`robot_effector_frame`** = parent, **`tracking_base_frame`** = calibrated optical frame, here **`oak_right_camera_optical_frame`**).
+- Build **`T_yaml`** (**effector → optical**) from translation + quaternion.
+- Build **`T_nom`** for **OAK-D-SR** **`oak_*_right`** path in `depthai_descriptions`: **`oak_frame`→`oak_right_camera_frame`** is **`(0,-0.01,0)`** (10 mm stereo half-baseline); **`oak_right_camera_frame`→optical** is **`rpy="-π/2 0 -π/2"`** (same intrinsic-xyz convention as the macro joints).
+- **`T_mount = T_yaml @ inverse(T_nom)`**; **`origin xyz`** from **`T_mount[:3,3]`**; **`rpy`** from the rotation matrix as **intrinsic XYZ** (REP-103 / URDF `rpy`).
+- Paste into **`piper_description/.../piper_oak_d_sr_handeye_macros.xacro`**, **`colcon build piper_description`**, re-source **`install`**.
+
+Option C is the default for **`piper_description_gz.xacro`** / **`piper_no_gripper_description_gz.xacro`** and the non-Gazebo **`piper_description.xacro`** / **`piper_no_gripper_description.xacro`**.
+
+**Option B — Static TF publisher only**  
+Run:
+
+```bash
+ros2 launch hand_eye_calibration publish.launch.py calibration_file:=~/.ros/hand_eye_calibration.yaml use_sim_time:=false
+```
+
+That publishes **`robot_effector_frame` → `tracking_base_frame`** from the YAML. **Do not** also bake that transform in URDF (Option C), run `depthai` with conflicting static frames, **or** use Option A+C together for the same optical frame—you will duplicate edges in TF.
 
 
 ------------------------------------------------
