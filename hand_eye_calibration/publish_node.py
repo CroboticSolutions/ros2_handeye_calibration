@@ -13,7 +13,9 @@ import yaml
 
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 from geometry_msgs.msg import TransformStamped
+from tf2_ros import Buffer, TransformException, TransformListener
 from tf2_ros import StaticTransformBroadcaster
 
 
@@ -23,6 +25,8 @@ class CalibrationPublisher(Node):
         super().__init__('hand_eye_calibration_publisher')
         self.declare_parameter('calibration_file', os.path.expanduser('~/.ros/hand_eye_calibration.yaml'))
         self._static_broadcaster = StaticTransformBroadcaster(self)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
         self._stamped = None
         self._load_and_publish()
 
@@ -55,7 +59,25 @@ class CalibrationPublisher(Node):
         msg.transform.rotation.z = float(t['qz'])
         msg.transform.rotation.w = float(t['qw'])
         self._stamped = msg
+        self._warn_if_duplicate_tf(parent, child)
         self._publish()
+
+    def _warn_if_duplicate_tf(self, parent, child):
+        try:
+            existing = self._tf_buffer.lookup_transform(
+                parent, child, rclpy.time.Time(), timeout=Duration(seconds=1.0)
+            )
+        except TransformException:
+            return
+
+        t = existing.transform.translation
+        q = existing.transform.rotation
+        self.get_logger().warning(
+            "TF already exists for %s -> %s before publishing calibration. "
+            "If this comes from robot_state_publisher/URDF, do not run this publisher at the same time. "
+            "Existing transform: xyz=[%.4f, %.4f, %.4f], quat=[%.4f, %.4f, %.4f, %.4f]"
+            % (parent, child, t.x, t.y, t.z, q.x, q.y, q.z, q.w)
+        )
 
     def _publish(self):
         if self._stamped is None:

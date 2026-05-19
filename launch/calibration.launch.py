@@ -41,7 +41,11 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 'tracking_base_frame',
                 default_value='camera_optical_frame',
-                description='Camera frame (where ArUco marker is detected)',
+                description=(
+                    'Camera optical frame in TF (must exist). Examples: oak_right_camera_optical_frame '
+                    '(Piper + OAK-D SR); camera_optical_frame or ur1_camera_optical_frame (UR wrist cam sim). '
+                    'Verify with: ros2 run tf2_ros tf2_monitor'
+                ),
             ),
             DeclareLaunchArgument(
                 'tracking_marker_frame',

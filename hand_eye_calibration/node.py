@@ -3,14 +3,19 @@
 Collect poses and perform calibration
 """
 
+import math
 import os
+from datetime import datetime, timezone
 import yaml
 
+import numpy as np
 import rclpy
+from rclpy.wait_for_message import wait_for_message
 
 from rclpy.node import Node
 from rclpy.time import Duration
 from geometry_msgs.msg import TransformStamped, Transform
+from sensor_msgs.msg import CameraInfo, PointCloud2
 from scipy.spatial.transform import Rotation as Rot
 from std_srvs.srv import Trigger
 from tf2_ros import TransformException
@@ -57,6 +62,17 @@ def tf_to_string(tf_stamped_message: TransformStamped):
     out += "\n\t" + tf_list_to_string(tfl)
     return str(out)
 
+def transform_to_matrix(tfl: list):
+    mat = np.eye(4)
+    mat[:3, :3] = Rot.from_quat(tfl[3:]).as_matrix()
+    mat[:3, 3] = np.array(tfl[:3], dtype=float)
+    return mat
+
+def matrix_to_residual(mat):
+    translation_error = float(np.linalg.norm(mat[:3, 3]))
+    rotation_error = float(Rot.from_matrix(mat[:3, :3]).magnitude())
+    return translation_error, rotation_error
+
 
 class DataCollector(Node):
 
@@ -71,12 +87,20 @@ class DataCollector(Node):
         # options are eye-in-hand or eye-on-base
         self.declare_parameter('calibration_type', "eye-on-base")
         self.declare_parameter('calibration_file', os.path.expanduser("~/.ros/hand_eye_calibration.yaml"))
+        self.declare_parameter('pointcloud_topic', "/oak/rgbd/points")
+        self.declare_parameter('image_topic', "")
+        self.declare_parameter('camera_info_topic', "")
+        self.declare_parameter('marker_size', 0.0)
 
         self.tracking_base_frame = str(self.get_parameter('tracking_base_frame').value)
         self.tracking_marker_frame = str(self.get_parameter('tracking_marker_frame').value)
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value)
         self.robot_effector_frame = str(self.get_parameter('robot_effector_frame').value)
         self.calibration_type = str(self.get_parameter('calibration_type').value)
+        self.pointcloud_topic = str(self.get_parameter('pointcloud_topic').value)
+        self.image_topic = str(self.get_parameter('image_topic').value)
+        self.camera_info_topic = str(self.get_parameter('camera_info_topic').value)
+        self.marker_size = float(self.get_parameter('marker_size').value)
 
         self.capture_point_service_name = mname + "/capture_point"
         self.capture_point_service = self.create_service(
@@ -96,8 +120,210 @@ class DataCollector(Node):
 
         self.robot_samples = list()
         self.tracking_samples = list()
+        self.sample_metrics = list()
+        self._preflight_logged = False
+        self._last_pointcloud_frame = None
+        self._last_camera_info_frame = None
+
+        self.create_timer(2.0, self.preflight_timer_callback)
+
+    def preflight_timer_callback(self):
+        if self._preflight_logged:
+            return
+        if self.log_preflight():
+            self._preflight_logged = True
+
+    def _lookup_ok(self, target_frame, source_frame, label, lookup_time=None):
+        if lookup_time is None:
+            lookup_time = rclpy.time.Time()
+        try:
+            self.tf_buffer.lookup_transform(target_frame, source_frame, lookup_time, Duration(seconds=0.2))
+            self.get_logger().info(f"Preflight {label}: {target_frame} -> {source_frame} OK")
+            return True
+        except TransformException as ex:
+            self.get_logger().warning(f"Preflight {label}: missing {target_frame} -> {source_frame}: {ex}")
+            return False
+
+    def _read_pointcloud_frame(self):
+        if not self.pointcloud_topic:
+            return None
+        ok, msg = wait_for_message(PointCloud2, self, self.pointcloud_topic, time_to_wait=0.5)
+        if ok:
+            self._last_pointcloud_frame = msg.header.frame_id
+            return msg.header.frame_id
+        return None
+
+    def _read_camera_info_frame(self):
+        if not self.camera_info_topic:
+            return None
+        ok, msg = wait_for_message(CameraInfo, self, self.camera_info_topic, time_to_wait=0.5)
+        if ok:
+            self._last_camera_info_frame = msg.header.frame_id
+            return msg.header.frame_id
+        return None
+
+    def log_preflight(self):
+        self.get_logger().info(
+            "Preflight config: "
+            f"calibration_type={self.calibration_type}, "
+            f"robot={self.robot_base_frame}->{self.robot_effector_frame}, "
+            f"tracking={self.tracking_base_frame}->{self.tracking_marker_frame}"
+        )
+        robot_ok = self._lookup_ok(self.robot_base_frame, self.robot_effector_frame, "robot")
+        tracking_ok = self._lookup_ok(self.tracking_base_frame, self.tracking_marker_frame, "tracking")
+
+        pointcloud_frame = self._read_pointcloud_frame()
+        if pointcloud_frame:
+            self.get_logger().info(f"Preflight pointcloud: {self.pointcloud_topic}.header.frame_id={pointcloud_frame}")
+            if pointcloud_frame != self.tracking_base_frame:
+                self.get_logger().warning(
+                    f"Pointcloud frame '{pointcloud_frame}' differs from tracking_base_frame "
+                    f"'{self.tracking_base_frame}'. For pointcloud calibration, these should usually match."
+                )
+        elif self.pointcloud_topic:
+            self.get_logger().warning(f"Preflight pointcloud: no message received on {self.pointcloud_topic}")
+
+        camera_info_frame = self._read_camera_info_frame()
+        if camera_info_frame:
+            self.get_logger().info(f"Preflight camera_info: {self.camera_info_topic}.header.frame_id={camera_info_frame}")
+            if camera_info_frame != self.tracking_base_frame:
+                self.get_logger().warning(
+                    f"CameraInfo frame '{camera_info_frame}' differs from tracking_base_frame "
+                    f"'{self.tracking_base_frame}'. The ArUco detector should publish marker TF from the same optical frame."
+                )
+
+        if self.marker_size > 0.0:
+            self.get_logger().info(f"Preflight marker_size={self.marker_size:.4f} m")
+        return robot_ok and tracking_ok
+
+    def _sample_metrics(self, robot, tracking):
+        robot_tf = get_transform(robot.transform)
+        tracking_tf = get_transform(tracking.transform)
+        marker_distance = float(np.linalg.norm(tracking_tf[:3]))
+        tracking_rot = Rot.from_quat(tracking_tf[3:]).as_matrix()
+        marker_normal = tracking_rot[:, 2]
+        normal_z = max(-1.0, min(1.0, abs(float(marker_normal[2]))))
+        marker_angle_deg = float(math.degrees(math.acos(normal_z)))
+
+        if self.robot_samples:
+            last_robot = transform_to_matrix(self.robot_samples[-1])
+            current_robot = transform_to_matrix(robot_tf)
+            delta = np.linalg.inv(last_robot) @ current_robot
+            robot_delta_m, robot_delta_rad = matrix_to_residual(delta)
+        else:
+            robot_delta_m, robot_delta_rad = None, None
+
+        return {
+            'marker_distance_m': marker_distance,
+            'marker_view_angle_deg': marker_angle_deg,
+            'robot_delta_translation_m': robot_delta_m,
+            'robot_delta_rotation_deg': None if robot_delta_rad is None else float(math.degrees(robot_delta_rad)),
+        }
+
+    def _log_sample_quality(self, metrics):
+        pieces = [
+            f"marker_distance={metrics['marker_distance_m']:.3f}m",
+            f"marker_view_angle={metrics['marker_view_angle_deg']:.1f}deg",
+        ]
+        if metrics['robot_delta_translation_m'] is not None:
+            pieces.append(f"robot_delta_translation={metrics['robot_delta_translation_m']:.3f}m")
+            pieces.append(f"robot_delta_rotation={metrics['robot_delta_rotation_deg']:.1f}deg")
+        self.get_logger().info("Sample quality: " + ", ".join(pieces))
+
+        if metrics['robot_delta_translation_m'] is not None:
+            if metrics['robot_delta_translation_m'] < 0.015 and metrics['robot_delta_rotation_deg'] < 5.0:
+                self.get_logger().warning(
+                    "This sample is very close to the previous robot pose. Add more wrist rotation/translation diversity."
+                )
+        if metrics['marker_view_angle_deg'] > 70.0:
+            self.get_logger().warning("Marker is viewed at a steep angle; pose estimate may be noisy.")
+        if metrics['marker_distance_m'] < 0.15 or metrics['marker_distance_m'] > 1.5:
+            self.get_logger().warning("Marker distance is outside the usual comfortable range for ArUco calibration.")
+
+    def _diversity_summary(self):
+        if len(self.robot_samples) < 2:
+            return {
+                'sample_count': len(self.robot_samples),
+                'translation_span_m': [0.0, 0.0, 0.0],
+                'max_rotation_from_first_deg': 0.0,
+                'guidance': ['Need more samples from different wrist poses.'],
+            }
+
+        translations = np.array([s[:3] for s in self.robot_samples], dtype=float)
+        span = (translations.max(axis=0) - translations.min(axis=0)).tolist()
+        first_rot = Rot.from_quat(self.robot_samples[0][3:])
+        rotation_deltas = [
+            (first_rot.inv() * Rot.from_quat(sample[3:])).magnitude()
+            for sample in self.robot_samples[1:]
+        ]
+        max_rot_deg = float(math.degrees(max(rotation_deltas)))
+        guidance = []
+        if max(span) < 0.05:
+            guidance.append("Need more translation spread.")
+        if max_rot_deg < 25.0:
+            guidance.append("Need more wrist rotation variation, especially around multiple axes.")
+        if len(self.robot_samples) < 10:
+            guidance.append("More samples recommended; 10-20 diverse poses is a better target than the 4-sample minimum.")
+        if not guidance:
+            guidance.append("Pose diversity looks reasonable.")
+        return {
+            'sample_count': len(self.robot_samples),
+            'translation_span_m': [float(v) for v in span],
+            'max_rotation_from_first_deg': max_rot_deg,
+            'guidance': guidance,
+        }
+
+    def _log_diversity(self):
+        summary = self._diversity_summary()
+        self.get_logger().info(
+            "Sample diversity: "
+            f"count={summary['sample_count']}, "
+            f"translation_span_m={[round(v, 3) for v in summary['translation_span_m']]}, "
+            f"max_rotation_from_first={summary['max_rotation_from_first_deg']:.1f}deg"
+        )
+        for item in summary['guidance']:
+            self.get_logger().info("Diversity guidance: " + item)
+
+    def _calibration_residuals(self, cal):
+        if len(self.robot_samples) < 2:
+            return None
+        x = transform_to_matrix(cal)
+        translation_errors = []
+        rotation_errors = []
+        for i in range(len(self.robot_samples) - 1):
+            h_i = transform_to_matrix(self.robot_samples[i])
+            h_j = transform_to_matrix(self.robot_samples[i + 1])
+            c_i = transform_to_matrix(self.tracking_samples[i])
+            c_j = transform_to_matrix(self.tracking_samples[i + 1])
+            a = np.linalg.inv(h_j) @ h_i
+            b = c_j @ np.linalg.inv(c_i)
+            residual = np.linalg.inv(a @ x) @ (x @ b)
+            t_err, r_err = matrix_to_residual(residual)
+            translation_errors.append(t_err)
+            rotation_errors.append(math.degrees(r_err))
+
+        return {
+            'mean_translation_m': float(np.mean(translation_errors)),
+            'max_translation_m': float(np.max(translation_errors)),
+            'mean_rotation_deg': float(np.mean(rotation_errors)),
+            'max_rotation_deg': float(np.max(rotation_errors)),
+            'pair_count': len(translation_errors),
+        }
+
+    def _log_residuals(self, cal):
+        residuals = self._calibration_residuals(cal)
+        if residuals is None:
+            return
+        self.get_logger().info(
+            "Calibration residuals: "
+            f"mean_translation={residuals['mean_translation_m']:.4f}m, "
+            f"max_translation={residuals['max_translation_m']:.4f}m, "
+            f"mean_rotation={residuals['mean_rotation_deg']:.2f}deg, "
+            f"max_rotation={residuals['max_rotation_deg']:.2f}deg"
+        )
 
     def capture_point_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
+        self.log_preflight()
         # Prefer slightly past time so TF buffer has data; avoid negative time when
         # use_sim_time is true but /clock never publishes (clock stuck at zero).
         now = self.get_clock().now()
@@ -132,7 +358,15 @@ class DataCollector(Node):
         except TransformException as ex:
             self.get_logger().error("Could not get transforms")
             self.get_logger().error(str(ex))
-            if self.tracking_marker_frame in str(ex) and "does not exist" in str(ex):
+            if self.tracking_base_frame in str(ex) and "does not exist" in str(ex):
+                self.get_logger().error(
+                    f"Frame '{self.tracking_base_frame}' (tracking_base_frame) not in TF. "
+                    "It must match the optical frame published by your camera chain — "
+                    "e.g. oak_right_camera_optical_frame (Piper + OAK-D SR), or "
+                    "camera_optical_frame / <prefix>camera_optical_frame from your URDF/sim. "
+                    "Check: ros2 run tf2_ros tf2_monitor"
+                )
+            elif self.tracking_marker_frame in str(ex) and "does not exist" in str(ex):
                 self.get_logger().error(
                     f"Frame '{self.tracking_marker_frame}' not in TF. "
                     "Ensure: 1) ArUco node is running (e.g. ros2 launch aruco_ros single.launch.py); "
@@ -145,9 +379,13 @@ class DataCollector(Node):
 
         self.get_logger().info("robot: " + tf_to_string(robot))
         self.get_logger().info("tracking: " + tf_to_string(tracking))
+        metrics = self._sample_metrics(robot, tracking)
+        self._log_sample_quality(metrics)
 
         self.robot_samples.append(get_transform(robot.transform))
         self.tracking_samples.append(get_transform(tracking.transform))
+        self.sample_metrics.append(metrics)
+        self._log_diversity()
 
         cal = self.get_calibration()
         if cal is None:
@@ -156,6 +394,7 @@ class DataCollector(Node):
             self.get_logger().info("Current estimate of: " + self.tracking_base_frame + " -> " + self.robot_effector_frame)
             self.get_logger().info("transform: " + tf_list_to_string(cal))
             self.get_logger().info("as euler: " + urdf_list_to_string(tf_to_urdf_tf(cal)))
+            self._log_residuals(cal)
             msg = "Current estimate: " + tf_list_to_string(cal) + " as euler: " + urdf_list_to_string(tf_to_urdf_tf(cal))
         resp.success = True
         resp.message = msg
@@ -180,12 +419,26 @@ class DataCollector(Node):
             return resp
         cal_file = os.path.expanduser(str(self.get_parameter('calibration_file').value))
         try:
+            residuals = self._calibration_residuals(cal)
+            diversity = self._diversity_summary()
             data = {
                 'calibration_type': self.calibration_type,
                 'tracking_base_frame': self.tracking_base_frame,
                 'tracking_marker_frame': self.tracking_marker_frame,
                 'robot_base_frame': self.robot_base_frame,
                 'robot_effector_frame': self.robot_effector_frame,
+                'calibrated_child_frame': self.tracking_base_frame,
+                'pointcloud_topic': self.pointcloud_topic,
+                'pointcloud_frame': self._last_pointcloud_frame,
+                'image_topic': self.image_topic,
+                'camera_info_topic': self.camera_info_topic,
+                'camera_info_frame': self._last_camera_info_frame,
+                'marker_size_m': self.marker_size if self.marker_size > 0.0 else None,
+                'sample_count': len(self.robot_samples),
+                'sample_metrics': self.sample_metrics,
+                'diversity': diversity,
+                'residuals': residuals,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'transform': {
                     'tx': cal[0], 'ty': cal[1], 'tz': cal[2],
                     'qx': cal[3], 'qy': cal[4], 'qz': cal[5], 'qw': cal[6],
