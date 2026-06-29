@@ -14,15 +14,18 @@ from rclpy.wait_for_message import wait_for_message
 
 from rclpy.node import Node
 from rclpy.time import Duration
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from geometry_msgs.msg import TransformStamped, Transform
 from sensor_msgs.msg import CameraInfo, PointCloud2
 from scipy.spatial.transform import Rotation as Rot
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 from .calibration_backend import CalibrationBackend
+from .calibration_status import build_calibration_status, status_to_json
 
 
 def get_transform(tf_message: Transform):
@@ -114,6 +117,14 @@ class DataCollector(Node):
             self.save_calibration_service_name,
             self.save_calibration_service_callback)
 
+        self.status_topic = mname + "/status"
+        status_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.status_pub = self.create_publisher(String, self.status_topic, status_qos)
+
         # Transform listener.
         self.tf_buffer = Buffer()
         self._listener = TransformListener(self.tf_buffer, self)
@@ -126,6 +137,21 @@ class DataCollector(Node):
         self._last_camera_info_frame = None
 
         self.create_timer(2.0, self.preflight_timer_callback)
+        self._publish_status(None, None)
+
+    def _publish_status(self, cal, last_metrics):
+        diversity = self._diversity_summary()
+        residuals = self._calibration_residuals(cal) if cal is not None else None
+        status = build_calibration_status(
+            sample_count=len(self.robot_samples),
+            diversity=diversity,
+            residuals=residuals,
+            last_sample_metrics=last_metrics,
+            estimate=cal,
+        )
+        msg = String()
+        msg.data = status_to_json(status)
+        self.status_pub.publish(msg)
 
     def preflight_timer_callback(self):
         if self._preflight_logged:
@@ -189,7 +215,7 @@ class DataCollector(Node):
             if camera_info_frame != self.tracking_base_frame:
                 self.get_logger().warning(
                     f"CameraInfo frame '{camera_info_frame}' differs from tracking_base_frame "
-                    f"'{self.tracking_base_frame}'. The ArUco detector should publish marker TF from the same optical frame."
+                    f"'{self.tracking_base_frame}'. The ChArUco detector should publish board TF from the same optical frame."
                 )
 
         if self.marker_size > 0.0:
@@ -369,9 +395,9 @@ class DataCollector(Node):
             elif self.tracking_marker_frame in str(ex) and "does not exist" in str(ex):
                 self.get_logger().error(
                     f"Frame '{self.tracking_marker_frame}' not in TF. "
-                    "Ensure: 1) ArUco node is running (e.g. ros2 launch aruco_ros single.launch.py); "
-                    "2) Sim with camera_info_fix + image_fix, or _fixed topics; "
-                    "3) Marker visible to camera; 4) Wait for detection before capture_point."
+                    "Ensure: 1) charuco_detector node is running (started by calibration.launch.py); "
+                    "2) camera image + camera_info topics are publishing; "
+                    "3) ChArUco board fully visible to the camera; 4) chessboard_visible is true before capture_point."
                 )
             resp.success = False
             resp.message = str(ex)
@@ -396,6 +422,7 @@ class DataCollector(Node):
             self.get_logger().info("as euler: " + urdf_list_to_string(tf_to_urdf_tf(cal)))
             self._log_residuals(cal)
             msg = "Current estimate: " + tf_list_to_string(cal) + " as euler: " + urdf_list_to_string(tf_to_urdf_tf(cal))
+        self._publish_status(cal, metrics)
         resp.success = True
         resp.message = msg
         return resp

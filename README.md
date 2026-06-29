@@ -33,7 +33,18 @@ Launch file arguments:
 
 
 **Required components**   
-This node assumes that the TF between the `robot_base_frame` and the `robot_effector_frame` and the TF between the `tracking_base_frame` and `tracking_marker_frame` are being published. For AprilTag markers, the latter TF can be obtained for example by using a ros Apriltag detector node (e.g. [here](https://github.com/wep21/apriltag_ros/tree/ros2-port) or [here](https://github.com/christianrauch/apriltag_ros)). If the TFs are not available, the node will crash when you attempt to take a sample.
+This node assumes that the TF between the `robot_base_frame` and the `robot_effector_frame` and the TF between the `tracking_base_frame` and the `tracking_marker_frame` are being published.
+
+**ChArUco board (recommended, bundled in `calibration.launch.py`)**  
+`calibration.launch.py` starts the integrated `charuco_detector` node, which subscribes to the camera image + `CameraInfo`, estimates the printed ChArUco board pose, and broadcasts TF `tracking_base_frame` → `charuco_board`. It also publishes:
+
+- `std_msgs/Bool` on `/hand_eye_calibration/chessboard_visible` (board pose valid)
+- `sensor_msgs/Image` on `/charuco_detector/image_annotated` (debug overlay)
+- accepts live board geometry on `/hand_eye_calibration/board_spec` (`std_msgs/String` JSON)
+
+Default board: 9×13 squares, 15 mm square, 11 mm marker, `DICT_4X4_100` (eye-in-hand on Piper + OAK-D Pro W).
+
+For legacy setups you can still use an external marker detector (AprilTag, single ArUco, etc.) instead of `charuco_detector`; in that case launch only `hand_eye_calibration` and set `tracking_marker_frame` to match your detector. If the tracking TF is not available, capture will fail when you take a sample.
 
 
 **Taking samples**

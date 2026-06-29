@@ -10,8 +10,30 @@ def _launch_calibration_setup(context, *_args, **_kwargs):
     use_sim_str = lc.get('use_sim_time', 'false').lower()
     use_sim_time = use_sim_str in ('true', '1', 'yes')
 
-    # Expect aruco_markers (or aruco_ros) running separately. Use marker_size in **meters** (e.g. 47 mm -> 0.047);
-    # wrong size breaks PnP and invalidates saved hand-eye YAML until you recapture samples.
+    # ChArUco board detector: detects the printed board, publishes its pose as
+    # TF (tracking_base_frame -> tracking_marker_frame) plus a chessboard_visible
+    # Bool for the GUI. Replaces the external single-ArUco-marker detector.
+    charuco_detector = Node(
+        package='hand_eye_calibration',
+        executable='charuco_detector',
+        name='charuco_detector',
+        output='screen',
+        parameters=[
+            {'use_sim_time': use_sim_time},
+            {'image_topic': lc['image_topic']},
+            {'camera_info_topic': lc['camera_info_topic']},
+            {'board_frame': lc['tracking_marker_frame']},
+            {'camera_optical_frame': lc['tracking_base_frame']},
+            {'squares_x': int(lc['squares_x'])},
+            {'squares_y': int(lc['squares_y'])},
+            {'square_length_m': float(lc['square_length_m'])},
+            {'marker_length_m': float(lc['marker_length_m'])},
+            {'aruco_dictionary': lc['aruco_dictionary']},
+        ],
+    )
+
+    # Collector: looks up robot + board TF on capture_point, runs hand-eye solve,
+    # saves YAML on save_calibration.
     calibration_node = Node(
         package='hand_eye_calibration',
         executable='hand_eye_calibration',
@@ -25,9 +47,12 @@ def _launch_calibration_setup(context, *_args, **_kwargs):
             {'robot_effector_frame': lc['robot_effector_frame']},
             {'calibration_type': lc['calibration_type']},
             {'calibration_file': lc['calibration_file']},
+            {'image_topic': lc['image_topic']},
+            {'camera_info_topic': lc['camera_info_topic']},
+            {'marker_size': float(lc['square_length_m'])},
         ],
     )
-    return [calibration_node]
+    return [charuco_detector, calibration_node]
 
 
 def generate_launch_description():
@@ -40,17 +65,16 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 'tracking_base_frame',
-                default_value='camera_optical_frame',
+                default_value='oak_rgb_camera_optical_frame',
                 description=(
-                    'Camera optical frame in TF (must exist). Examples: oak_right_camera_optical_frame '
-                    '(Piper + OAK-D SR); camera_optical_frame or ur1_camera_optical_frame (UR wrist cam sim). '
-                    'Verify with: ros2 run tf2_ros tf2_monitor'
+                    'Camera optical frame in TF (must exist). Piper + OAK-D Pro W RGB: '
+                    'oak_rgb_camera_optical_frame. Verify with: ros2 run tf2_ros tf2_monitor'
                 ),
             ),
             DeclareLaunchArgument(
                 'tracking_marker_frame',
-                default_value='aruco_marker_0',
-                description='ArUco marker frame (matches aruco_ros single.launch.py marker_frame)',
+                default_value='charuco_board',
+                description='Frame the ChArUco detector broadcasts for the board pose',
             ),
             DeclareLaunchArgument(
                 'robot_base_frame',
@@ -60,12 +84,50 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 'robot_effector_frame',
                 default_value='link6',
-                description='Robot end effector frame (where camera is mounted)',
+                description='Robot end effector frame (where the camera is mounted)',
             ),
             DeclareLaunchArgument(
                 'calibration_type',
                 default_value='eye-in-hand',
                 description='Options are eye-in-hand or eye-on-base',
+            ),
+            DeclareLaunchArgument(
+                'image_topic',
+                default_value='/oak/rgb/image_raw',
+                description='RGB image topic the ChArUco detector subscribes to',
+            ),
+            DeclareLaunchArgument(
+                'camera_info_topic',
+                default_value='/oak/rgb/camera_info',
+                description='CameraInfo topic providing intrinsics for board pose',
+            ),
+            DeclareLaunchArgument(
+                'squares_x',
+                default_value='9',
+                description='ChArUco squares in X',
+            ),
+            DeclareLaunchArgument(
+                'squares_y',
+                default_value='13',
+                description='ChArUco squares in Y',
+            ),
+            DeclareLaunchArgument(
+                'square_length_m',
+                default_value='0.015',
+                description='ChArUco square length in meters (15 mm board)',
+            ),
+            DeclareLaunchArgument(
+                'marker_length_m',
+                default_value='0.011',
+                description='ChArUco marker length in meters (11 mm)',
+            ),
+            DeclareLaunchArgument(
+                'aruco_dictionary',
+                default_value='DICT_4X4_100',
+                description=(
+                    'ArUco dictionary of the printed board. A 9x13 board needs ~58 markers, '
+                    'so DICT_4X4_50 is too small; default DICT_4X4_100. Change to match your print.'
+                ),
             ),
             DeclareLaunchArgument(
                 'use_sim_time',
