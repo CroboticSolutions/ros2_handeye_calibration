@@ -14,9 +14,13 @@ camera_info, detects a ChArUco board, estimates its pose with solvePnP, and:
     GUI can change dictionary / square count / sizes without relaunching.
 
 Board defaults match the printed Calib.io-style board:
-  9 x 13 squares, 15 mm square, 11 mm marker, 4x4 ArUco dictionary.
+  13 x 9 squares (landscape), 15 mm square, 11 mm marker, 4x4 ArUco dictionary.
 
-NOTE on dictionary size: a 9x13 ChArUco board needs ~58 markers, so DICT_4X4_50
+NOTE on orientation: OpenCV ChArUco layouts are NOT symmetric — (13, 9) and
+(9, 13) place markers differently, so a swapped X/Y never detects. The printed
+board is 13 wide x 9 high (58 markers, ids 0-57, verified from live captures).
+
+NOTE on dictionary size: a 13x9 ChArUco board needs 58 markers, so DICT_4X4_50
 (only 50 ids) is too small. Default is DICT_4X4_100. If detection never locks on,
 the printed board was generated with a different dictionary -- change it from the
 GUI (Board spec -> Dictionary) or via the `aruco_dictionary` parameter.
@@ -67,8 +71,8 @@ class CharucoBoardDetector(Node):
         self.declare_parameter("publish_annotated", True)
 
         # Board geometry (the printed board)
-        self.declare_parameter("squares_x", 9)
-        self.declare_parameter("squares_y", 13)
+        self.declare_parameter("squares_x", 13)
+        self.declare_parameter("squares_y", 9)
         self.declare_parameter("square_length_m", 0.015)
         self.declare_parameter("marker_length_m", 0.011)
         self.declare_parameter("aruco_dictionary", "DICT_4X4_100")

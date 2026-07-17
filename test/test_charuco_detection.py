@@ -20,6 +20,7 @@ import numpy as np
 from charuco_detection_helpers import (
     DEFAULT_DETECTOR_SPEC,
     LIVE_BOARD_SPEC,
+    SWAPPED_BOARD_SPEC,
     BoardSpec,
     detect_charuco,
     load_gray_image,
@@ -46,27 +47,34 @@ class CharucoDetectionTest(unittest.TestCase):
         n = count_raw_markers(gray, "DICT_4X4_100")
         self.assertGreaterEqual(n, 10, "camera sees ArUco markers but raw count is low")
 
-    def test_live_snapshot_fails_with_default_9x13_spec(self) -> None:
-        """Documents why GUI/detector defaults miss the printed board."""
+    def test_live_snapshot_fails_with_swapped_spec(self) -> None:
+        """ChArUco layouts are orientation-sensitive: 9x13 never matches the 13x9 board."""
         gray = load_gray_image(str(LIVE_SNAPSHOT))
-        spec = BoardSpec.from_dict(DEFAULT_DETECTOR_SPEC)
+        spec = BoardSpec.from_dict(SWAPPED_BOARD_SPEC)
         result = detect_charuco(gray, spec)
         self.assertEqual(
             result.n_corners,
             0,
-            "default 9x13 spec must NOT match the physical 13x15 board",
+            "swapped 9x13 spec must NOT match the physical 13x9 board",
         )
 
-    def test_live_snapshot_detects_with_observed_13x15_spec(self) -> None:
+    def test_live_snapshot_detects_with_default_spec(self) -> None:
+        """Detector/GUI defaults must match the physical 13x9 board."""
         gray = load_gray_image(str(LIVE_SNAPSHOT))
-        spec = BoardSpec.from_dict(LIVE_BOARD_SPEC)
+        spec = BoardSpec.from_dict(DEFAULT_DETECTOR_SPEC)
         result = detect_charuco(gray, spec)
         self.assertGreaterEqual(
             result.n_corners,
             8,
-            f"expected >=8 ChArUco corners with 13x15 spec, got {result.n_corners}",
+            f"expected >=8 ChArUco corners with 13x9 spec, got {result.n_corners}",
         )
         self.assertGreaterEqual(result.n_markers, 20)
+        if result.marker_ids:
+            self.assertLess(
+                max(result.marker_ids),
+                58,
+                "ids above 57 would mean the board is larger than 13x9",
+            )
 
     def test_live_snapshot_pose_with_approximate_intrinsics(self) -> None:
         gray = load_gray_image(str(LIVE_SNAPSHOT))
@@ -79,14 +87,14 @@ class CharucoDetectionTest(unittest.TestCase):
         self.assertTrue(result.pose_ok, "pose should succeed with enough corners + intrinsics")
         self.assertIsNotNone(result.reproj_error_px)
 
-    def test_sweep_finds_13x15_on_live_snapshot(self) -> None:
+    def test_sweep_finds_13x9_on_live_snapshot(self) -> None:
         gray = load_gray_image(str(LIVE_SNAPSHOT))
         best = best_matching_spec(gray, min_corners=8)
         self.assertIsNotNone(best, "sweep should find at least one matching board spec")
         assert best is not None
         self.assertEqual(best.spec.squares_x, 13)
-        self.assertEqual(best.spec.squares_y, 15)
-        self.assertIn(best.spec.aruco_dictionary, ("DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250"))
+        self.assertEqual(best.spec.squares_y, 9)
+        self.assertIn(best.spec.aruco_dictionary, ("DICT_4X4_100", "DICT_4X4_250"))
 
 
 if __name__ == "__main__":

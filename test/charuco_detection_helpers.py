@@ -13,22 +13,22 @@ import cv2
 import numpy as np
 
 # Printed board observed in live OAK-D captures (Calib.io-style, DICT_4X4).
+# 13 wide x 9 high = 58 markers; live captures show ids 0-57 with the full board
+# in frame, which pins the layout exactly (a 13x15 board would use ids up to 96).
 LIVE_BOARD_SPEC = {
     "squares_x": 13,
-    "squares_y": 15,
+    "squares_y": 9,
     "square_length_m": 0.015,
     "marker_length_m": 0.011,
     "aruco_dictionary": "DICT_4X4_100",
 }
 
-# Defaults wired into charuco_detector / calibration.launch.py (mismatch live board).
-DEFAULT_DETECTOR_SPEC = {
-    "squares_x": 9,
-    "squares_y": 13,
-    "square_length_m": 0.015,
-    "marker_length_m": 0.011,
-    "aruco_dictionary": "DICT_4X4_100",
-}
+# Defaults wired into charuco_detector / calibration.launch.py (match live board).
+DEFAULT_DETECTOR_SPEC = dict(LIVE_BOARD_SPEC)
+
+# Historical GUI/detector default before the fix — orientation-swapped, never
+# detects the physical board (ChArUco layouts are not X/Y symmetric).
+SWAPPED_BOARD_SPEC = {**LIVE_BOARD_SPEC, "squares_x": 9, "squares_y": 13}
 
 COMMON_DICTIONARIES = (
     "DICT_4X4_50",
@@ -205,13 +205,15 @@ def sweep_board_specs(
                         result = detect_charuco(gray, spec)
                         if result.n_corners >= min_corners:
                             hits.append(result)
+    # Prefer the SMALLEST board among equal detections: a larger board whose
+    # top rows share the same marker layout (e.g. 13x15 vs 13x9) matches the
+    # same corners, so descending area would overfit to the bigger board.
     hits.sort(
         key=lambda r: (
-            r.n_corners,
-            r.n_markers,
+            -r.n_corners,
+            -r.n_markers,
             r.spec.squares_x * r.spec.squares_y,
-        ),
-        reverse=True,
+        )
     )
     return hits
 

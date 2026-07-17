@@ -42,7 +42,19 @@ This node assumes that the TF between the `robot_base_frame` and the `robot_effe
 - `sensor_msgs/Image` on `/charuco_detector/image_annotated` (debug overlay)
 - accepts live board geometry on `/hand_eye_calibration/board_spec` (`std_msgs/String` JSON)
 
-Default board: 9×13 squares, 15 mm square, 11 mm marker, `DICT_4X4_100` (eye-in-hand on Piper + OAK-D Pro W).
+Default board: 13×9 squares (13 wide × 9 high — ChArUco X/Y are orientation-sensitive, not swappable), 15 mm square, 11 mm marker, `DICT_4X4_100` (eye-in-hand on Piper + OAK-D Pro W).
+
+**Applying a saved calibration to the Piper URDF**
+The GUI's *Save calibration* writes `~/.ros/hand_eye_calibration.yaml` only. To apply it to the robot, regenerate the URDF mount origin and rebuild:
+
+```bash
+cd arms_ws/src/ros2_handeye_calibration
+python3 -m hand_eye_calibration.depthai_mount_cli \
+  --update-xacro ../piper_ros/src/robot_description/piper_description/urdf/include/piper_oak_d_pro_w_handeye_macros.xacro
+cd ../.. && colcon build --packages-select piper_description
+```
+
+The CLI infers the optical socket (rgb/right/left) from `tracking_base_frame` in the YAML and supports `--camera-model OAK-D-PRO-W` (default), `OAK-D-PRO`, `OAK-D`, and `OAK-D-SR`. Restart the robot stack afterwards so `robot_state_publisher` picks up the new mount.
 
 For legacy setups you can still use an external marker detector (AprilTag, single ArUco, etc.) instead of `charuco_detector`; in that case launch only `hand_eye_calibration` and set `tracking_marker_frame` to match your detector. If the tracking TF is not available, capture will fail when you take a sample.
 

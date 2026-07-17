@@ -103,13 +103,13 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 'squares_x',
-                default_value='9',
-                description='ChArUco squares in X',
+                default_value='13',
+                description='ChArUco squares in X (printed board is 13 wide x 9 high; X/Y are not swappable)',
             ),
             DeclareLaunchArgument(
                 'squares_y',
-                default_value='13',
-                description='ChArUco squares in Y',
+                default_value='9',
+                description='ChArUco squares in Y (printed board is 13 wide x 9 high; X/Y are not swappable)',
             ),
             DeclareLaunchArgument(
                 'square_length_m',
@@ -125,7 +125,7 @@ def generate_launch_description():
                 'aruco_dictionary',
                 default_value='DICT_4X4_100',
                 description=(
-                    'ArUco dictionary of the printed board. A 9x13 board needs ~58 markers, '
+                    'ArUco dictionary of the printed board. A 13x9 board needs 58 markers, '
                     'so DICT_4X4_50 is too small; default DICT_4X4_100. Change to match your print.'
                 ),
             ),

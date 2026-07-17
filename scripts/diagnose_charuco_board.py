@@ -31,6 +31,7 @@ if str(_PKG_ROOT / "test") not in sys.path:
 from charuco_detection_helpers import (  # noqa: E402
     COMMON_DICTIONARIES,
     DEFAULT_DETECTOR_SPEC,
+    LIVE_BOARD_SPEC,
     BoardSpec,
     best_matching_spec,
     count_raw_markers,
@@ -122,18 +123,13 @@ def main() -> int:
     print("\nDetection with configured spec:")
     _print_result("configured", detect_charuco(gray, spec))
 
-    live_hint = BoardSpec.from_dict(
-        {
-            "squares_x": 13,
-            "squares_y": 15,
-            "square_length_m": 0.015,
-            "marker_length_m": 0.011,
-            "aruco_dictionary": "DICT_4X4_100",
-        }
+    live_hint = BoardSpec.from_dict(LIVE_BOARD_SPEC)
+    print(
+        f"\nDetection with observed live board hint "
+        f"({live_hint.squares_x}x{live_hint.squares_y} {live_hint.aruco_dictionary}):"
     )
-    print("\nDetection with observed live board hint (13x15 DICT_4X4_100):")
     hint_result = detect_charuco(gray, live_hint)
-    _print_result("13x15 hint", hint_result)
+    _print_result("live hint", hint_result)
 
     best = None
     if args.sweep or hint_result.n_corners == 0:
@@ -174,11 +170,14 @@ def main() -> int:
         print(f"\nWrote annotated image to {args.save_annotated}")
 
     if hint_result.n_corners >= 8:
+        if spec.squares_x == live_hint.squares_x and spec.squares_y == live_hint.squares_y:
+            return 0
         print(
-            "\nLikely cause: detector defaults (9x13) do not match printed board (13x15). "
-            "Update board spec in the calibration GUI without changing detector code."
+            f"\nLikely cause: configured spec ({spec.squares_x}x{spec.squares_y}) does not "
+            f"match the printed board ({live_hint.squares_x}x{live_hint.squares_y}). "
+            "Update the board spec in the calibration GUI (X/Y are orientation-sensitive)."
         )
-        return 0 if spec.squares_x == 13 and spec.squares_y == 15 else 2
+        return 2
 
     return 1 if hint_result.n_corners < 8 else 0
 
