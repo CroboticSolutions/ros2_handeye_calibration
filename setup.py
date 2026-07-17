@@ -33,6 +33,7 @@ setup(
             'charuco_detector = hand_eye_calibration.charuco_detector:main',
             'hand_eye_calibration_publisher = hand_eye_calibration.publish_node:main',
             'handeye_depthai_mount_args = hand_eye_calibration.depthai_mount_cli:main',
+            'handeye_realsense_mount_args = hand_eye_calibration.realsense_mount_cli:main',
             'tool_tcp_calibration = hand_eye_calibration.pivot_calibration_node:main',
             'tool_tcp_calibration_publisher = hand_eye_calibration.pivot_publish_node:main',
         ],
