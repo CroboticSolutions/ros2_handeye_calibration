@@ -36,7 +36,13 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from scipy.spatial.transform import Rotation as Rot
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, String
@@ -109,8 +115,17 @@ class CharucoBoardDetector(Node):
         self.visible_pub = self.create_publisher(
             Bool, str(self.get_parameter("chessboard_visible_topic").value), 10
         )
+        # WebRTC (server_ros.py IMAGE_QOS) is RELIABLE. qos_profile_sensor_data
+        # is BEST_EFFORT — DDS drops every annotated frame while
+        # chessboard_visible (RELIABLE Bool) still lights the GUI.
+        annotated_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.annotated_pub = (
-            self.create_publisher(Image, self.annotated_topic, qos_profile_sensor_data)
+            self.create_publisher(Image, self.annotated_topic, annotated_qos)
             if self.publish_annotated
             else None
         )
