@@ -116,8 +116,14 @@ def update_xacro_origin(
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
+    # Non-greedy .*? alone already stops at the nearest "/>" — excluding "/"
+    # from the group (as an earlier version did) breaks on any xacro
+    # expression containing "/" in the existing origin (e.g. rpy="0 ${pi/2}
+    # 0"): the "/" can't be consumed, so the match silently fails and re
+    # falls through to the *next* <origin> tag in the file instead, corrupting
+    # a different joint. Reproduced live 2026-08-28 against a real xacro file.
     joint_pattern = re.compile(
-        r'(<joint\s+name="%s"[^>]*>.*?<origin\b)([^/]*?)(/>)' % re.escape(joint_name),
+        r'(<joint\s+name="%s"[^>]*>.*?<origin\b)(.*?)(/>)' % re.escape(joint_name),
         re.DOTALL,
     )
     m = joint_pattern.search(content)

@@ -21,6 +21,12 @@ WARN_MEAN_RESIDUAL_ROT_DEG = 2.0
 DUPLICATE_TRANS_M = 0.015
 DUPLICATE_ROT_DEG = 5.0
 
+# Bootstrap 1-sigma uncertainty (worst-constrained direction) below which the
+# calibration is considered well determined. Reported only when an uncertainty
+# estimate has actually been run — it is deliberately not computed on every
+# capture because each estimate costs a full refit per resample.
+MAX_UNCERTAINTY_TRANS_M = 0.002
+
 
 def _sample_warnings(metrics: dict[str, Any] | None) -> list[str]:
     if not metrics:
@@ -186,11 +192,14 @@ def build_calibration_status(
     residuals: dict[str, Any] | None,
     last_sample_metrics: dict[str, Any] | None,
     estimate: list[float] | None = None,
+    uncertainty: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_warnings = _sample_warnings(last_sample_metrics)
     readiness = _readiness(sample_count, diversity, residuals, last_warnings)
     guidance = list(diversity.get("guidance") or [])
     guidance.extend(last_warnings)
+    if uncertainty and uncertainty.get("guidance"):
+        guidance.append(uncertainty["guidance"])
 
     if readiness == "excellent":
         summary = "Excellent — no need to collect more samples. Save when ready."
@@ -202,6 +211,16 @@ def build_calibration_status(
         summary = "Keep collecting — improve pose diversity before saving."
 
     checklist = _checklist(sample_count, diversity, residuals, last_warnings)
+    if uncertainty:
+        worst = float(uncertainty.get("worst_direction_sigma_m") or 0.0)
+        checklist.append(
+            {
+                "id": "uncertainty",
+                "label": "Calibration uncertainty (1σ, worst direction)",
+                "ok": worst <= MAX_UNCERTAINTY_TRANS_M,
+                "detail": f"±{worst * 1000:.2f} mm (good < {MAX_UNCERTAINTY_TRANS_M * 1000:.0f} mm)",
+            }
+        )
     ready_to_save = readiness in ("ready_to_save", "excellent")
 
     payload: dict[str, Any] = {
@@ -215,6 +234,7 @@ def build_calibration_status(
         "checklist": checklist,
         "diversity": diversity,
         "residuals": residuals,
+        "uncertainty": uncertainty,
         "last_sample_warning": last_warnings[0] if last_warnings else None,
     }
     if estimate is not None and len(estimate) >= 7:

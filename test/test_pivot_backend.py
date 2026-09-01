@@ -91,6 +91,49 @@ class PivotBackendTest(unittest.TestCase):
             similar_result["condition_number"], diverse_result["condition_number"]
         )
 
+    def test_ransac_rejects_slipped_touches_and_recovers_tcp(self) -> None:
+        rpys = ORIENTATIONS_DEG * 3
+        samples = [_make_sample(rpy) for rpy in rpys]
+        for index, offset in ((2, 0.008), (11, -0.010), (19, 0.012)):
+            samples[index] = list(samples[index])
+            samples[index][index % 3] += offset
+
+        result = PivotCalibrationBackend.compute_pivot(samples)
+
+        self.assertTrue({2, 11, 19}.issubset(set(result["outlier_indices"])))
+        np.testing.assert_allclose(result["tcp_translation"], TRUE_TCP, atol=1e-8)
+        self.assertEqual(result["method"], "ransac_huber_aos")
+
+    def test_held_out_validation_does_not_refit(self) -> None:
+        fit = PivotCalibrationBackend.compute_pivot(
+            [_make_sample(rpy) for rpy in ORIENTATIONS_DEG]
+        )
+        validation_samples = [
+            _make_sample((55, -25, 30)),
+            _make_sample((-45, 35, -20)),
+        ]
+        validation_samples[1] = list(validation_samples[1])
+        validation_samples[1][0] += 0.003
+
+        validation = PivotCalibrationBackend.validate_pivot(validation_samples, fit)
+
+        self.assertEqual(validation["sample_count"], 2)
+        self.assertGreater(validation["max_residual_m"], 0.0029)
+        np.testing.assert_allclose(fit["tcp_translation"], TRUE_TCP, atol=1e-9)
+
+    def test_pose_burst_uses_robust_translation_center(self) -> None:
+        base = _make_sample((20, -15, 30))
+        burst = []
+        for dx in (-0.00004, -0.00002, 0.0, 0.00002, 0.00004):
+            sample = list(base)
+            sample[0] += dx
+            burst.append(sample)
+        result = PivotCalibrationBackend.aggregate_pose_burst(burst)
+
+        np.testing.assert_allclose(result["pose"][:3], base[:3], atol=1e-12)
+        self.assertLess(result["translation_p95_m"], 0.00005)
+        self.assertLess(result["rotation_p95_deg"], 1e-9)
+
 
 class FrameFromAxisTest(unittest.TestCase):
     def test_quaternion_plus_z_is_the_axis(self) -> None:

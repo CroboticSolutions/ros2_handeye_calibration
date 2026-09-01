@@ -19,11 +19,150 @@ touching one fixed point cannot recover the TCP orientation.
 """
 
 import numpy as np
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as Rot
 
 
 class PivotCalibrationBackend:
+    # Four poses are enough for an algebraic preview, but are not enough for a
+    # calibration that should be trusted on a welding robot.  The status/save
+    # layer applies the stricter 20-pose quality gate.
     MIN_SAMPLES = 4
+    RANSAC_THRESHOLD_M = 0.002
+    RANSAC_ITERATIONS = 500
+    ROBUST_F_SCALE_M = 0.00075
+    BOOTSTRAP_SAMPLES = 400
+
+    @staticmethod
+    def _build_system(flange_samples):
+        rows = []
+        rhs = []
+        for sample in flange_samples:
+            block, r = PivotCalibrationBackend._design_row(sample)
+            rows.append(block)
+            rhs.append(r)
+        return np.vstack(rows), np.concatenate(rhs)
+
+    @staticmethod
+    def _linear_fit(flange_samples):
+        a, b = PivotCalibrationBackend._build_system(flange_samples)
+        solution, _, rank, singular_values = np.linalg.lstsq(a, b, rcond=None)
+        condition_number = (
+            float(singular_values[0] / singular_values[-1])
+            if singular_values[-1] > 1e-12
+            else float("inf")
+        )
+        return solution, int(rank), condition_number
+
+    @staticmethod
+    def _residual_vectors(flange_samples, solution):
+        a, b = PivotCalibrationBackend._build_system(flange_samples)
+        return (a @ solution - b).reshape(len(flange_samples), 3)
+
+    @staticmethod
+    def _ransac_inliers(flange_samples, *, threshold_m, iterations, random_seed):
+        """Return deterministic RANSAC inliers for the algebraic pivot model."""
+        n = len(flange_samples)
+        subset_size = PivotCalibrationBackend.MIN_SAMPLES
+        rng = np.random.default_rng(random_seed)
+        best = None
+
+        # Always score the all-sample AOS fit as a deterministic fallback.
+        candidates = [np.arange(n, dtype=int)]
+        candidates.extend(
+            rng.choice(n, size=subset_size, replace=False) for _ in range(iterations)
+        )
+        for subset in candidates:
+            try:
+                solution, rank, _ = PivotCalibrationBackend._linear_fit(
+                    [flange_samples[int(i)] for i in subset]
+                )
+            except np.linalg.LinAlgError:
+                continue
+            if rank < 6:
+                continue
+            norms = np.linalg.norm(
+                PivotCalibrationBackend._residual_vectors(flange_samples, solution),
+                axis=1,
+            )
+            inliers = np.flatnonzero(norms <= threshold_m)
+            if len(inliers) < subset_size:
+                continue
+            score = (
+                len(inliers),
+                -float(np.median(norms[inliers])),
+                -float(np.sqrt(np.mean(norms[inliers] ** 2))),
+            )
+            if best is None or score > best[0]:
+                best = (score, inliers)
+
+        if best is None:
+            return np.arange(n, dtype=int)
+        return best[1]
+
+    @staticmethod
+    def _robust_fit(flange_samples, initial_solution, *, f_scale_m):
+        a, b = PivotCalibrationBackend._build_system(flange_samples)
+        result = least_squares(
+            lambda x: a @ x - b,
+            initial_solution,
+            loss="huber",
+            f_scale=f_scale_m,
+            method="trf",
+        )
+        if not result.success or not np.all(np.isfinite(result.x)):
+            return initial_solution
+        return result.x
+
+    @staticmethod
+    def _uncertainty(flange_samples, *, bootstrap_samples, random_seed):
+        """Bootstrap confidence interval and leave-one-out TCP influence."""
+        n = len(flange_samples)
+        rng = np.random.default_rng(random_seed)
+        boot_tcp = []
+        for _ in range(bootstrap_samples):
+            pick = rng.integers(0, n, size=n)
+            if len(set(pick.tolist())) < PivotCalibrationBackend.MIN_SAMPLES:
+                continue
+            try:
+                solution, rank, _ = PivotCalibrationBackend._linear_fit(
+                    [flange_samples[int(i)] for i in pick]
+                )
+            except np.linalg.LinAlgError:
+                continue
+            if rank == 6 and np.all(np.isfinite(solution)):
+                boot_tcp.append(solution[:3])
+
+        if boot_tcp:
+            arr = np.asarray(boot_tcp)
+            ci_low = np.percentile(arr, 2.5, axis=0)
+            ci_high = np.percentile(arr, 97.5, axis=0)
+            std = np.std(arr, axis=0, ddof=1) if len(arr) > 1 else np.zeros(3)
+            ci_half = 0.5 * (ci_high - ci_low)
+        else:
+            ci_low = ci_high = std = ci_half = np.full(3, np.nan)
+
+        full, _, _ = PivotCalibrationBackend._linear_fit(flange_samples)
+        loo_shifts = []
+        for omitted in range(n):
+            reduced = flange_samples[:omitted] + flange_samples[omitted + 1 :]
+            try:
+                loo, rank, _ = PivotCalibrationBackend._linear_fit(reduced)
+                shift = float(np.linalg.norm(loo[:3] - full[:3])) if rank == 6 else float("inf")
+            except np.linalg.LinAlgError:
+                shift = float("inf")
+            loo_shifts.append(shift)
+
+        return {
+            "bootstrap_count": len(boot_tcp),
+            "tcp_std_m": [float(v) for v in std],
+            "tcp_ci95_low_m": [float(v) for v in ci_low],
+            "tcp_ci95_high_m": [float(v) for v in ci_high],
+            "tcp_ci95_half_width_m": [float(v) for v in ci_half],
+            "max_tcp_ci95_half_width_m": float(np.max(ci_half)),
+            "loo_tcp_shifts_m": loo_shifts,
+            "max_loo_tcp_shift_m": float(np.max(loo_shifts)),
+        }
 
     @staticmethod
     def _design_row(flange_tf):
@@ -35,7 +174,15 @@ class PivotCalibrationBackend:
         return block, rhs
 
     @staticmethod
-    def compute_pivot(flange_samples):
+    def compute_pivot(
+        flange_samples,
+        *,
+        robust=True,
+        ransac_threshold_m=RANSAC_THRESHOLD_M,
+        ransac_iterations=RANSAC_ITERATIONS,
+        bootstrap_samples=BOOTSTRAP_SAMPLES,
+        random_seed=17,
+    ):
         """
         flange_samples: list of [tx, ty, tz, qx, qy, qz, qw] flange poses in the
         robot base frame, captured while the tool tip touches one fixed point.
@@ -54,37 +201,107 @@ class PivotCalibrationBackend:
                 f"Need at least {PivotCalibrationBackend.MIN_SAMPLES} samples, got {n}"
             )
 
-        rows = []
-        rhs = []
-        for sample in flange_samples:
-            block, r = PivotCalibrationBackend._design_row(sample)
-            rows.append(block)
-            rhs.append(r)
-        a = np.vstack(rows)
-        b = np.concatenate(rhs)
-
-        solution, _, rank, singular_values = np.linalg.lstsq(a, b, rcond=None)
+        if robust:
+            inlier_indices = PivotCalibrationBackend._ransac_inliers(
+                flange_samples,
+                threshold_m=ransac_threshold_m,
+                iterations=ransac_iterations,
+                random_seed=random_seed,
+            )
+        else:
+            inlier_indices = np.arange(n, dtype=int)
+        inlier_samples = [flange_samples[int(i)] for i in inlier_indices]
+        initial, rank, condition_number = PivotCalibrationBackend._linear_fit(inlier_samples)
+        if rank < 6:
+            raise ValueError(
+                "Pivot system is rank-deficient; capture more varied wrist orientations."
+            )
+        solution = (
+            PivotCalibrationBackend._robust_fit(
+                inlier_samples, initial, f_scale_m=PivotCalibrationBackend.ROBUST_F_SCALE_M
+            )
+            if robust
+            else initial
+        )
         t = solution[:3]
         p = solution[3:]
-
-        condition_number = (
-            float(singular_values[0] / singular_values[-1])
-            if singular_values[-1] > 1e-12
-            else float("inf")
-        )
-
-        predicted = a @ solution
-        per_sample = (predicted - b).reshape(n, 3)
+        per_sample = PivotCalibrationBackend._residual_vectors(flange_samples, solution)
         per_sample_norms = np.linalg.norm(per_sample, axis=1)
+        inlier_mask = np.zeros(n, dtype=bool)
+        inlier_mask[inlier_indices] = True
+        outlier_indices = np.flatnonzero(~inlier_mask)
+        inlier_norms = per_sample_norms[inlier_mask]
 
-        return {
+        uncertainty = PivotCalibrationBackend._uncertainty(
+            inlier_samples,
+            bootstrap_samples=bootstrap_samples,
+            random_seed=random_seed + 1,
+        )
+        influential_inlier_indices = [
+            int(inlier_indices[i])
+            for i, shift in enumerate(uncertainty["loo_tcp_shifts_m"])
+            if shift > 0.001
+        ]
+
+        result = {
             "tcp_translation": [float(v) for v in t],
             "fixed_point": [float(v) for v in p],
             "condition_number": condition_number,
             "rank": int(rank),
+            "method": "ransac_huber_aos" if robust else "aos",
+            "ransac_threshold_m": float(ransac_threshold_m),
+            "inlier_indices": [int(v) for v in inlier_indices],
+            "outlier_indices": [int(v) for v in outlier_indices],
+            "inlier_mask": [bool(v) for v in inlier_mask],
+            "inlier_count": int(np.sum(inlier_mask)),
+            "outlier_count": int(np.sum(~inlier_mask)),
             "per_sample_residuals_m": [float(v) for v in per_sample_norms],
-            "rms_residual_m": float(np.sqrt(np.mean(per_sample_norms**2))),
+            "rms_residual_m": float(np.sqrt(np.mean(inlier_norms**2))),
             "max_residual_m": float(np.max(per_sample_norms)),
+            "inlier_max_residual_m": float(np.max(inlier_norms)),
+            "influential_sample_indices": influential_inlier_indices,
+        }
+        result.update(uncertainty)
+        return result
+
+    @staticmethod
+    def validate_pivot(flange_samples, pivot_result):
+        """Evaluate held-out spike touches without refitting the TCP."""
+        if not flange_samples:
+            return None
+        solution = np.concatenate(
+            [pivot_result["tcp_translation"], pivot_result["fixed_point"]]
+        )
+        residuals = np.linalg.norm(
+            PivotCalibrationBackend._residual_vectors(flange_samples, solution), axis=1
+        )
+        return {
+            "sample_count": len(flange_samples),
+            "per_sample_residuals_m": [float(v) for v in residuals],
+            "rms_residual_m": float(np.sqrt(np.mean(residuals**2))),
+            "max_residual_m": float(np.max(residuals)),
+            "p95_residual_m": float(np.percentile(residuals, 95.0)),
+        }
+
+    @staticmethod
+    def aggregate_pose_burst(flange_samples):
+        """Robustly average a short burst and report whether the robot moved."""
+        if not flange_samples:
+            raise ValueError("Cannot aggregate an empty capture burst.")
+        translations = np.asarray([sample[:3] for sample in flange_samples], dtype=float)
+        rotations = Rot.from_quat([sample[3:] for sample in flange_samples])
+        center_t = np.median(translations, axis=0)
+        center_r = rotations.mean()
+        translation_deviation = np.linalg.norm(translations - center_t, axis=1)
+        rotation_deviation_deg = np.degrees((center_r.inv() * rotations).magnitude())
+        quat = center_r.as_quat()
+        return {
+            "pose": [float(v) for v in np.concatenate([center_t, quat])],
+            "sample_count": len(flange_samples),
+            "translation_p95_m": float(np.percentile(translation_deviation, 95.0)),
+            "translation_max_m": float(np.max(translation_deviation)),
+            "rotation_p95_deg": float(np.percentile(rotation_deviation_deg, 95.0)),
+            "rotation_max_deg": float(np.max(rotation_deviation_deg)),
         }
 
     # Minimum number of alignment poses for the axis; one is mathematically

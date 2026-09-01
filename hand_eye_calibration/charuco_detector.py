@@ -83,9 +83,28 @@ class CharucoBoardDetector(Node):
         self.declare_parameter("marker_length_m", 0.011)
         self.declare_parameter("aruco_dictionary", "DICT_4X4_100")
         # Quality gate: minimum interior ChArUco corners required for a pose.
-        self.declare_parameter("min_charuco_corners", 8)
-        # Warn if reprojection error (px) is above this; pose still published.
+        # A 13x9 board exposes up to 96 interior corners. Measured on this
+        # repo's fixtures: a good live capture yields ~79, a half-visible board
+        # ~30, so 24 rejects genuinely weak detections while staying permissive.
+        # Raising this trades capture rate for pose conditioning.
+        self.declare_parameter("min_charuco_corners", 24)
+        # Corners clustered in one small image region give a poorly conditioned
+        # PnP even when there are many of them. This is the RMS radius of the
+        # corners about their centroid, normalized by the image diagonal.
+        # Measured: full-frame synthetic 0.26, good live capture 0.09,
+        # half-visible board 0.06. The default only catches pathological
+        # clustering; raise it if you want to insist on fuller board coverage.
+        self.declare_parameter("min_charuco_corner_spread", 0.04)
+        # Reject (do not publish) poses whose reprojection error exceeds this.
         self.declare_parameter("max_reproj_error_px", 2.0)
+        # Set false to publish high-error poses anyway (diagnostics only —
+        # feeding them into hand-eye calibration degrades its precision).
+        self.declare_parameter("reject_on_reproj_error", True)
+        # Re-detect markers from the interpolated ChArUco corners. Measured on
+        # this repo's fixtures: recovers 79 corners vs 39 on a real capture, and
+        # is slightly more accurate against a known synthetic ground-truth pose
+        # (0.777 mm vs 0.833 mm median position error over 40 views).
+        self.declare_parameter("try_refine_markers", True)
 
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.camera_info_topic = str(self.get_parameter("camera_info_topic").value)
@@ -94,7 +113,10 @@ class CharucoBoardDetector(Node):
         self.annotated_topic = str(self.get_parameter("annotated_topic").value)
         self.publish_annotated = bool(self.get_parameter("publish_annotated").value)
         self.min_charuco_corners = int(self.get_parameter("min_charuco_corners").value)
+        self.min_charuco_corner_spread = float(self.get_parameter("min_charuco_corner_spread").value)
         self.max_reproj_error_px = float(self.get_parameter("max_reproj_error_px").value)
+        self.reject_on_reproj_error = bool(self.get_parameter("reject_on_reproj_error").value)
+        self.try_refine_markers = bool(self.get_parameter("try_refine_markers").value)
 
         self.spec = {
             "squares_x": int(self.get_parameter("squares_x").value),
@@ -109,6 +131,11 @@ class CharucoBoardDetector(Node):
         self.dist_coeffs = None
         self._info_frame = None
         self._warned_no_info = False
+        # Rejection bookkeeping so a persistently-rejecting gate explains itself
+        # instead of silently publishing nothing (see _note_rejection).
+        self._reject_streak = 0
+        self._reject_reason = None
+        self._last_reproj_px = None
         self._build_board()
 
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -147,6 +174,12 @@ class CharucoBoardDetector(Node):
             f"square={self.spec['square_length_m']*1000:.0f}mm marker={self.spec['marker_length_m']*1000:.0f}mm "
             f"dict={self.spec['aruco_dictionary']}, board_frame={self.board_frame}"
         )
+        self.get_logger().info(
+            f"Quality gates: min_charuco_corners={self.min_charuco_corners}, "
+            f"min_charuco_corner_spread={self.min_charuco_corner_spread:.3f}, "
+            f"max_reproj_error_px={self.max_reproj_error_px:.2f} "
+            f"(reject={self.reject_on_reproj_error}), try_refine_markers={self.try_refine_markers}"
+        )
 
     # -- board construction ------------------------------------------------
     def _build_board(self):
@@ -158,8 +191,23 @@ class CharucoBoardDetector(Node):
             self.spec["marker_length_m"],
             dictionary,
         )
+
+        detector_params = cv2.aruco.DetectorParameters()
+        # Explicitly OFF (this also happens to be the OpenCV default): refining
+        # ArUco marker corners near the chessboard squares biases the corners
+        # that ChArUco's interior-corner interpolation depends on, unless the
+        # marker/square margin is large. See the OpenCV ChArUco tutorial.
+        detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+
+        charuco_params = cv2.aruco.CharucoParameters()
+        # Interior ChArUco corners are subpixel-refined by the detector itself,
+        # independently of the marker setting above. Re-detecting markers from
+        # the board layout (tryRefineMarkers) recovers markers that the first
+        # pass missed, which mostly helps exactly when detection is degraded.
+        charuco_params.tryRefineMarkers = self.try_refine_markers
+
         # Modern (OpenCV >= 4.7) detector. Falls back handled by exception in callback.
-        self.charuco_detector = cv2.aruco.CharucoDetector(self.board)
+        self.charuco_detector = cv2.aruco.CharucoDetector(self.board, charuco_params, detector_params)
         self.dictionary = dictionary
 
     def _board_spec_cb(self, msg: String):
@@ -204,6 +252,47 @@ class CharucoBoardDetector(Node):
     def _publish_visible(self, visible: bool):
         self.visible_pub.publish(Bool(data=bool(visible)))
 
+    @staticmethod
+    def corner_spread(charuco_corners, image_shape) -> float:
+        """RMS radius of the corners about their centroid, over the image diagonal."""
+        pts = np.asarray(charuco_corners, dtype=np.float64).reshape(-1, 2)
+        if len(pts) < 2:
+            return 0.0
+        diag = float(np.hypot(image_shape[0], image_shape[1]))
+        if diag <= 0.0:
+            return 0.0
+        centred = pts - pts.mean(axis=0)
+        return float(np.sqrt((centred ** 2).sum(axis=1).mean()) / diag)
+
+    def _note_rejection(self, reason: str):
+        """Log why a pose was rejected, escalating if it keeps happening.
+
+        A hard quality gate that silently publishes nothing looks identical to
+        'the board is not visible', so say which gate is firing and what to do.
+        """
+        self._reject_streak += 1
+        self._reject_reason = reason
+        if self._reject_streak in (1, 10) or self._reject_streak % 100 == 0:
+            self.get_logger().warning(
+                f"ChArUco pose rejected ({self._reject_streak} in a row): {reason}"
+            )
+            if self._reject_streak >= 10:
+                self.get_logger().warning(
+                    "Nothing is being published to TF, so calibration capture will fail. "
+                    "Check camera focus/lighting and board visibility; verify camera_info "
+                    "intrinsics are for this resolution; then relax the gates via "
+                    "min_charuco_corners / min_charuco_corner_spread / max_reproj_error_px "
+                    "(or set reject_on_reproj_error:=false to publish anyway)."
+                )
+
+    def _note_accepted(self):
+        if self._reject_streak:
+            self.get_logger().info(
+                f"ChArUco pose accepted again after {self._reject_streak} rejected frame(s)."
+            )
+        self._reject_streak = 0
+        self._reject_reason = None
+
     def _image_cb(self, msg: Image):
         if self.camera_matrix is None:
             if not self._warned_no_info:
@@ -226,7 +315,20 @@ class CharucoBoardDetector(Node):
 
         annotated = frame if self.annotated_pub is not None else None
         pose_ok = False
-        if n_corners >= self.min_charuco_corners:
+        spread = self.corner_spread(charuco_corners, gray.shape) if n_corners else 0.0
+        if n_corners < self.min_charuco_corners:
+            if n_corners:
+                self._note_rejection(
+                    f"only {n_corners} ChArUco corners (need min_charuco_corners="
+                    f"{self.min_charuco_corners}) — move closer or expose more of the board"
+                )
+        elif spread < self.min_charuco_corner_spread:
+            self._note_rejection(
+                f"corners clustered in one region (spread={spread:.3f} < "
+                f"min_charuco_corner_spread={self.min_charuco_corner_spread:.3f}) — "
+                "a clustered set gives a poorly conditioned pose"
+            )
+        else:
             pose_ok = self._estimate_and_publish(
                 charuco_corners, charuco_ids, msg.header.frame_id, annotated, msg.header.stamp
             )
@@ -239,12 +341,21 @@ class CharucoBoardDetector(Node):
                     annotated, charuco_corners, charuco_ids, (0, 255, 0)
                 )
             label = (
-                f"corners {n_corners}  {'POSE OK' if pose_ok else 'no pose'}"
+                f"corners {n_corners}/{self.min_charuco_corners}  "
+                f"spread {spread:.3f}  "
+                f"{'POSE OK' if pose_ok else 'no pose'}"
             )
+            if pose_ok and self._last_reproj_px is not None:
+                label += f"  reproj {self._last_reproj_px:.2f}px"
             cv2.putText(
                 annotated, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                 (0, 255, 0) if pose_ok else (0, 0, 255), 2, cv2.LINE_AA,
             )
+            if not pose_ok and self._reject_reason:
+                cv2.putText(
+                    annotated, self._reject_reason[:70], (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA,
+                )
             out = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
             out.header = msg.header
             self.annotated_pub.publish(out)
@@ -270,25 +381,37 @@ class CharucoBoardDetector(Node):
         except AttributeError:
             obj_points, img_points = None, None
         if obj_points is None or len(obj_points) < 4:
+            self._note_rejection("could not match enough board points to image points")
             return False
 
         ok, rvec, tvec = cv2.solvePnP(
             obj_points, img_points, self.camera_matrix, self.dist_coeffs
         )
         if not ok:
+            self._note_rejection(f"solvePnP failed on {len(obj_points)} corners")
             return False
 
-        # Reprojection error for quality reporting.
+        # Reprojection error gates whether this pose is trustworthy enough to
+        # publish at all — a high-error pose fed into hand-eye calibration
+        # silently degrades its precision, so reject rather than just warn.
         proj, _ = cv2.projectPoints(
             obj_points, rvec, tvec, self.camera_matrix, self.dist_coeffs
         )
         reproj = float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - img_points.reshape(-1, 2), axis=1)))
+        self._last_reproj_px = reproj
         if reproj > self.max_reproj_error_px:
-            self.get_logger().warning(
-                f"High ChArUco reprojection error {reproj:.2f}px (> {self.max_reproj_error_px:.2f}). "
-                "Check square/marker sizes and dictionary."
+            reason = (
+                f"reprojection error {reproj:.2f}px > max_reproj_error_px="
+                f"{self.max_reproj_error_px:.2f} over {len(obj_points)} corners — "
+                "check square/marker sizes, dictionary, focus, and that camera_info "
+                "intrinsics match this image resolution"
             )
+            if self.reject_on_reproj_error:
+                self._note_rejection(reason)
+                return False
+            self.get_logger().warning(f"Publishing low-quality ChArUco pose anyway: {reason}")
 
+        self._note_accepted()
         rot = Rot.from_rotvec(rvec.reshape(3))
         qx, qy, qz, qw = (float(v) for v in rot.as_quat())
 

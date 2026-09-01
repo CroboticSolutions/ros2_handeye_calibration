@@ -22,6 +22,14 @@ def _launch_tcp_calibration_setup(context, *_args, **_kwargs):
             {'tcp_name': lc['tcp_name']},
             {'calibration_file': lc['calibration_file']},
             {'spike_axis_base': lc['spike_axis_base']},
+            {'robot_firmware_version': lc['robot_firmware_version']},
+            {'capture_burst_duration_s': float(lc['capture_burst_duration_s'])},
+            {'capture_burst_samples': int(lc['capture_burst_samples'])},
+            {'capture_burst_min_samples': int(lc['capture_burst_min_samples'])},
+            {'capture_translation_p95_limit_m': float(lc['capture_translation_p95_limit_m'])},
+            {'capture_rotation_p95_limit_deg': float(lc['capture_rotation_p95_limit_deg'])},
+            {'duplicate_orientation_limit_deg': float(lc['duplicate_orientation_limit_deg'])},
+            {'max_tf_age_s': float(lc['max_tf_age_s'])},
         ],
     )
     return [pivot_node]
@@ -61,6 +69,18 @@ def generate_launch_description():
                 default_value='false',
                 description='true only when using Gazebo/sim and /clock is published; false for real robots',
             ),
+            DeclareLaunchArgument(
+                'robot_firmware_version',
+                default_value='unknown',
+                description='Metadata saved with the calibration; no CAN query is issued',
+            ),
+            DeclareLaunchArgument('capture_burst_duration_s', default_value='1.2'),
+            DeclareLaunchArgument('capture_burst_samples', default_value='50'),
+            DeclareLaunchArgument('capture_burst_min_samples', default_value='15'),
+            DeclareLaunchArgument('capture_translation_p95_limit_m', default_value='0.0005'),
+            DeclareLaunchArgument('capture_rotation_p95_limit_deg', default_value='0.20'),
+            DeclareLaunchArgument('duplicate_orientation_limit_deg', default_value='5.0'),
+            DeclareLaunchArgument('max_tf_age_s', default_value='0.25'),
             OpaqueFunction(function=_launch_tcp_calibration_setup),
         ]
     )

@@ -33,6 +33,16 @@ DIVERSE_RPYS = [
     (0, 0, 0), (35, 0, 0), (-35, 20, 0), (0, 40, 15),
     (20, -30, 40), (-25, 25, -25), (45, 10, -20), (-10, -40, 30),
     (15, 15, 15), (-15, -15, -15),
+    (30, 30, -30), (-30, -30, 30), (55, -10, 10), (-50, 15, 35),
+    (10, 55, -40), (-15, -50, 45), (40, -45, 10), (-45, 40, -10),
+    (25, 10, 60), (-20, -15, -60), (60, 25, 25), (-60, -20, -20),
+    (5, 50, 55), (-5, -55, -50), (50, 50, 0),
+]
+
+VALIDATION_RPYS = [
+    (65, -5, 40), (-55, 35, 20), (35, 55, -20), (-40, -50, 50),
+    (20, -60, -35), (-25, 60, 35), (50, -35, 55), (-60, 10, -45),
+    (10, 65, 10), (-10, -65, -10),
 ]
 
 TRUE_TCP = np.array([0.01, 0.0, 0.15])
@@ -48,6 +58,10 @@ def _make_sample(rpy_deg, tcp=TRUE_TCP, fixed_point=TRUE_FIXED_POINT):
 
 
 class PivotStatusTest(unittest.TestCase):
+    def test_status_json_replaces_non_finite_diagnostics(self) -> None:
+        parsed = json.loads(status_to_json({"condition": float("inf")}))
+        self.assertIsNone(parsed["condition"])
+
     def test_not_ready_with_few_samples(self) -> None:
         samples = [_make_sample(rpy) for rpy in [(0, 0, 0), (10, 0, 0)]]
         status = build_pivot_status(flange_samples=samples, pivot=None)
@@ -70,7 +84,7 @@ class PivotStatusTest(unittest.TestCase):
         )
 
     def test_collecting_when_orientations_too_similar(self) -> None:
-        rpys = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 0)]
+        rpys = [(i % 4, (i // 4) % 4, (i // 8) % 3) for i in range(20)]
         samples = [_make_sample(rpy) for rpy in rpys]
         pivot = PivotCalibrationBackend.compute_pivot(samples)
         status = build_pivot_status(flange_samples=samples, pivot=pivot)
@@ -78,25 +92,17 @@ class PivotStatusTest(unittest.TestCase):
         self.assertTrue(any("too similar" in g or "orientation" in g.lower() for g in status["guidance"]))
 
     def test_excellent_with_diverse_low_residual_samples(self) -> None:
-        rpys = [
-            (0, 0, 0), (35, 0, 0), (-35, 20, 0), (0, 40, 15),
-            (20, -30, 40), (-25, 25, -25), (45, 10, -20), (-10, -40, 30),
-            (15, 15, 15), (-15, -15, -15),
-        ]
-        samples = [_make_sample(rpy) for rpy in rpys]
+        samples = [_make_sample(rpy) for rpy in DIVERSE_RPYS]
         pivot = PivotCalibrationBackend.compute_pivot(samples)
         status = build_pivot_status(flange_samples=samples, pivot=pivot)
         self.assertEqual(status["readiness"], "excellent")
         self.assertTrue(status["ready_to_save"])
         parsed = json.loads(status_to_json(status))
-        self.assertEqual(parsed["sample_count"], 10)
+        self.assertEqual(parsed["sample_count"], 25)
         self.assertAlmostEqual(parsed["estimate"]["tx"], TRUE_TCP[0], places=6)
 
     def test_last_sample_residual_flagged_when_touch_slipped(self) -> None:
-        rpys = [
-            (0, 0, 0), (35, 0, 0), (-35, 20, 0), (0, 40, 15),
-            (20, -30, 40), (-25, 25, -25),
-        ]
+        rpys = DIVERSE_RPYS
         samples = [_make_sample(rpy) for rpy in rpys]
         bad = list(samples[-1])
         bad[1] += 0.01
@@ -113,13 +119,20 @@ class ToolTcpStatusTest(unittest.TestCase):
         pivot = PivotCalibrationBackend.compute_pivot(samples)
         return samples, pivot
 
+    def _validation(self, pivot):
+        samples = [_make_sample(rpy) for rpy in VALIDATION_RPYS]
+        return samples, PivotCalibrationBackend.validate_pivot(samples, pivot)
+
     def test_position_mode_save_gates_on_tip_round(self) -> None:
         tip_samples, tip_pivot = self._tip_round()
+        validation_samples, validation_result = self._validation(tip_pivot)
         status = build_tool_tcp_status(
             mode="position",
             active_round="tip",
             tip_samples=tip_samples,
             tip_pivot=tip_pivot,
+            validation_samples=validation_samples,
+            validation_result=validation_result,
             align_samples=[],
             axis=None,
         )
@@ -127,9 +140,36 @@ class ToolTcpStatusTest(unittest.TestCase):
         self.assertTrue(status["ready_to_save"])
         self.assertFalse(status["axis"]["computed"])
 
+    def test_position_mode_can_save_without_held_out_validation(self) -> None:
+        tip_samples, tip_pivot = self._tip_round()
+        status = build_tool_tcp_status(
+            mode="position",
+            active_round="tip",
+            tip_samples=tip_samples,
+            tip_pivot=tip_pivot,
+            validation_samples=[],
+            validation_result=None,
+            align_samples=[],
+            axis=None,
+        )
+        self.assertTrue(status["tip"]["ready_to_save"])
+        self.assertFalse(status["validation"]["ready_to_save"])
+        self.assertTrue(status["ready_to_save"])
+
+    def test_four_pose_fit_is_saveable_even_when_quality_is_advisory(self) -> None:
+        samples = [_make_sample(rpy) for rpy in DIVERSE_RPYS[:4]]
+        samples[1] = list(samples[1])
+        samples[1][0] += 0.004
+        pivot = PivotCalibrationBackend.compute_pivot(samples)
+        status = build_pivot_status(flange_samples=samples, pivot=pivot)
+
+        self.assertTrue(status["ready_to_save"])
+        self.assertNotEqual(status["readiness"], "excellent")
+
     def test_axis_mode_not_ready_until_axis_computed(self) -> None:
         tip_samples, tip_pivot = self._tip_round()
         align_samples = _alignment_samples(3)
+        validation_samples, validation_result = self._validation(tip_pivot)
 
         # Tip ready and alignment poses captured, but axis not computed yet.
         status = build_tool_tcp_status(
@@ -137,6 +177,8 @@ class ToolTcpStatusTest(unittest.TestCase):
             active_round="axis_ref",
             tip_samples=tip_samples,
             tip_pivot=tip_pivot,
+            validation_samples=validation_samples,
+            validation_result=validation_result,
             align_samples=align_samples,
             axis=None,
         )
@@ -154,6 +196,8 @@ class ToolTcpStatusTest(unittest.TestCase):
             active_round="axis_ref",
             tip_samples=tip_samples,
             tip_pivot=tip_pivot,
+            validation_samples=validation_samples,
+            validation_result=validation_result,
             align_samples=align_samples,
             axis=axis,
         )
@@ -171,6 +215,7 @@ class ToolTcpStatusTest(unittest.TestCase):
     def test_single_alignment_pose_still_ready(self) -> None:
         tip_samples, tip_pivot = self._tip_round()
         align_samples = _alignment_samples(1)
+        validation_samples, validation_result = self._validation(tip_pivot)
         axis = PivotCalibrationBackend.compute_axis_from_alignment(
             alignment_samples=align_samples,
             spike_axis_base=SPIKE,
@@ -181,6 +226,8 @@ class ToolTcpStatusTest(unittest.TestCase):
             active_round="axis_ref",
             tip_samples=tip_samples,
             tip_pivot=tip_pivot,
+            validation_samples=validation_samples,
+            validation_result=validation_result,
             align_samples=align_samples,
             axis=axis,
         )
