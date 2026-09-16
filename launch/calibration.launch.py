@@ -8,7 +8,8 @@ from launch_ros.actions import Node
 def _launch_calibration_setup(context, *_args, **_kwargs):
     lc = context.launch_configurations
     use_sim_str = lc.get('use_sim_time', 'false').lower()
-    use_sim_time = use_sim_str in ('true', '1', 'yes')
+    piper_sim = lc['image_topic'].startswith('/piper/camera/')
+    use_sim_time = piper_sim or use_sim_str in ('true', '1', 'yes')
 
     # ChArUco board detector: detects the printed board, publishes its pose as
     # TF (tracking_base_frame -> tracking_marker_frame) plus a chessboard_visible
@@ -47,9 +48,13 @@ def _launch_calibration_setup(context, *_args, **_kwargs):
             {'robot_effector_frame': lc['robot_effector_frame']},
             {'calibration_type': lc['calibration_type']},
             {'calibration_file': lc['calibration_file']},
+            {'auto_enabled': lc.get('auto_enabled', 'auto').lower() == 'true' or (lc.get('auto_enabled', 'auto') == 'auto' and piper_sim)},
             {'image_topic': lc['image_topic']},
             {'camera_info_topic': lc['camera_info_topic']},
             {'marker_size': float(lc['square_length_m'])},
+            {'squares_x': int(lc['squares_x'])},
+            {'squares_y': int(lc['squares_y'])},
+            {'square_length_m': float(lc['square_length_m'])},
         ],
     )
     return [charuco_detector, calibration_node]
@@ -134,6 +139,7 @@ def generate_launch_description():
                 default_value='false',
                 description='true only when using Gazebo/sim and /clock is published; false for real robots',
             ),
+            DeclareLaunchArgument('auto_enabled', default_value='auto', description='Enable direct Piper simulation calibration trajectories'),
             OpaqueFunction(function=_launch_calibration_setup),
         ]
     )

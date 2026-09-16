@@ -6,6 +6,7 @@ Collect poses and perform calibration
 import math
 import os
 import time
+import threading
 from datetime import datetime, timezone
 import yaml
 
@@ -90,6 +91,9 @@ class DataCollector(Node):
         self.declare_parameter('pointcloud_topic', "/oak/rgbd/points")
         self.declare_parameter('image_topic', "")
         self.declare_parameter('camera_info_topic', "")
+        self.declare_parameter('squares_x', 13)
+        self.declare_parameter('squares_y', 9)
+        self.declare_parameter('square_length_m', 0.015)
         self.declare_parameter('marker_size', 0.0)
         # Burst capture: instead of a single TF lookup per sample, gather a
         # short burst of freshly-published (robot, tracking) pairs — each pair
@@ -171,6 +175,8 @@ class DataCollector(Node):
 
         self.create_timer(2.0, self.preflight_timer_callback)
         self._publish_status(None, None)
+        from .automatic_calibration import AutomaticCalibration
+        self.automatic = AutomaticCalibration(self)
 
     def _publish_status(self, cal, last_metrics):
         diversity = self._diversity_summary()
@@ -183,6 +189,9 @@ class DataCollector(Node):
             estimate=cal,
             uncertainty=self._last_uncertainty,
         )
+        self._status_payload = status
+        if hasattr(self, "automatic"):
+            status = {**status, "automatic": dict(self.automatic.status)}
         msg = String()
         msg.data = status_to_json(status)
         self.status_pub.publish(msg)
@@ -394,6 +403,11 @@ class DataCollector(Node):
             "Invalid calibration_type: " + self.calibration_type + ". Options are eye-in-hand or eye-on-base")
 
     def capture_point_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
+        if (hasattr(self, 'automatic') and self.automatic.active
+                and threading.current_thread() is not self.automatic.thread):
+            resp.success = False
+            resp.message = 'Automatic calibration is running; use Stop first.'
+            return resp
         self.log_preflight()
 
         if self.calibration_type not in ("eye-in-hand", "eye-on-base"):
@@ -415,17 +429,22 @@ class DataCollector(Node):
         # (e.g. rclpy.spin_once) raises "Executor is already spinning" and
         # aborts the whole capture. The TF buffer is instead kept fresh by the
         # listener running on another executor thread; see _service_cb_group.
-        burst_deadline = self.get_clock().now() + Duration(seconds=self.capture_burst_duration_s)
+        burst_deadline = time.monotonic() + max(1.5, self.capture_burst_duration_s)
         seen_stamps = set()
         tracking_burst = []
         robot_burst = []
 
-        while len(tracking_burst) < self.capture_burst_samples and self.get_clock().now() < burst_deadline:
+        while len(tracking_burst) < self.capture_burst_samples and time.monotonic() < burst_deadline:
+            if hasattr(self, 'automatic') and self.automatic.active:
+                self.automatic.check()
             time.sleep(0.02)
             try:
                 tracking_k = self.tf_buffer.lookup_transform(
                     self.tracking_base_frame, self.tracking_marker_frame, rclpy.time.Time())
             except TransformException:
+                continue
+            age = (self.get_clock().now().nanoseconds - rclpy.time.Time.from_msg(tracking_k.header.stamp).nanoseconds) / 1e9
+            if not -0.1 <= age < 1.0:
                 continue
             stamp_key = (tracking_k.header.stamp.sec, tracking_k.header.stamp.nanosec)
             if stamp_key in seen_stamps:
@@ -438,38 +457,10 @@ class DataCollector(Node):
             tracking_burst.append(tracking_k)
             robot_burst.append(robot_k)
 
-        if not tracking_burst:
-            # Nothing landed during the burst window — fall back to a single
-            # generous-timeout lookup so the diagnostic messages below (frame
-            # never published, detector not running, ...) still fire.
-            try:
-                tracking = self.tf_buffer.lookup_transform(
-                    self.tracking_base_frame, self.tracking_marker_frame,
-                    rclpy.time.Time(), Duration(seconds=2))
-                robot = self._lookup_robot_at(tracking.header.stamp, timeout_s=2.0)
-            except TransformException as ex:
-                self.get_logger().error("Could not get transforms")
-                self.get_logger().error(str(ex))
-                if self.tracking_base_frame in str(ex) and "does not exist" in str(ex):
-                    self.get_logger().error(
-                        f"Frame '{self.tracking_base_frame}' (tracking_base_frame) not in TF. "
-                        "It must match the optical frame published by your camera chain — "
-                        "e.g. oak_right_camera_optical_frame (Piper + OAK-D SR), or "
-                        "camera_optical_frame / <prefix>camera_optical_frame from your URDF/sim. "
-                        "Check: ros2 run tf2_ros tf2_monitor"
-                    )
-                elif self.tracking_marker_frame in str(ex) and "does not exist" in str(ex):
-                    self.get_logger().error(
-                        f"Frame '{self.tracking_marker_frame}' not in TF. "
-                        "Ensure: 1) charuco_detector node is running (started by calibration.launch.py); "
-                        "2) camera image + camera_info topics are publishing; "
-                        "3) ChArUco board fully visible to the camera; 4) chessboard_visible is true before capture_point."
-                    )
-                resp.success = False
-                resp.message = str(ex)
-                return resp
-            tracking_burst = [tracking]
-            robot_burst = [robot]
+        if len(tracking_burst) < 3:
+            resp.success = False
+            resp.message = 'Need at least 3 fresh, time-synchronized board frames. Check detection and use_sim_time.'
+            return resp
 
         robot_list = [get_transform(t.transform) for t in robot_burst]
         tracking_list = [get_transform(t.transform) for t in tracking_burst]
@@ -478,12 +469,9 @@ class DataCollector(Node):
         tracking_avg, tracking_spread = CalibrationBackend.average_transforms(tracking_list)
 
         if robot_spread['max_translation_dev_m'] > 0.003 or robot_spread['max_rotation_dev_deg'] > 0.3:
-            self.get_logger().warning(
-                f"Robot appears to have moved during the capture burst "
-                f"(max deviation {robot_spread['max_translation_dev_m'] * 1000:.2f}mm / "
-                f"{robot_spread['max_rotation_dev_deg']:.2f}deg over {robot_spread['count']} frame(s)). "
-                "Hold the arm still while capturing for the most precise sample."
-            )
+            resp.success = False
+            resp.message = 'Robot moved during capture; sample rejected.'
+            return resp
 
         dropped = tracking_spread['rejected_frames'] + robot_spread['rejected_frames']
         self.get_logger().info(
@@ -511,9 +499,9 @@ class DataCollector(Node):
         self._last_uncertainty = None
         self._log_diversity()
 
-        cal = self.get_calibration()
+        cal = None if self.automatic.active else self.get_calibration()
         if cal is None:
-            msg = "Not enough samples yet..."
+            msg = "Sample captured." if self.automatic.active else "Not enough samples yet..."
         else:
             self.get_logger().info("Current estimate of: " + self.tracking_base_frame + " -> " + self.robot_effector_frame)
             self.get_logger().info("transform: " + tf_list_to_string(cal))
@@ -604,6 +592,11 @@ class DataCollector(Node):
         return uncertainty
 
     def estimate_uncertainty_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
+        if (hasattr(self, 'automatic') and self.automatic.active
+                and threading.current_thread() is not self.automatic.thread):
+            resp.success = False
+            resp.message = 'Automatic calibration is running; use Stop first.'
+            return resp
         cal = self.get_calibration()
         if cal is None:
             resp.success = False
@@ -631,6 +624,11 @@ class DataCollector(Node):
         return resp
 
     def save_calibration_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
+        if (hasattr(self, 'automatic') and self.automatic.active
+                and threading.current_thread() is not self.automatic.thread):
+            resp.success = False
+            resp.message = 'Automatic calibration is running; use Stop first.'
+            return resp
         """Save current calibration estimate to YAML file for later publishing."""
         cal = self.get_calibration()
         if cal is None:
@@ -672,8 +670,24 @@ class DataCollector(Node):
                 'uncertainty': uncertainty,
             }
             os.makedirs(os.path.dirname(os.path.abspath(cal_file)) or '.', exist_ok=True)
-            with open(cal_file, 'w') as f:
+            if self.automatic.active:
+                self.automatic.check()
+                data['automatic_validation'] = self.automatic.status.get('validation')
+            import tempfile
+            import shutil
+            if os.path.exists(cal_file):
+                shutil.copy2(cal_file, cal_file + '.previous')
+            with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(os.path.abspath(cal_file)), delete=False) as f:
                 yaml.dump(data, f, default_flow_style=False)
+                temporary = f.name
+            try:
+                if self.automatic.active:
+                    self.automatic.check()
+                os.replace(temporary, cal_file)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            self._publish_status(cal, self.sample_metrics[-1] if self.sample_metrics else None)
             self.get_logger().info("Calibration saved to %s" % cal_file)
             resp.success = True
             resp.message = "Saved to " + cal_file
@@ -685,8 +699,18 @@ class DataCollector(Node):
 
 
 def main():
-    rclpy.init()
+    import signal
+    from rclpy.signals import SignalHandlerOptions
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = DataCollector()
+    shutdown_requested = threading.Event()
+
+    def request_shutdown(signum, frame):
+        node.automatic.stop(None, Trigger.Response())
+        shutdown_requested.set()
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
 
     # MultiThreadedExecutor is required, not just nice to have: the capture
     # callback blocks while collecting its burst, and the TF listener has to
@@ -694,10 +718,16 @@ def main():
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
-        executor.spin()
+        while rclpy.ok() and not shutdown_requested.is_set():
+            executor.spin_once(timeout_sec=0.1)
+        # Keep processing action responses while cancellation is acknowledged.
+        deadline = time.monotonic() + 1.0
+        while rclpy.ok() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.1)
     except KeyboardInterrupt:
         pass
     finally:
+        node.automatic.close()
         executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
