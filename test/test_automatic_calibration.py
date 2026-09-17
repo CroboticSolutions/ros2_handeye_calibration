@@ -58,6 +58,7 @@ def bare_runner():
     runner = AutomaticCalibration.__new__(AutomaticCalibration)
     runner.lock = threading.RLock()
     runner.stop_event = threading.Event()
+    runner.check_collisions = False
     runner.goal = None
     runner.thread = None
     runner.visible = True
@@ -109,57 +110,78 @@ def test_stop_while_goal_acceptance_is_pending_cancels_late_goal(monkeypatch):
     handle.cancel_goal_async.assert_called_once()
 
 
-def synthetic_sequence(monkeypatch, *, bad_validation=False, reachable=True):
-    """Exercise the complete worker with a deterministic virtual controller/camera."""
-    runner = bare_runner()
-    runner.status['active'] = True
-    initial_camera = transform([0.4, 0, 0.3], [0.3, 2.9, 0])
-    observation = transform([0.01, 0.02, 0.3], [0.1, 0.1, 0])
-    mount = transform([0.02, 0.03, 0.04], [0.1, -0.1, 0.05])
-    board = initial_camera @ observation
-    current = [initial_camera]
-    params = {'auto_joint_names': [f'joint{i}' for i in range(1, 7)], 'auto_ik_link': 'arm_tcp'}
-    node = SimpleNamespace(
-        get_parameter=lambda name: SimpleNamespace(value=params[name]),
+def synthetic_sequence(monkeypatch, *, bad_validation=False, reachable=True, robot_profile=None):
+    """Independent virtual robot + camera; no mount TF is available to the worker."""
+    from sensor_msgs.msg import CameraInfo
+    from hand_eye_calibration import bootstrap_calibration as bootstrap
+    runner = bare_runner(); runner.status['active'] = True
+    mount = transform([.03, -.02, .04], [.6, -.7, .4])
+    current = [np.zeros(6) if robot_profile is None else np.array(robot_profile['joints'])]
+    def physical_robot(q):
+        return transform(np.array([.3, .1, .5]) + .15*q[:3], q[3:])
+    if robot_profile is not None:
+        import xml.etree.ElementTree as ET
+        from hand_eye_calibration.visibility import CameraKinematics
+        physical_robot = CameraKinematics(ET.fromstring(robot_profile['urdf']), 'base_link', robot_profile.get('tip','link6'),
+            robot_profile.get('names',[f'joint{i}' for i in range(1,7)]), np.eye(4)).camera
+    board = physical_robot(current[0]) @ mount @ transform([-.0975, -.0675, .65], [0, 0, 0])
+    def observation():
+        return np.linalg.inv(physical_robot(current[0]) @ mount) @ board
+    monkeypatch.setattr(bootstrap, 'CameraKinematics', lambda *a: SimpleNamespace(camera=physical_robot))
+    original_session = bootstrap.BootstrapSession
+    def session(*args):
+        result = original_session(*args); runner.session = result; return result
+    monkeypatch.setattr(bootstrap, 'BootstrapSession', session)
+    params = {'auto_joint_names': robot_profile.get('names',[f'joint{i}' for i in range(1,7)]) if robot_profile else [f'joint{i}' for i in range(1,7)]}
+    node = SimpleNamespace(get_parameter=lambda name: SimpleNamespace(value=params[name]),
         robot_base_frame='base', tracking_base_frame='camera', robot_effector_frame='wrist',
         robot_samples=[], tracking_samples=[], sample_metrics=[], _publish_status=Mock(),
         _last_uncertainty=None, _last_calibration_detail=None, get_logger=lambda: Mock())
     runner.node = node
+    def configure(root):
+        runner.names=params['auto_joint_names']
+        limits=[root.find(f"joint[@name='{name}']/limit") for name in runner.names]
+        runner.lower=np.array([float(j.get('lower')) for j in limits])
+        runner.upper=np.array([float(j.get('upper')) for j in limits])
+    runner.configure_robot=configure
+    runner.planning=SimpleNamespace(wait_for_service=lambda **_:True)
+    runner.plan_joint_path=lambda start,end:[start.copy(),end.copy()] if reachable else None
     urdf = '<robot>' + ''.join(f'<joint name="joint{i}"><limit lower="-3" upper="3"/></joint>' for i in range(1, 7)) + '</robot>'
+    if robot_profile is not None:
+        urdf = robot_profile['urdf']
+        node.robot_base_frame = 'base_link'; node.robot_effector_frame = robot_profile.get('tip','link6')
     runner.description = SimpleNamespace(wait_for_service=lambda **_: True, call_async=lambda _: SimpleNamespace(values=[SimpleNamespace(string_value=urdf)]))
     runner.wait = lambda value, _: value
     runner.check = lambda: None
-    runner.ik = SimpleNamespace(wait_for_service=lambda **_: True)
+    runner.ik = Mock(side_effect=AssertionError('Bootstrap must not request camera IK'))
     runner.action = SimpleNamespace(wait_for_server=lambda **_: True)
-    runner.joint_positions = lambda: np.zeros(6)
+    runner.joint_positions = lambda: current[0].copy()
     runner.settle = lambda _: None
-    runner.fresh_board = lambda: observation
-    monkeypatch.setattr('hand_eye_calibration.automatic_calibration.matrix', lambda value: value)
-    runner.tf = lambda parent, child: initial_camera if parent == 'base' else np.eye(4)
+    runner.observed_board = lambda **_: observation()
+    runner.tf = Mock(side_effect=AssertionError('No initial camera transform exists'))
     runner.update = lambda state, message, **values: runner.status.update(state=state, message=message, **values)
-    poses = []
-    def solve(pose, seed):
-        poses.append(pose)
-        return np.full(6, len(poses)) if reachable else None
-    runner.solve = solve
-    runner.move = Mock(side_effect=lambda q: current.__setitem__(0, initial_camera if q[0] == 0 else poses[int(q[0])-1]))
-    capture_count = [0]
+    runner.camera_info = CameraInfo(width=640, height=480, k=[600.,0.,320.,0.,600.,240.,0.,0.,1.])
+    runner.camera_info.header.frame_id = 'camera'
+    runner.board_spec = {'squares_x':13, 'squares_y':9, 'square_length_m':.015}
+    runner.collision_free_path = lambda a,b: reachable or np.max(np.abs(a-b)) < .001
+    def move(q, **kwargs):
+        assert np.max(np.abs(q-current[0])) <= .051
+        current[0] = q.copy()
+    runner.move = Mock(side_effect=move)
+    runner.sample_events = []
     def capture():
-        capture_count[0] += 1
-        robot = current[0] @ np.linalg.inv(mount)
-        tracking = np.linalg.inv(current[0]) @ board
-        if bad_validation and capture_count[0] > 21:
-            tracking[0, 3] += 0.05
-        node.robot_samples.append(as_sample(robot))
-        node.tracking_samples.append(as_sample(tracking))
-        node.sample_metrics.append({})
+        tracking = observation()
+        session = runner.session
+        runner.sample_events.append((len(node.robot_samples)+1, session.estimate is not None,
+            None if session.view_planner is None else float(np.max(np.abs(current[0]-session.view_planner.goal)))))
+        if bad_validation and session.estimate is not None and (len(session.views)+1)%3 == 0:
+            tracking[0,3] += .05
+        node.robot_samples.append(as_sample(physical_robot(current[0])))
+        node.tracking_samples.append(as_sample(tracking)); node.sample_metrics.append({})
         return True
-    runner.prepare_framing = lambda _: None
-    runner.fits = lambda _: True
-    runner.path_fits = lambda *args: True
-    runner.guarded_move = lambda q: runner.move(q)
     runner.capture = capture
     node.get_calibration = lambda: CalibrationBackend.compute_calibration(node.robot_samples, node.tracking_samples)
+    node._compute_uncertainty = lambda cal: {'worst_direction_sigma_m': .001, 'n_bootstrap':40, 'worst_direction_axis':[0.,0.,1.]}
     node.save_calibration_service_callback = Mock(return_value=SimpleNamespace(success=True, message='Saved'))
     return runner, node, mount
 
@@ -169,18 +191,24 @@ def test_complete_sequence_saves_only_training_samples(monkeypatch):
     runner.run()
     assert runner.status['state'] == 'completed', runner.status
     assert not runner.active
-    assert len(node.robot_samples) == 21  # all three holdouts excluded
-    assert runner.status['validation']['poses'] == 3
+    assert len(node.robot_samples) == 15  # six initial + nine targeted, all used in the solve
+    assert runner.status['initial_samples'] == 6
+    assert runner.status['targeted_samples'] == 9
+    assert [event[1] for event in runner.sample_events] == [False]*6+[True]*9
+    assert all(event[2] is not None and event[2] < .003 for event in runner.sample_events[6:])
+    assert all(call.kwargs['speed_scale'] == 1. for call in runner.move.call_args_list)
+    runner.tf.assert_not_called()
+    assert runner.status['validation'] is None
     node.save_calibration_service_callback.assert_called_once()
     np.testing.assert_allclose(sample_matrix(node.get_calibration()), mount, atol=1e-6)
-    np.testing.assert_array_equal(runner.move.call_args.args[0], np.zeros(6))
+    assert not np.allclose(runner.move.call_args.args[0], np.zeros(6))  # stays at the final useful view
 
 
 def test_failed_validation_preserves_saved_calibration(monkeypatch):
     runner, node, _ = synthetic_sequence(monkeypatch, bad_validation=True)
     runner.run()
     assert runner.status['state'] == 'failed'
-    assert 'validation failed' in runner.status['message']
+    assert 'inconsistent' in runner.status['message']
     node.save_calibration_service_callback.assert_not_called()
 
 
@@ -188,7 +216,9 @@ def test_unreachable_views_do_not_produce_a_saved_calibration(monkeypatch):
     runner, node, _ = synthetic_sequence(monkeypatch, reachable=False)
     runner.run()
     assert runner.status['state'] == 'failed'
-    assert 'Too few valid views' in runner.status['message']
+    assert 'local search exhausted' in runner.status['message']
+    assert runner.status['attempts'] == 8
+    runner.move.assert_not_called()
     node.save_calibration_service_callback.assert_not_called()
 
 
@@ -199,3 +229,34 @@ def test_stop_during_motion_does_not_return_or_save(monkeypatch):
     assert runner.status['state'] == 'stopped'
     runner.move.assert_called_once()
     node.save_calibration_service_callback.assert_not_called()
+
+
+def test_real_path_rejects_intermediate_collision_before_sending_goal():
+    from sensor_msgs.msg import JointState
+    runner = bare_runner(); runner.check_collisions = True
+    runner.names = ['joint1']; runner.joints = JointState(name=['joint1'], position=[0.0])
+    runner.check = lambda: None
+    runner.joint_positions = lambda: np.array([0.0])
+    requests = []
+    def valid(req):
+        requests.append(req)
+        return SimpleNamespace(valid=not (.04 < req.robot_state.joint_state.position[0] < .06))
+    runner.validity = SimpleNamespace(wait_for_service=lambda **_: True, call_async=valid)
+    runner.node.get_parameter = lambda _: SimpleNamespace(value='arm')
+    runner.wait = lambda value, _: value
+    runner.action = Mock()
+    with pytest.raises(RuntimeError, match='collision'):
+        runner.move(np.array([.1]))
+    assert len(requests) > 1 and all(r.robot_state.is_diff for r in requests)
+    runner.action.send_goal_async.assert_not_called()
+
+
+def test_real_path_fails_closed_if_collision_service_is_missing():
+    runner = bare_runner(); runner.check_collisions = True
+    runner.validity = SimpleNamespace(wait_for_service=lambda **_: False)
+    runner.check = lambda: None
+    runner.joint_positions = lambda: np.array([0.0])
+    runner.action = Mock()
+    with pytest.raises(RuntimeError, match='unavailable'):
+        runner.move(np.array([.1]))
+    runner.action.send_goal_async.assert_not_called()

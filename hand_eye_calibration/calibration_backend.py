@@ -352,17 +352,21 @@ class CalibrationBackend:
         rotvec0 = Rot.from_matrix(rot0).as_rotvec()
         x0 = np.concatenate([rotvec0, tr0])
 
+        # Relative motions are constant during optimization. Compute all pairs
+        # once and evaluate their residuals in batches, including bootstrap fits.
+        a, b = np.asarray(pairs).T
+        Rg, tg, Rc, tc = map(np.asarray, (Rg, tg, Rc, tc))
+        RA = Rg[b].transpose(0,2,1) @ Rg[a]
+        tA = (Rg[b].transpose(0,2,1) @ (tg[a]-tg[b])[...,None])[...,0]
+        RB = Rc[b] @ Rc[a].transpose(0,2,1)
+        tB = tc[b] - (RB @ tc[a][...,None])[...,0]
+
         def residual(x):
-            rv, t = x[:3], x[3:]
-            R_X = Rot.from_rotvec(rv).as_matrix()
-            out = np.empty(len(pairs) * 6, dtype=np.float64)
-            for k, (a, b) in enumerate(pairs):
-                t_err_vec, R_err = CalibrationBackend._pair_residual_raw(
-                    Rg[a], tg[a], Rg[b], tg[b], Rc[a], tc[a], Rc[b], tc[b], R_X, t)
-                rot_err_vec = Rot.from_matrix(R_err).as_rotvec()
-                out[k * 6:k * 6 + 3] = t_err_vec / CalibrationBackend.TRANS_SCALE_M
-                out[k * 6 + 3:k * 6 + 6] = rot_err_vec / CalibrationBackend.ROT_SCALE_RAD
-            return out
+            R_X = Rot.from_rotvec(x[:3]).as_matrix()
+            t = x[3:]
+            translation = (RA @ t + tA - tB @ R_X.T - t) / CalibrationBackend.TRANS_SCALE_M
+            rotation = Rot.from_matrix(RA @ R_X @ RB.transpose(0,2,1) @ R_X.T).as_rotvec() / CalibrationBackend.ROT_SCALE_RAD
+            return np.column_stack((translation, rotation)).ravel()
 
         result = least_squares(residual, x0, method='trf', loss='soft_l1', f_scale=1.0, max_nfev=2000)
 

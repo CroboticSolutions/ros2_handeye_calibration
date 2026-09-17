@@ -556,6 +556,12 @@ class DataCollector(Node):
         if cal is None or detail is None:
             return None
 
+        cache_key = (tuple(cal), detail['algorithm_used'], self.bootstrap_samples,
+                     tuple(map(tuple, self.robot_samples)), tuple(map(tuple, self.tracking_samples)))
+        cached = getattr(self, '_uncertainty_cache', None)
+        if cached is not None and cached[0] == cache_key:
+            self._last_uncertainty = cached[1]
+            return cached[1]
         self.get_logger().info(
             f"Estimating calibration uncertainty ({self.bootstrap_samples} bootstrap resamples), "
             "this takes a few seconds..."
@@ -589,6 +595,7 @@ class DataCollector(Node):
         )
         self.get_logger().info("Uncertainty guidance: " + uncertainty['guidance'])
         self._last_uncertainty = uncertainty
+        self._uncertainty_cache = (cache_key, uncertainty)
         return uncertainty
 
     def estimate_uncertainty_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
@@ -642,6 +649,12 @@ class DataCollector(Node):
             # Record how well-determined the saved numbers actually are, so the
             # YAML carries its own error bars rather than a bare transform.
             uncertainty = self._compute_uncertainty(cal)
+            if self.automatic.active:
+                from .calibration_quality import position_uncertainty_ok
+                if not position_uncertainty_ok(uncertainty, self.automatic.max_position_sigma):
+                    resp.success = False
+                    resp.message = 'Automatic uncertainty target was not met; no calibration was saved.'
+                    return resp
             data = {
                 'calibration_type': self.calibration_type,
                 'tracking_base_frame': self.tracking_base_frame,
@@ -673,6 +686,9 @@ class DataCollector(Node):
             if self.automatic.active:
                 self.automatic.check()
                 data['automatic_validation'] = self.automatic.status.get('validation')
+                data['automatic_fit_consistency'] = self.automatic.status.get('fit_consistency')
+                data['automatic_sample_plan'] = {'initial': 6, 'targeted': 9, 'independent_validation': 0}
+                data['automatic_position_sigma_limit_m'] = self.automatic.max_position_sigma
             import tempfile
             import shutil
             if os.path.exists(cal_file):

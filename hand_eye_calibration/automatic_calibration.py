@@ -1,4 +1,4 @@
-"""Cancellable eye-in-hand sequence using IK and direct controller trajectories."""
+"""Cancellable eye-in-hand acquisition using observed joint-space bootstrap."""
 import copy
 import json
 import threading
@@ -9,22 +9,24 @@ import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from control_msgs.action import FollowJointTrajectory
-from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.srv import GetStateValidity, GetMotionPlan
+from controller_manager_msgs.srv import ListControllers
+from .motion_planning import plan_joint_path
+from .robot_configuration import chain_joints, matching_group, matching_controller
 from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.qos import qos_profile_sensor_data
+from tf2_ros import TransformException
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState, CameraInfo
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
-
-from .automatic_geometry import (camera_targets, validation_error, pose_variants,
-                                 distinct_view, has_rotation_diversity)
+from visualization_msgs.msg import Marker
 
 
-from .visibility import BoardFraming, CameraKinematics, visible_joint_path
+
 
 
 def matrix(tf):
@@ -46,6 +48,10 @@ class FramingCorrection(Exception):
     """Motion was cancelled and stopped to permit a framing correction."""
 
 
+class TrackingInterrupted(RuntimeError):
+    """Cancel and settle before attempting stationary board reacquisition."""
+
+
 class Stopped(Exception):
     pass
 
@@ -57,6 +63,8 @@ class AutomaticCalibration:
         self.stop_event = threading.Event()
         self.thread = None
         self.goal = None
+        self.board_marker = None
+        self.board_marker_pub = node.create_publisher(Marker, 'hand_eye_calibration/board_estimate', 1)
         self.joints = None
         self.joint_at = 0.0
         self.visible = False
@@ -65,18 +73,25 @@ class AutomaticCalibration:
         self.camera_info = None
         self.board_spec = {key: node.get_parameter(key).value for key in
                            ('squares_x', 'squares_y', 'square_length_m')}
-        self.status = {'state': 'idle', 'active': False, 'pose': 0, 'total': 24,
+        self.status = {'state': 'idle', 'active': False, 'pose': 0, 'total': 15, 'strategy': 'adaptive_joint_bootstrap', 'phase': 'bootstrap',
                        'accepted': 0, 'message': 'Position the camera to see the board, then Calibrate.'}
-        for key, value in {'auto_enabled': False, 'auto_group': 'arm',
-                           'auto_ik_link': 'arm_tcp',
-                           'auto_controller': '/arm_controller/follow_joint_trajectory',
-                           'auto_joint_names': ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']}.items():
+        for key, value in {'auto_enabled': False, 'auto_check_collisions': True, 'auto_group': '',
+                           'auto_max_position_sigma_m': .002, 'auto_max_training_samples': 15,
+                           'auto_controller': ''}.items():
             node.declare_parameter(key, value)
+        self.max_position_sigma = float(node.get_parameter('auto_max_position_sigma_m').value)
+        self.max_training_samples = 15  # fixed six initial + nine targeted samples
+        if not np.isfinite(self.max_position_sigma) or self.max_position_sigma <= 0:
+            raise ValueError('Invalid automatic calibration quality limits.')
+        self.check_collisions = bool(node.get_parameter("auto_check_collisions").value)
         self.status["enabled"] = bool(node.get_parameter("auto_enabled").value)
         self.group = ReentrantCallbackGroup()
-        self.ik = node.create_client(GetPositionIK, '/compute_ik', callback_group=self.group)
+        self.validity = node.create_client(GetStateValidity, "/check_state_validity", callback_group=self.group)
         self.description = node.create_client(GetParameters, '/robot_state_publisher/get_parameters', callback_group=self.group)
-        self.action = ActionClient(node, FollowJointTrajectory, node.get_parameter('auto_controller').value, callback_group=self.group)
+        self.action = None
+        self.planning = node.create_client(GetMotionPlan, '/plan_kinematic_path', callback_group=self.group)
+        self.semantic = node.create_client(GetParameters, '/move_group/get_parameters', callback_group=self.group)
+        self.controllers = node.create_client(ListControllers, '/controller_manager/list_controllers', callback_group=self.group)
         if node.camera_info_topic:
             node.create_subscription(CameraInfo, node.camera_info_topic, self._camera_info, qos_profile_sensor_data, callback_group=self.group)
         node.create_subscription(JointState, '/joint_states', self._joints, qos_profile_sensor_data, callback_group=self.group)
@@ -122,6 +137,27 @@ class AutomaticCalibration:
         msg = String()
         msg.data = json.dumps({**self.node._status_payload, 'automatic': dict(self.status)})
         self.node.status_pub.publish(msg)
+        if self.board_marker is not None:
+            self.board_marker.header.stamp = self.node.get_clock().now().to_msg()
+            self.board_marker.action = Marker.ADD if self.active else Marker.DELETE
+            self.board_marker_pub.publish(self.board_marker)
+
+    def show_board_estimate(self, board):
+        marker = Marker()
+        marker.header.frame_id = self.node.robot_base_frame
+        marker.ns = 'estimated_calibration_board'
+        marker.id = 0
+        marker.type = Marker.CUBE
+        center = (board @ np.r_[self.framing.center, 1])[:3]
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = map(float, center)
+        q = Rotation.from_matrix(board[:3,:3]).as_quat()
+        marker.pose.orientation.x, marker.pose.orientation.y, marker.pose.orientation.z, marker.pose.orientation.w = map(float,q)
+        marker.scale.x = self.board_spec['squares_x']*self.board_spec['square_length_m']
+        marker.scale.y = self.board_spec['squares_y']*self.board_spec['square_length_m']
+        marker.scale.z = .002
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1., .65, .1, .35
+        marker.lifetime.sec = 2
+        self.board_marker = marker
 
     def update(self, state, message, **values):
         with self.lock:
@@ -145,7 +181,7 @@ class AutomaticCalibration:
     def start(self, req, resp):
         with self.lock:
             if not self.node.get_parameter('auto_enabled').value:
-                resp.message = 'Automatic calibration is configured for the Piper simulation profile.'
+                resp.message = 'Automatic calibration is not enabled for this robot profile.'
             elif self.active or (self.thread is not None and self.thread.is_alive()):
                 resp.message = 'Calibration is already running.'
             elif self.node.calibration_type != 'eye-in-hand':
@@ -154,8 +190,19 @@ class AutomaticCalibration:
                 resp.message = 'Position the camera so the board is detected, then Calibrate.'
             else:
                 self.stop_event.clear()
+                if self.board_marker is not None:
+                    self.board_marker.action = Marker.DELETE
+                    self.board_marker_pub.publish(self.board_marker)
+                    self.board_marker = None
                 self.status = {**self.status, 'active': True, 'state': 'preparing', 'pose': 0,
-                               'accepted': 0, 'message': 'Checking initial view and controller.', 'validation': None, 'skipped': 0}
+                               'accepted': 0, 'message': 'Checking initial view and controller.', 'validation': None, 'phase': 'bootstrap', 'skipped': 0,
+                               'position_sigma_m': None, 'position_sigma_limit_m': self.max_position_sigma,
+                               'target_samples': 15, 'max_training_samples': self.max_training_samples,
+                               'attempts': 0, 'attempts_without_sample': 0, 'local_attempts_without_sample': 0,
+                               'max_attempts_without_sample': 16, 'max_local_attempts_without_sample': 8,
+                               'initial_samples': 0, 'targeted_samples': 0, 'validation_views': 0, 'required_validation_views': 0, 'fit_consistency': None,
+                               'search_mode': None, 'planner_rejections': {}, 'robot_group': None,
+                               'robot_joints': [], 'robot_controller': None}
                 self.thread = threading.Thread(target=self.run, daemon=True)
                 self.thread.start()
                 resp.success, resp.message = True, 'Automatic calibration started.'
@@ -181,49 +228,53 @@ class AutomaticCalibration:
             raise RuntimeError('Invalid joint positions.')
         return q
 
-    def tf(self, parent, child):
-        return self.node.tf_buffer.lookup_transform(parent, child, rclpy.time.Time()).transform
-
     def fresh_board(self):
         if not self.board_ready():
             raise ValueError('Board is not detected.')
         tf = self.node.tf_buffer.lookup_transform(self.node.tracking_base_frame, self.node.tracking_marker_frame, rclpy.time.Time())
         age = (self.node.get_clock().now().nanoseconds - rclpy.time.Time.from_msg(tf.header.stamp).nanoseconds) / 1e9
         if not -0.1 <= age < 1.0:
-            raise ValueError('Board pose is stale; check simulation time.')
+            raise ValueError('Board pose is stale; check camera timestamps and the ROS clock.')
         return matrix(tf.transform)
 
-    def solve(self, camera, seed):
-        req = GetPositionIK.Request()
-        ik = req.ik_request
-        ik.group_name = self.node.get_parameter('auto_group').value
-        ik.ik_link_name = self.node.get_parameter('auto_ik_link').value
-        ik.avoid_collisions = False
-        ik.timeout = Duration(seconds=0.25).to_msg()
-        ik.robot_state.joint_state = copy.deepcopy(self.joints)
-        values = dict(zip(self.names, seed))
-        ik.robot_state.joint_state.position = [float(values.get(n, p)) for n, p in zip(self.joints.name, self.joints.position)]
-        ik.pose_stamped.header.frame_id = self.node.robot_base_frame
-        target = camera @ self.camera_ik
-        p, q = target[:3, 3], Rotation.from_matrix(target[:3, :3]).as_quat()
-        pose = ik.pose_stamped.pose
-        pose.position.x, pose.position.y, pose.position.z = map(float, p)
-        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = map(float, q)
-        result = self.wait(self.ik.call_async(req), 3)
-        if result.error_code.val != 1:
-            return None
-        vals = dict(zip(result.solution.joint_state.name, result.solution.joint_state.position))
-        q = np.array([vals[n] for n in self.names])
-        if not np.isfinite(q).all() or np.any(q < self.lower) or np.any(q > self.upper):
-            return None
-        if np.max(np.abs(q - seed)) > 0.85:
-            return None  # reject IK branch jumps
-        return q
+    def collision_free_path(self, start, end):
+        if not self.check_collisions:
+            return True
+        if not self.validity.wait_for_service(timeout_sec=1):
+            raise RuntimeError('MoveIt collision checking is unavailable; no motion was sent.')
+        # Same straight joint-space path as the zero-endpoint-velocity cubic.
+        steps = max(2, int(np.ceil(np.max(np.abs(end-start)) / .015)) + 1)
+        feedback = copy.deepcopy(self.joints)
+        for fraction in np.linspace(0, 1, steps):
+            self.check()
+            req = GetStateValidity.Request()
+            req.group_name = getattr(self, 'move_group', self.node.get_parameter('auto_group').value)
+            req.robot_state.is_diff = True  # retain attached tools from the scene
+            req.robot_state.joint_state = copy.deepcopy(feedback)
+            values = dict(zip(self.names, start + fraction * (end-start)))
+            req.robot_state.joint_state.position = [float(values.get(n, p))
+                for n, p in zip(feedback.name, feedback.position)]
+            result = self.wait(self.validity.call_async(req), 3)
+            if result is None or not result.valid:
+                return False
+        return True
 
-    def move(self, q, monitor=None):
+    def move(self, q, monitor=None, speed_scale=1.0, minimum_duration=2.5):
         self.check()
         start = self.joint_positions()
-        seconds = max(2.5, float(np.max(np.abs(q - start))) / 0.12)
+        if not self.collision_free_path(start, q):
+            raise RuntimeError('Calibration path is in collision in the MoveIt scene; no motion was sent.')
+        self.check()
+        if np.max(np.abs(self.joint_positions() - start)) > .01:
+            raise RuntimeError('Robot moved during path checking; retry calibration.')
+        distance = float(np.max(np.abs(q - start)))
+        seconds = max(minimum_duration, distance / 0.12)
+        if self.check_collisions:
+            # Cubic with zero endpoint velocities: peak v=1.5*d/T, a=6*d/T².
+            seconds = max(minimum_duration, 1.5 * distance / .06, np.sqrt(6 * distance / .12))
+        if hasattr(self, 'velocity_limits'):
+            seconds = max(seconds, float(np.max(1.5*np.abs(q-start)/self.velocity_limits)))
+        seconds /= max(.25, min(1., speed_scale))
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = self.names
         from trajectory_msgs.msg import JointTrajectoryPoint
@@ -233,6 +284,53 @@ class AutomaticCalibration:
             point.velocities = [0.0] * len(q)
             point.time_from_start = Duration(seconds=stamp).to_msg()
             goal.trajectory.points.append(point)
+        self.execute_trajectory(goal, seconds, q, monitor)
+
+    def move_planned(self, trajectory):
+        import copy
+        self.check()
+        trajectory = copy.deepcopy(trajectory)
+        if len(trajectory.points) < 2 or trajectory.joint_names != list(self.names):
+            raise RuntimeError('Invalid planned calibration trajectory.')
+        start = self.joint_positions()
+        if np.max(np.abs(start-np.asarray(trajectory.points[0].positions))) > .01:
+            raise RuntimeError('Robot moved since planning; trajectory was not sent.')
+        times = np.array([p.time_from_start.sec+p.time_from_start.nanosec/1e9 for p in trajectory.points])
+        if not np.isfinite(times).all() or times[0] < 0 or np.any(np.diff(times) <= 0):
+            raise RuntimeError('MoveIt trajectory has invalid timing.')
+        velocity_limit = np.minimum(self.velocity_limits, .18)
+        scale = 1.
+        previous = None
+        for point, stamp in zip(trajectory.points, times):
+            self.check()
+            q = np.asarray(point.positions)
+            if not np.isfinite(q).all() or np.any(q < self.lower) or np.any(q > self.upper):
+                raise RuntimeError('Planned trajectory exceeds joint limits.')
+            if len(point.velocities) != len(self.names) or len(point.accelerations) != len(self.names):
+                raise RuntimeError('MoveIt trajectory lacks timed velocity/acceleration data.')
+            scale = max(scale, float(np.max(np.abs(point.velocities)/velocity_limit)),
+                        float(np.sqrt(np.max(np.abs(point.accelerations)/.36))))
+            if previous is not None:
+                old, old_stamp = previous
+                scale = max(scale, float(np.max(np.abs(q-old)/(stamp-old_stamp)/velocity_limit)))
+                if not self.collision_free_path(old, q):
+                    raise RuntimeError('Planned path is now in collision; trajectory was not sent.')
+            previous = (q, stamp)
+        if not np.isfinite(scale):
+            raise RuntimeError('Invalid planned trajectory speed.')
+        # Uniform time scaling preserves the MoveIt path and its smooth derivatives.
+        for point, stamp in zip(trajectory.points, times):
+            point.time_from_start = Duration(seconds=float(stamp*scale)).to_msg()
+            point.velocities = [float(v/scale) for v in point.velocities]
+            point.accelerations = [float(a/scale**2) for a in point.accelerations]
+        if np.max(np.abs(self.joint_positions()-start)) > .01:
+            raise RuntimeError('Robot moved during path checks; trajectory was not sent.')
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+        self.execute_trajectory(goal, float(times[-1]*scale),
+                                np.asarray(trajectory.points[-1].positions), self.joint_positions)
+
+    def execute_trajectory(self, goal, seconds, q, monitor):
         goal.goal_time_tolerance = Duration(seconds=2).to_msg()
         abandoned = threading.Event()
         future = self.action.send_goal_async(goal)
@@ -257,13 +355,13 @@ class AutomaticCalibration:
                 if monitor is not None:
                     try:
                         monitor()
-                    except FramingCorrection:
+                    except (FramingCorrection, TrackingInterrupted):
                         # Wait for terminal cancellation before issuing any new
                         # command; a cancellation request alone is insufficient.
                         self.wait(handle.cancel_goal_async(), 3)
                         result = self.wait(result_future, 5)
                         if result.status not in (GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_SUCCEEDED):
-                            raise RuntimeError('Controller failed while stopping for framing correction.')
+                            raise RuntimeError('Controller failed while pausing calibration.')
                         self.settle(self.joint_positions())
                         raise
                 self.stop_event.wait(.05)
@@ -271,7 +369,7 @@ class AutomaticCalibration:
             if result.status != GoalStatus.STATUS_SUCCEEDED or result.result.error_code != 0:
                 raise RuntimeError('Trajectory failed: ' + result.result.error_string)
             self.settle(q)
-        except FramingCorrection:
+        except (FramingCorrection, TrackingInterrupted):
             raise
         except Exception:
             # Also cancel goals whose acceptance arrives after a timeout.
@@ -315,25 +413,6 @@ class AutomaticCalibration:
                 return True
         return False
 
-    def prepare_framing(self, root):
-        if self.camera_info is None:
-            raise ValueError('Waiting for CameraInfo; retry when the camera is streaming.')
-        self.framing = BoardFraming(self.board_spec, self.camera_info)
-        # Detector expresses its pose in tracking_base_frame. Transform to the
-        # actual optical frame named by CameraInfo before projecting.
-        self.optical_tracking = matrix(self.tf(self.camera_info.header.frame_id, self.node.tracking_base_frame))
-        self.kinematics = CameraKinematics(root, self.node.robot_base_frame,
-            self.node.get_parameter('auto_ik_link').value, self.names, self.camera_ik)
-
-    def fits(self, observation):
-        return self.framing.contains(self.optical_tracking @ observation)
-
-    def optical_camera(self, q):
-        return self.kinematics.camera(q) @ np.linalg.inv(self.optical_tracking)
-
-    def path_fits(self, start, end, base_board, margin=None):
-        return visible_joint_path(start, end, self.optical_camera, self.framing, base_board, margin)
-
     def observed_board(self, recovering=False):
         # After settling, require a detection captured after the stop, not the
         # last transform from the preceding movement.
@@ -358,160 +437,112 @@ class AutomaticCalibration:
         # Check new image timestamps as well as ROS age: a paused simulation or
         # stalled detector must not keep an old detection valid indefinitely.
         self.joint_positions()
+        # A rejected RGB frame does not invalidate the preceding accepted pose.
+        # During motion use that pose only inside the existing 350 ms freshness
+        # bound. Start/capture still require a currently detected board.
         try:
-            board = self.fresh_board()
-        except ValueError as exc:
-            raise RuntimeError('Board detection lost during motion; stopping.') from exc
-        stamped = self.node.tf_buffer.lookup_transform(self.node.tracking_base_frame,
-            self.node.tracking_marker_frame, rclpy.time.Time())
+            stamped = self.node.tf_buffer.lookup_transform(self.node.tracking_base_frame,
+                self.node.tracking_marker_frame, rclpy.time.Time())
+        except TransformException as exc:
+            raise TrackingInterrupted('Board detection lost during motion; pausing.') from exc
+        board = matrix(stamped.transform)
         stamp = rclpy.time.Time.from_msg(stamped.header.stamp).nanoseconds
         if stamp != self.monitor_stamp:
             self.monitor_stamp, self.monitor_at = stamp, time.monotonic()
         age = (self.node.get_clock().now().nanoseconds - stamp) / 1e9
-        if age > .35 or time.monotonic() - self.monitor_at > .75:
-            raise RuntimeError('Camera feedback stale during motion; stopping.')
+        if not -.1 <= age <= .35 or time.monotonic() - self.monitor_at > .75:
+            raise TrackingInterrupted('Camera feedback stale during motion; pausing.')
         observation = self.optical_tracking @ board
         if not self.framing.contains(observation, margin=.03):
             raise RuntimeError('Board too close to image edge; stopping.')
         if not self.framing.contains(observation, margin=.08):
             raise FramingCorrection('Board approaching image edge.')
 
-    def guarded_move(self, target):
-        desired = target.copy()
-        recovering = False
-        for attempt in range(4):
+    def wait_for_tracking(self):
+        """Called only after controller cancellation and measured settling."""
+        deadline = time.monotonic() + 5
+        first_stamp = last_stamp = None
+        count = 0
+        while time.monotonic() < deadline:
             self.check()
-            start = self.joint_positions()
-            board = self.observed_board(recovering=recovering)
-            base_board = self.kinematics.camera(start) @ board
-            if np.max(np.abs(desired-start)) < .003 and not recovering:
-                return
-            if recovering or not self.path_fits(start, desired, base_board):
-                camera = self.optical_camera(desired)
-                corrected = self.framing.corrected(camera, base_board)
-                q = None if corrected is None else self.solve(corrected @ self.optical_tracking, start)
-                if q is None:
-                    raise RuntimeError('No reachable correction keeps the board in frame; sequence stopped.')
-                desired = q
-                # Recovery starts inside the normal margin. Require full board
-                # visibility throughout and restore the 10% margin at its end.
-                margin = .03 if recovering else None
-                if not self.path_fits(start, desired, base_board, margin=margin):
-                    raise RuntimeError('Correction path leaves the image margin; sequence stopped.')
-                self.update('moving', 'Correcting board framing while preserving camera tilt.')
-            self.monitor_stamp, self.monitor_at = None, time.monotonic()
-            def monitor():
-                try:
-                    self.motion_monitor()
-                except FramingCorrection:
-                    # During recovery tolerate the warning band, but the hard
-                    # edge and freshness checks remain active.
-                    if not recovering:
-                        raise
+            self.joint_positions()
             try:
-                self.move(desired, monitor=monitor)
-                self.observed_board()
-                return
-            except FramingCorrection:
-                recovering = True
-                self.update('moving', 'Paused near image margin; checking a correction.')
-        raise RuntimeError('Framing correction did not converge; sequence stopped.')
+                board = self.fresh_board()
+                stamped = self.node.tf_buffer.lookup_transform(self.node.tracking_base_frame,
+                    self.node.tracking_marker_frame, rclpy.time.Time())
+                stamp = rclpy.time.Time.from_msg(stamped.header.stamp).nanoseconds
+                age = (self.node.get_clock().now().nanoseconds-stamp)/1e9
+                if not -.1 <= age <= .2 or not self.framing.contains(self.optical_tracking @ board, margin=.03):
+                    raise ValueError('Waiting for fresh, fully visible board.')
+                if last_stamp is not None and stamp < last_stamp:
+                    raise ValueError('Camera timestamp went backwards.')
+                if stamp != last_stamp:
+                    first_stamp = stamp if first_stamp is None else first_stamp
+                    last_stamp = stamp
+                    count += 1
+                if count >= 3 and stamp-first_stamp >= 200_000_000:
+                    return
+            except (ValueError, TransformException):
+                first_stamp = last_stamp = None
+                count = 0
+            self.stop_event.wait(.05)
+        raise RuntimeError('Board did not return with stable detection within 5 seconds. Robot remains stopped; recenter the board and retry.')
+
+    def configure_robot(self, root):
+        self.names = chain_joints(root, self.node.robot_base_frame, self.node.robot_effector_frame)
+        if len(self.names)<3:
+            raise ValueError('Calibration requires at least three controlled joints.')
+        limits = [root.find(f"joint[@name='{name}']/limit") for name in self.names]
+        if any(limit is None for limit in limits):
+            raise ValueError('Controlled joint limits are missing from the robot description.')
+        self.lower = np.array([float(limit.get('lower')) for limit in limits])
+        self.upper = np.array([float(limit.get('upper')) for limit in limits])
+        self.velocity_limits = np.array([float(limit.get('velocity','nan')) for limit in limits])
+        if not np.isfinite(self.velocity_limits).all() or np.any(self.velocity_limits<=0):
+            raise ValueError('Robot URDF is missing positive joint velocity limits.')
+        if not np.isfinite([self.lower,self.upper]).all() or np.any(self.lower>=self.upper):
+            raise ValueError('Invalid robot joint limits.')
+        if not self.semantic.wait_for_service(timeout_sec=2):
+            raise RuntimeError('MoveIt semantic robot description is unavailable.')
+        result = self.wait(self.semantic.call_async(GetParameters.Request(names=['robot_description_semantic'])),3)
+        self.move_group = matching_group(root,result.values[0].string_value,self.names,
+                                        self.node.get_parameter('auto_group').value)
+        controller = self.node.get_parameter('auto_controller').value
+        if not controller:
+            if not self.controllers.wait_for_service(timeout_sec=2):
+                raise RuntimeError('Controller discovery unavailable; configure auto_controller.')
+            result = self.wait(self.controllers.call_async(ListControllers.Request()),3)
+            controller = matching_controller(result.controller,self.names)
+        if self.action is not None:
+            self.action.destroy()
+        self.action = ActionClient(self.node,FollowJointTrajectory,controller,callback_group=self.group)
+        self.update('preparing', f'Robot configured: {self.move_group}, {len(self.names)} joints.',
+                    robot_group=self.move_group, robot_joints=self.names, robot_controller=controller)
+
+    def plan_joint_path(self, start, target):
+        return plan_joint_path(self, start, target)
 
     def run(self):
         n = self.node
         try:
-            self.names = list(n.get_parameter('auto_joint_names').value)
-            if not self.ik.wait_for_service(timeout_sec=2) or not self.action.wait_for_server(timeout_sec=2):
-                raise RuntimeError('IK service or trajectory controller is unavailable.')
             if not self.description.wait_for_service(timeout_sec=2):
                 raise RuntimeError('Robot description is unavailable.')
             req = GetParameters.Request(names=['robot_description'])
             urdf = self.wait(self.description.call_async(req), 3).values[0].string_value
             root = ET.fromstring(urdf)
-            limits = [root.find(f"joint[@name='{name}']/limit") for name in self.names]
-            self.lower = np.array([float(l.attrib['lower']) for l in limits])
-            self.upper = np.array([float(l.attrib['upper']) for l in limits])
+            self.configure_robot(root)
+            if not self.action.wait_for_server(timeout_sec=2):
+                raise RuntimeError('Trajectory controller is unavailable.')
+            if not self.planning.wait_for_service(timeout_sec=2):
+                raise RuntimeError('MoveIt /plan_kinematic_path is unavailable; no motion was sent.')
             initial = self.joint_positions()
+            if not self.collision_free_path(initial, initial):
+                raise RuntimeError('Current robot pose is in collision in the MoveIt scene; no motion was sent.')
             self.settle(initial)
-            board = self.fresh_board()
-            base_camera = matrix(self.tf(n.robot_base_frame, n.tracking_base_frame))
-            self.camera_ik = matrix(self.tf(n.tracking_base_frame, n.get_parameter('auto_ik_link').value))
-            self.prepare_framing(root)
-            if not self.fits(board):
-                raise ValueError('Center the entire board with 10% image margin before Calibrate. No motion was sent.')
-            base_board = base_camera @ board
-            targets = camera_targets(base_camera, board)
-            plan, views, seed = [], [], initial
-            for i, target in enumerate(targets):
-                self.check()
-                self.update('preparing', 'Checking reachable views; adapting motion to the initial pose.', pose=i + 1)
-                q, chosen = None, None
-                for candidate in pose_variants(base_camera, target):
-                    if not self.fits(np.linalg.inv(candidate) @ base_board):
-                        optical = candidate @ np.linalg.inv(self.optical_tracking)
-                        corrected = self.framing.corrected(optical, base_board)
-                        if corrected is None:
-                            continue
-                        candidate = corrected @ self.optical_tracking
-                    if not distinct_view(candidate, views):
-                        continue
-                    q = self.solve(candidate, seed)
-                    if q is not None and self.path_fits(seed, q, base_board):
-                        chosen = candidate
-                        break
-                    q = None
-                if q is not None:
-                    views.append(chosen)
-                    plan.append((i, q, chosen))
-                    seed = q
-            training = [pose for i, _, pose in plan if i < len(targets) - 3]
-            checks = [i for i, _, _ in plan if i >= len(targets) - 3]
-            if len(training) < 12 or len(checks) < 2 or not has_rotation_diversity(training):
-                raise RuntimeError('Too few valid views from this starting pose. Bend the arm further from its limits, keep the board visible, and retry. No motion was sent.')
+            from .bootstrap_calibration import BootstrapSession
+            BootstrapSession(self, root).run()
             self.check()
-            self.settle(initial)
-            current_board = self.fresh_board()
-            if (np.linalg.norm(current_board[:3, 3] - board[:3, 3]) > 0.01 or
-                    Rotation.from_matrix(board[:3, :3].T @ current_board[:3, :3]).magnitude() > np.deg2rad(3)):
-                raise RuntimeError('Initial view changed during preparation; keep robot and board still and retry.')
-            n.robot_samples.clear()
-            n.tracking_samples.clear()
-            n.sample_metrics.clear()
-            n._last_uncertainty = n._last_calibration_detail = None
-            n._publish_status(None, None)
-            skipped, holdouts = len(targets) - len(plan), []
-            for i, q, _ in plan:
-                self.check()
-                validation = i >= len(targets) - 3
-                self.update('validating' if validation else 'moving', 'Moving to the next view.', pose=i + 1, skipped=skipped)
-                self.guarded_move(q)
-                self.update('capturing', 'Robot stationary; collecting fresh board frames.')
-                if self.capture():
-                    if validation:
-                        holdouts.append((sample_matrix(n.robot_samples.pop()), sample_matrix(n.tracking_samples.pop())))
-                        n.sample_metrics.pop()
-                        n._last_calibration_detail = None
-                        n._publish_status(None, None)
-                    else:
-                        self.update('capturing', 'Sample accepted.', accepted=len(n.robot_samples))
-                else:
-                    skipped += 1
-                    self.update('skipped', 'No stable board detection; sample skipped.', skipped=skipped)
-            self.update('returning', 'Returning to the initial position.')
-            self.guarded_move(initial)
-            if len(n.robot_samples) < 12 or len(holdouts) < 2:
-                raise RuntimeError('Too few valid views. Need 12 samples and 2 validation views; choose a better initial view and retry.')
-            self.update('solving', 'Computing camera calibration and checking independent views.')
-            cal = n.get_calibration()
-            if cal is None:
-                raise RuntimeError('Calibration could not be solved.')
-            check = validation_error([sample_matrix(s) for s in n.robot_samples],
-                                     [sample_matrix(s) for s in n.tracking_samples], sample_matrix(cal), holdouts)
-            self.update('validating', 'Checking board consistency in base frame.', validation=check)
-            if check['max_translation_m'] > 0.01 or check['max_rotation_deg'] > 3:
-                raise RuntimeError('Independent validation failed (limit 10 mm / 3 degrees). Result was not saved.')
-            self.check()
-            self.update('saving', 'Validation passed; estimating uncertainty and saving.')
+            self.update('saving', 'Internal consistency and uncertainty passed; saving without independent validation.', validation=None)
             response = n.save_calibration_service_callback(Trigger.Request(), Trigger.Response())
             self.check()
             if not response.success:

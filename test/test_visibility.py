@@ -9,7 +9,7 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from hand_eye_calibration.visibility import BoardFraming, CameraKinematics, visible_joint_path
-from hand_eye_calibration.automatic_calibration import AutomaticCalibration, FramingCorrection
+from hand_eye_calibration.automatic_calibration import AutomaticCalibration, FramingCorrection, TrackingInterrupted
 
 
 def framing():
@@ -62,6 +62,7 @@ def test_urdf_fk_includes_origin_axis_and_camera_offset():
 
 def runner():
     r = AutomaticCalibration.__new__(AutomaticCalibration)
+    r.check_collisions = False
     r.check = lambda: None
     r.update = Mock()
     r.framing = framing()
@@ -71,43 +72,15 @@ def runner():
     state = [np.zeros(6)]
     r.joint_positions = lambda: state[0].copy()
     r.move = Mock(side_effect=lambda q, **kwargs: state.__setitem__(0, q.copy()))
-    r.path_fits = Mock(return_value=True)
     return r
 
 
-def test_guarded_motion_uses_one_trajectory_and_observes_at_destination():
-    r = runner(); target = np.ones(6)*.6
-    r.guarded_move(target)
-    r.move.assert_called_once()
-    np.testing.assert_allclose(r.move.call_args.args[0], target)
-    assert callable(r.move.call_args.kwargs['monitor'])
-    assert r.observed_board.call_count == 2
 
 
-def test_detection_loss_stops_before_further_motion():
-    r = runner()
-    r.observed_board.side_effect = [observation(), RuntimeError('lost')]
-    with pytest.raises(RuntimeError, match='lost'):
-        r.guarded_move(np.ones(6)*.2)
-    r.move.assert_called_once()
 
 
-def test_invalid_correction_sends_no_trajectory():
-    r = runner(); r.path_fits.return_value = False
-    r.solve = Mock(return_value=None)
-    with pytest.raises(RuntimeError, match='No reachable correction'):
-        r.guarded_move(np.ones(6)*.2)
-    r.move.assert_not_called()
 
 
-def test_reachable_correction_is_checked_before_motion():
-    r = runner()
-    r.path_fits.side_effect = [False, True, True]
-    r.solve = Mock(return_value=np.ones(6)*.08)
-    r.guarded_move(np.ones(6)*.2)
-    r.solve.assert_called_once()
-    np.testing.assert_allclose(r.move.call_args.args[0], np.ones(6)*.08)
-    assert r.path_fits.call_count == 2
 
 
 def test_camera_intrinsic_change_interrupts_active_run():
@@ -122,14 +95,6 @@ def test_camera_intrinsic_change_interrupts_active_run():
     assert r.stop_event.is_set()
 
 
-def test_warning_replans_after_cancelled_motion_and_stops_at_target():
-    r = runner()
-    r.move.side_effect = [FramingCorrection(), None]
-    r.solve = Mock(return_value=np.ones(6)*.15)
-    r.guarded_move(np.ones(6)*.2)
-    assert r.move.call_count == 2
-    r.solve.assert_called_once()
-    assert r.observed_board.call_args_list[1].kwargs['recovering'] is True
 
 
 def test_monitor_loss_cancels_active_goal(monkeypatch):
@@ -152,7 +117,8 @@ def test_monitor_loss_cancels_active_goal(monkeypatch):
     r.settle.assert_not_called()
 
 
-def test_warning_waits_for_terminal_cancellation_before_replanning():
+@pytest.mark.parametrize("interruption", [FramingCorrection, TrackingInterrupted])
+def test_warning_waits_for_terminal_cancellation_before_replanning(interruption):
     from concurrent.futures import Future
     from action_msgs.msg import GoalStatus
     r = runner(); r.names = [f'joint{i}' for i in range(6)]
@@ -168,23 +134,12 @@ def test_warning_waits_for_terminal_cancellation_before_replanning():
     r.action = SimpleNamespace(send_goal_async=lambda _: accepted)
     r.wait = lambda future, timeout: future.result(timeout=.1)
     r.settle = Mock()
-    with pytest.raises(FramingCorrection):
-        AutomaticCalibration.move(r, np.ones(6)*.2, monitor=Mock(side_effect=FramingCorrection()))
+    with pytest.raises(interruption):
+        AutomaticCalibration.move(r, np.ones(6)*.2, monitor=Mock(side_effect=interruption()))
     handle.cancel_goal_async.assert_called_once()
     r.settle.assert_called_once()
     assert pending.done()
     assert not r.stop_event.is_set()
-
-
-def monitor_runner():
-    from builtin_interfaces.msg import Time
-    r = runner(); r.monitor_stamp = 1000000000; r.monitor_at = time.monotonic()
-    r.fresh_board = Mock(return_value=observation())
-    stamped = SimpleNamespace(header=SimpleNamespace(stamp=Time(sec=1)))
-    r.node = SimpleNamespace(tf_buffer=SimpleNamespace(lookup_transform=lambda *a: stamped),
-        tracking_base_frame='camera', tracking_marker_frame='board',
-        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1100000000)))
-    return r
 
 
 def test_monitor_rejects_stalled_image_even_with_paused_ros_clock():
@@ -201,3 +156,67 @@ def test_monitor_warning_and_hard_edge_are_distinct():
     r.framing.contains.side_effect = [False]
     with pytest.raises(RuntimeError, match='edge'):
         r.motion_monitor()
+
+
+def monitor_runner(age=.1):
+    from geometry_msgs.msg import TransformStamped
+    from rclpy.time import Time
+    from scipy.spatial.transform import Rotation
+    r = runner(); r.visible = False  # Latest frame was rejected.
+    r.monitor_stamp = 10000000000; r.monitor_at = time.monotonic()
+    stamped = TransformStamped(); stamped.header.stamp = Time(seconds=10).to_msg()
+    obs = observation(); t = stamped.transform
+    t.translation.x, t.translation.y, t.translation.z = map(float, obs[:3, 3])
+    t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w = map(float, Rotation.from_matrix(obs[:3, :3]).as_quat())
+    r.node = SimpleNamespace(tracking_base_frame='camera', tracking_marker_frame='board',
+        tf_buffer=SimpleNamespace(lookup_transform=lambda *a: stamped),
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=10+age)))
+    return r
+
+
+def test_rejected_frame_keeps_recent_valid_pose_during_motion():
+    r = monitor_runner(.05)
+    r.motion_monitor()  # No stop on a single rejected image.
+
+
+@pytest.mark.parametrize('age', [.36, 1.0, -.2])
+def test_rejected_frames_cannot_extend_pose_freshness(age):
+    with pytest.raises(RuntimeError, match='stale'):
+        monitor_runner(age).motion_monitor()
+
+
+def test_paused_ros_clock_does_not_allow_stale_motion():
+    r = monitor_runner(.05)
+    r.motion_monitor(); r.monitor_at -= 1
+    with pytest.raises(RuntimeError, match='stale'):
+        r.motion_monitor()
+
+
+
+
+
+
+def test_stationary_reacquisition_requires_multiple_fresh_frames():
+    from geometry_msgs.msg import TransformStamped
+    from rclpy.time import Time
+    r = runner(); r.stop_event = threading.Event()
+    r.fresh_board = Mock(return_value=observation())
+    now = [10.]
+    def stamped(*args):
+        now[0] += .05
+        msg = TransformStamped(); msg.header.stamp = Time(seconds=now[0]).to_msg()
+        return msg
+    r.node = SimpleNamespace(tracking_base_frame='camera', tracking_marker_frame='board',
+        tf_buffer=SimpleNamespace(lookup_transform=stamped),
+        get_clock=lambda: SimpleNamespace(now=lambda: Time(seconds=now[0])))
+    r.wait_for_tracking()
+    assert r.fresh_board.call_count >= 5
+
+
+def test_stationary_reacquisition_times_out_on_repeated_old_frame(monkeypatch):
+    r = monitor_runner(.05); r.stop_event = Mock()
+    r.fresh_board = Mock(return_value=observation())
+    ticks = iter(np.arange(0, 20, .5))
+    monkeypatch.setattr(time, 'monotonic', lambda: next(ticks))
+    with pytest.raises(RuntimeError, match='within 5 seconds'):
+        r.wait_for_tracking()
