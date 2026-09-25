@@ -22,7 +22,7 @@ YAML ("oak_rgb_camera_optical_frame" → rgb), or forced with --socket.
 Typical use after saving a new calibration from the GUI:
 
     python3 -m hand_eye_calibration.depthai_mount_cli \
-        --update-xacro ~/arms_ws/src/piper_ros/src/robot_description/piper_description/urdf/include/piper_oak_d_pro_w_handeye_macros.xacro
+        --update-xacro ~/arms_ws/src/robots/piper_ros/src/robot_description/piper_description/urdf/include/piper_oak_d_pro_w_handeye_macros.xacro
 
 then rebuild piper_description and restart the robot stack.
 

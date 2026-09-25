@@ -2,7 +2,7 @@
 Tests for depthai_mount_cli: nominal chains, mount composition, xacro rewrite.
 
 Run offline (no ROS):
-  cd arms_ws/src/ros2_handeye_calibration
+  cd arms_ws/src/misc/ros2_handeye_calibration
   python3 -m pytest test/test_depthai_mount_cli.py -v
 """
 

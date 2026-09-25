@@ -4,7 +4,7 @@ generated from a known ground-truth transform so the tests do not depend on
 ROS, real hardware, or a physical ChArUco board.
 
 Run offline (no ROS):
-  cd arms_ws/src/ros2_handeye_calibration
+  cd arms_ws/src/misc/ros2_handeye_calibration
   python3 -m pytest test/test_calibration_backend.py -v
 """
 

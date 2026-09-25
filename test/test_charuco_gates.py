@@ -7,7 +7,7 @@ pinned against this repo's real fixture so a future tuning change that would
 silently stop accepting good captures fails here instead of in the lab.
 
 Run offline (needs a ROS 2 environment sourced):
-  cd arms_ws/src/ros2_handeye_calibration
+  cd arms_ws/src/misc/ros2_handeye_calibration
   python3 -m pytest test/test_charuco_gates.py -v
 """
 

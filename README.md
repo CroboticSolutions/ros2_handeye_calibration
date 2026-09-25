@@ -48,7 +48,7 @@ Default board: 13×9 squares (13 wide × 9 high — ChArUco X/Y are orientation-
 The GUI's *Save calibration* writes `~/.ros/hand_eye_calibration.yaml` only. To apply it to the robot, regenerate the URDF mount origin and rebuild:
 
 ```bash
-cd arms_ws/src/ros2_handeye_calibration
+cd arms_ws/src/misc/ros2_handeye_calibration
 python3 -m hand_eye_calibration.depthai_mount_cli \
   --update-xacro ../piper_ros/src/robot_description/piper_description/urdf/include/piper_oak_d_pro_w_handeye_macros.xacro
 cd ../.. && colcon build --packages-select piper_description

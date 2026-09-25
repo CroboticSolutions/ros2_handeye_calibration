@@ -12,7 +12,7 @@ the active end effector.
 Typical use after saving a new pivot calibration from the GUI:
 
     python3 -m hand_eye_calibration.tool_tcp_cli \\
-        --update-xacro ~/arms_ws/src/piper_ros/src/robot_description/piper_description/urdf/include/piper_tool_tcp_macros.xacro
+        --update-xacro ~/arms_ws/src/robots/piper_ros/src/robot_description/piper_description/urdf/include/piper_tool_tcp_macros.xacro
 
 then rebuild piper_description, restart the robot stack, and call
 arm/set_eelink with the tcp link name to make MoveIt plan to it.

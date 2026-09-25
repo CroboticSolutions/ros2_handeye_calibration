@@ -3,7 +3,7 @@ Tests for tool_tcp_cli: YAML -> xacro joint (flange -> tool TCP), both creating
 a fresh xacro file and updating an existing one.
 
 Run offline (no ROS):
-  cd arms_ws/src/ros2_handeye_calibration
+  cd arms_ws/src/misc/ros2_handeye_calibration
   python3 -m pytest test/test_tool_tcp_cli.py -v
 """
 

@@ -3,7 +3,7 @@ Unit tests for pivot (tool-tip) calibration, using synthetic flange poses with
 a known ground-truth TCP translation and pivot point.
 
 Run offline (no ROS):
-  cd arms_ws/src/ros2_handeye_calibration
+  cd arms_ws/src/misc/ros2_handeye_calibration
   python3 -m pytest test/test_pivot_backend.py -v
 """
 

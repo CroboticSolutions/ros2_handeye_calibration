@@ -11,7 +11,7 @@ which raises ``RuntimeError: Executor is already spinning`` and aborted every
 capture. Nothing in the backend tests could see that.
 
 Run offline (needs a ROS 2 environment sourced):
-  cd arms_ws/src/ros2_handeye_calibration
+  cd arms_ws/src/misc/ros2_handeye_calibration
   python3 -m pytest test/test_capture_burst.py -v
 """
 

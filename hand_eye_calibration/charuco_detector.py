@@ -65,6 +65,11 @@ class CharucoBoardDetector(Node):
     def __init__(self):
         super().__init__("charuco_detector")
 
+        # Avoid a large OpenCV worker pool competing with RGB-D and robot nodes.
+        # This is local to the detector process; welding processes are unaffected.
+        self.declare_parameter("opencv_threads", 2)
+        cv2.setNumThreads(max(1, int(self.get_parameter("opencv_threads").value)))
+
         # Topics / frames
         self.declare_parameter("image_topic", "/oak/rgb/image_raw")
         self.declare_parameter("camera_info_topic", "/oak/rgb/camera_info")
@@ -161,7 +166,10 @@ class CharucoBoardDetector(Node):
             CameraInfo, self.camera_info_topic, self._camera_info_cb, 10
         )
         self.create_subscription(
-            Image, self.image_topic, self._image_cb, qos_profile_sensor_data
+            Image, self.image_topic, self._image_cb,
+            QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                       reliability=ReliabilityPolicy.BEST_EFFORT,
+                       durability=DurabilityPolicy.VOLATILE)
         )
         # GUI -> node live board reconfiguration.
         self.create_subscription(
