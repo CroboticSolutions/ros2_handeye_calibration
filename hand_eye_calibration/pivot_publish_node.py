@@ -36,13 +36,13 @@ class PivotCalibrationPublisher(Node):
             self.get_logger().error('Tool TCP calibration file not found: %s' % cal_file)
             self.get_logger().info('Capture at least 4 pivot samples, then call save_calibration:')
             self.get_logger().info('  ros2 service call /tool_tcp_calibration/save_calibration std_srvs/srv/Trigger {}')
-            return
+            raise FileNotFoundError(cal_file)
         try:
             with open(cal_file, 'r') as f:
                 data = yaml.safe_load(f)
         except Exception as e:
             self.get_logger().error('Failed to load TCP calibration: %s' % str(e))
-            return
+            raise RuntimeError('Failed to load TCP calibration: %s' % cal_file) from e
 
         t = data['transform']
         parent = data.get('robot_flange_frame', data.get('parent_frame', 'link6'))

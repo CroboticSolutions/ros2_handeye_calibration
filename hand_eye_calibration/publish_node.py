@@ -36,13 +36,13 @@ class CalibrationPublisher(Node):
             self.get_logger().error('Calibration file not found: %s' % cal_file)
             self.get_logger().info('Run calibration, capture at least 4 points, then call save_calibration:')
             self.get_logger().info('  ros2 service call /hand_eye_calibration/save_calibration std_srvs/srv/Trigger {}')
-            return
+            raise FileNotFoundError(cal_file)
         try:
             with open(cal_file, 'r') as f:
                 data = yaml.safe_load(f)
         except Exception as e:
             self.get_logger().error('Failed to load calibration: %s' % str(e))
-            return
+            raise RuntimeError('Failed to load calibration: %s' % cal_file) from e
         t = data['transform']
         parent = data['robot_effector_frame']
         child = data['tracking_base_frame']
