@@ -17,7 +17,7 @@ def test_uncertainty_gate(sigma,count,ok):
 
 
 @pytest.mark.parametrize('real_geometry',[False,True])
-def test_uncertainty_failure_does_not_extend_fifteen_pose_budget(monkeypatch,real_geometry):
+def test_quality_is_reassessed_after_initial_estimate(monkeypatch,real_geometry):
     import json
     from pathlib import Path
     fixture=Path(__file__).parent/'fixtures'
@@ -31,12 +31,13 @@ def test_uncertainty_failure_does_not_extend_fifteen_pose_budget(monkeypatch,rea
                 'n_bootstrap':40,'worst_direction_axis':[0.,0.,1.]}
     n._compute_uncertainty=uncertainty
     r.run()
-    assert r.status['state']=='failed', r.status
-    assert counts==[15]
-    assert len(r.session.views)==15
-    assert len(n.robot_samples)==15
-    assert r.status['validation'] is None
-    n.save_calibration_service_callback.assert_not_called()
+    assert r.status['state']=='completed', r.status
+    assert min(counts) < 20 and max(counts) == 20
+    assert len(r.session.views)==20
+    assert len(r.session.validation)==5
+    assert r.status['validation']['passed']
+    n.save_calibration_service_callback.assert_called_once()
+
 
 
 @pytest.mark.parametrize('missing',[False,True])
@@ -46,8 +47,8 @@ def test_unmet_uncertainty_stops_at_sample_limit_without_save(monkeypatch,missin
     n._compute_uncertainty=lambda cal: None if missing else {'worst_direction_sigma_m':.00855,'n_bootstrap':40}
     r.run()
     assert r.status['state']=='failed',r.status
-    assert 'Sample limit reached' in r.status['message']
-    assert len(n.robot_samples)==15
+    assert 'sample limit' in r.status['message'] or 'quality failed' in r.status['message']
+    assert len(n.robot_samples)==20
     n.save_calibration_service_callback.assert_not_called()
 
 
@@ -63,19 +64,6 @@ def test_stop_during_uncertainty_assessment_does_not_move_or_save(monkeypatch):
     assert r.status['state']=='stopped'
     assert calls==[r.move.call_count]
     n.save_calibration_service_callback.assert_not_called()
-
-
-@pytest.mark.parametrize('uncertainty',[None,{'worst_direction_sigma_m':.00855,'n_bootstrap':40}])
-def test_save_gate_preserves_existing_file(tmp_path,uncertainty):
-    path=tmp_path/'calibration.yaml'; path.write_text('previous calibration')
-    n=SimpleNamespace(automatic=SimpleNamespace(active=True,thread=threading.current_thread(),max_position_sigma=.002),
-        get_calibration=lambda:[0,0,0,0,0,0,1],get_parameter=lambda _:SimpleNamespace(value=str(path)),
-        _calibration_residuals=lambda _: {},_diversity_summary=lambda:{},_compute_uncertainty=lambda _:uncertainty)
-    response=DataCollector.save_calibration_service_callback(n,Trigger.Request(),Trigger.Response())
-    assert not response.success
-    assert 'uncertainty' in response.message
-    assert path.read_text()=='previous calibration'
-    assert list(tmp_path.iterdir())==[path]
 
 
 def test_ranking_rewards_rotation_that_constrains_weak_translation(monkeypatch):

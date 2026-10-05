@@ -80,6 +80,9 @@ class CharucoBoardDetector(Node):
         self.declare_parameter("chessboard_visible_topic", "/hand_eye_calibration/chessboard_visible")
         self.declare_parameter("board_spec_topic", "/hand_eye_calibration/board_spec")
         self.declare_parameter("publish_annotated", True)
+        # Raw corners of every published pose (JSON). The calibration node
+        # solves on these pixels and measures camera latency from their stamps.
+        self.declare_parameter("observation_topic", "/charuco_detector/observation")
 
         # Board geometry (the printed board)
         self.declare_parameter("squares_x", 13)
@@ -135,6 +138,7 @@ class CharucoBoardDetector(Node):
         self.camera_matrix = None
         self.dist_coeffs = None
         self._info_frame = None
+        self._info = None
         self._warned_no_info = False
         # Rejection bookkeeping so a persistently-rejecting gate explains itself
         # instead of silently publishing nothing (see _note_rejection).
@@ -156,6 +160,11 @@ class CharucoBoardDetector(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        self.observation_pub = self.create_publisher(
+            String, str(self.get_parameter("observation_topic").value),
+            QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=10,
+                       reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.VOLATILE))
         self.annotated_pub = (
             self.create_publisher(Image, self.annotated_topic, annotated_qos)
             if self.publish_annotated
@@ -250,6 +259,7 @@ class CharucoBoardDetector(Node):
         self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape(3, 3)
         self.dist_coeffs = np.array(msg.d, dtype=np.float64).reshape(-1, 1)
         self._info_frame = msg.header.frame_id
+        self._info = msg
 
     # -- detection ---------------------------------------------------------
     def _optical_frame(self, header_frame: str) -> str:
@@ -441,7 +451,29 @@ class CharucoBoardDetector(Node):
         t.transform.rotation.z = qz
         t.transform.rotation.w = qw
         self.tf_broadcaster.sendTransform(t)
+        self._publish_observation(t, charuco_ids, img_points, obj_points, reproj)
         return True
+
+    def _publish_observation(self, t, charuco_ids, img_points, obj_points, reproj):
+        info = self._info
+        data = {
+            "stamp": {"sec": int(t.header.stamp.sec), "nanosec": int(t.header.stamp.nanosec)},
+            "frame_id": t.header.frame_id,
+            "ids": [int(v) for v in np.asarray(charuco_ids).reshape(-1)],
+            "image_points": np.asarray(img_points, dtype=float).reshape(-1, 2).round(3).tolist(),
+            "object_points": np.asarray(obj_points, dtype=float).reshape(-1, 3).round(6).tolist(),
+            "reprojection_px": round(float(reproj), 4),
+            "pose": [t.transform.translation.x, t.transform.translation.y, t.transform.translation.z,
+                     t.transform.rotation.x, t.transform.rotation.y, t.transform.rotation.z,
+                     t.transform.rotation.w],
+            "camera": None if info is None else {
+                "k": [float(v) for v in info.k], "d": [float(v) for v in info.d],
+                "width": int(info.width), "height": int(info.height),
+                "distortion_model": info.distortion_model,
+            },
+            "board": dict(self.spec),
+        }
+        self.observation_pub.publish(String(data=json.dumps(data, separators=(",", ":"))))
 
 
 def main():

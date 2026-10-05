@@ -67,20 +67,41 @@ class AutomaticCalibration:
         self.board_marker_pub = node.create_publisher(Marker, 'hand_eye_calibration/board_estimate', 1)
         self.joints = None
         self.joint_at = 0.0
+        self.teaching = None
+        self.teaching_at = 0.0
         self.visible = False
         self.visible_at = 0.0
         self.board_revision = None
         self.camera_info = None
+        self.robot_description = None
+        # Set around a capture: frames must be exposed after this ROS time,
+        # and the role decides whether the sample trains or validates.
+        self.stationary_ns = None
+        self.min_capture_stamp_ns = None
+        self.capture_role = 'training'
+        self.heartbeat_at = None
         self.board_spec = {key: node.get_parameter(key).value for key in
                            ('squares_x', 'squares_y', 'square_length_m')}
-        self.status = {'state': 'idle', 'active': False, 'pose': 0, 'total': 15, 'strategy': 'adaptive_joint_bootstrap', 'phase': 'bootstrap',
+        self.status = {'state': 'idle', 'active': False, 'pose': 0, 'total': 35, 'strategy': 'adaptive_joint_bootstrap', 'phase': 'bootstrap',
                        'accepted': 0, 'message': 'Position the camera to see the board, then Calibrate.'}
         for key, value in {'auto_enabled': False, 'auto_check_collisions': True, 'auto_group': '',
-                           'auto_max_position_sigma_m': .002, 'auto_max_training_samples': 15,
-                           'auto_controller': ''}.items():
+                           'auto_max_position_sigma_m': .002, 'auto_min_training_samples': 20, 'auto_max_training_samples': 30,
+                           'auto_controller': '', 'auto_validation_views': 5, 'intrinsic_return_to_base': True,
+                           'auto_heartbeat_timeout_s': 0.0, 'auto_max_camera_excursion_m': 0.30}.items():
             node.declare_parameter(key, value)
+        # Held-out views collected after the training set; never used in the fit.
+        self.intrinsic_return_to_base = bool(node.get_parameter('intrinsic_return_to_base').value)
+        self.validation_views = max(3, int(node.get_parameter('auto_validation_views').value))
+        # > 0: the run stops when no operator heartbeat (GUI page open) arrives
+        # within this many seconds. The GUI launch passes 3 s.
+        self.heartbeat_timeout = float(node.get_parameter('auto_heartbeat_timeout_s').value)
+        self.max_camera_excursion = float(node.get_parameter('auto_max_camera_excursion_m').value)
         self.max_position_sigma = float(node.get_parameter('auto_max_position_sigma_m').value)
-        self.max_training_samples = 15  # fixed six initial + nine targeted samples
+        self.min_training_samples = max(12, int(node.get_parameter('auto_min_training_samples').value))
+        self.max_training_samples = int(node.get_parameter('auto_max_training_samples').value)
+        if self.max_training_samples < self.min_training_samples:
+            raise ValueError('auto_max_training_samples must be >= auto_min_training_samples; '
+                             'rebuild the calibration package and restart the collector to update launch defaults.')
         if not np.isfinite(self.max_position_sigma) or self.max_position_sigma <= 0:
             raise ValueError('Invalid automatic calibration quality limits.')
         self.check_collisions = bool(node.get_parameter("auto_check_collisions").value)
@@ -95,8 +116,10 @@ class AutomaticCalibration:
         if node.camera_info_topic:
             node.create_subscription(CameraInfo, node.camera_info_topic, self._camera_info, qos_profile_sensor_data, callback_group=self.group)
         node.create_subscription(JointState, '/joint_states', self._joints, qos_profile_sensor_data, callback_group=self.group)
+        node.create_subscription(Bool, '/piper/teaching', self._teaching, 1, callback_group=self.group)
         node.create_subscription(Bool, '/hand_eye_calibration/chessboard_visible', self._visible, 10, callback_group=self.group)
         node.create_subscription(String, '/hand_eye_calibration/board_spec', self._board, 10, callback_group=self.group)
+        node.create_subscription(String, 'hand_eye_calibration/auto_heartbeat', self._heartbeat, 10, callback_group=self.group)
         node.create_service(Trigger, 'hand_eye_calibration/auto_start', self.start, callback_group=node._service_cb_group)
         node.create_service(Trigger, 'hand_eye_calibration/auto_stop', self.stop, callback_group=self.group)
         node.create_timer(0.5, self.publish, callback_group=self.group)
@@ -107,6 +130,40 @@ class AutomaticCalibration:
 
     def _joints(self, msg):
         self.joints, self.joint_at = msg, time.monotonic()
+
+    def _teaching(self, msg):
+        self.teaching, self.teaching_at = bool(msg.data), time.monotonic()
+
+    def motion_block_reason(self):
+        if getattr(self, 'teaching', None) is not None:
+            if time.monotonic() - self.teaching_at > 1.5:
+                return 'Robot teach-mode feedback is stale; no automatic motion is allowed.'
+            if self.teaching:
+                return 'Robot is in teach mode. Exit teach mode before automatic calibration.'
+        return None
+
+    def require_joint_limits(self, positions):
+        outside = (positions < self.lower) | (positions > self.upper)
+        if np.any(outside):
+            detail = '; '.join(f'{name}={np.degrees(q):.3f} deg, allowed '
+                               f'[{np.degrees(lo):.3f}, {np.degrees(hi):.3f}] deg'
+                               for name, q, lo, hi, bad in
+                               zip(self.names, positions, self.lower, self.upper, outside) if bad)
+            raise RuntimeError('Measured robot pose exceeds URDF joint limits: ' + detail +
+                               '. Move the robot inside its limits before calibration. No motion was sent.')
+
+    def _heartbeat(self, msg):
+        self.heartbeat_at = time.monotonic()
+
+    def heartbeat_ok(self):
+        if getattr(self, 'heartbeat_timeout', 0.0) <= 0:
+            return True
+        return self.heartbeat_at is not None and time.monotonic() - self.heartbeat_at <= self.heartbeat_timeout
+
+    def freshness(self, base_s):
+        """Stamp-age limit scaled by the measured camera latency."""
+        limit = getattr(self.node, 'freshness_limit', None)
+        return float(limit(base_s)) if limit is not None else float(base_s)
 
     def _visible(self, msg):
         self.visible, self.visible_at = msg.data, time.monotonic()
@@ -167,6 +224,15 @@ class AutomaticCalibration:
     def check(self):
         if self.stop_event.is_set() or not rclpy.ok():
             raise Stopped('Calibration stopped.')
+        reason = self.motion_block_reason()
+        if self.active and reason:
+            raise Stopped(reason)
+        if self.active and not self.heartbeat_ok():
+            self.stop_event.set()
+            with self.lock:
+                if self.goal is not None:
+                    self.goal.cancel_goal_async()
+            raise Stopped('Operator heartbeat lost (GUI closed or bridge down); robot stopped.')
 
     def wait(self, future, timeout):
         end = time.monotonic() + timeout
@@ -186,10 +252,16 @@ class AutomaticCalibration:
                 resp.message = 'Calibration is already running.'
             elif self.node.calibration_type != 'eye-in-hand':
                 resp.message = 'Automatic calibration requires eye-in-hand.'
+            elif self.motion_block_reason():
+                resp.message = self.motion_block_reason()
             elif not self.board_ready():
                 resp.message = 'Position the camera so the board is detected, then Calibrate.'
+            elif not self.heartbeat_ok():
+                resp.message = 'No operator heartbeat; start automatic calibration from the open GUI page.'
             else:
                 self.stop_event.clear()
+                self.capture_role = 'training'
+                self.min_capture_stamp_ns = None
                 if self.board_marker is not None:
                     self.board_marker.action = Marker.DELETE
                     self.board_marker_pub.publish(self.board_marker)
@@ -197,10 +269,11 @@ class AutomaticCalibration:
                 self.status = {**self.status, 'active': True, 'state': 'preparing', 'pose': 0,
                                'accepted': 0, 'message': 'Checking initial view and controller.', 'validation': None, 'phase': 'bootstrap', 'skipped': 0,
                                'position_sigma_m': None, 'position_sigma_limit_m': self.max_position_sigma,
-                               'target_samples': 15, 'max_training_samples': self.max_training_samples,
+                               'target_samples': self.min_training_samples, 'max_training_samples': self.max_training_samples,
+                               'required_validation_views': self.validation_views,
                                'attempts': 0, 'attempts_without_sample': 0, 'local_attempts_without_sample': 0,
                                'max_attempts_without_sample': 16, 'max_local_attempts_without_sample': 8,
-                               'initial_samples': 0, 'targeted_samples': 0, 'validation_views': 0, 'required_validation_views': 0, 'fit_consistency': None,
+                               'initial_samples': 0, 'targeted_samples': 0, 'validation_views': 0, 'fit_consistency': None,
                                'search_mode': None, 'planner_rejections': {}, 'robot_group': None,
                                'robot_joints': [], 'robot_controller': None}
                 self.thread = threading.Thread(target=self.run, daemon=True)
@@ -233,7 +306,7 @@ class AutomaticCalibration:
             raise ValueError('Board is not detected.')
         tf = self.node.tf_buffer.lookup_transform(self.node.tracking_base_frame, self.node.tracking_marker_frame, rclpy.time.Time())
         age = (self.node.get_clock().now().nanoseconds - rclpy.time.Time.from_msg(tf.header.stamp).nanoseconds) / 1e9
-        if not -0.1 <= age < 1.0:
+        if not -0.1 <= age < self.freshness(1.0):
             raise ValueError('Board pose is stale; check camera timestamps and the ROS clock.')
         return matrix(tf.transform)
 
@@ -293,8 +366,15 @@ class AutomaticCalibration:
         if len(trajectory.points) < 2 or trajectory.joint_names != list(self.names):
             raise RuntimeError('Invalid planned calibration trajectory.')
         start = self.joint_positions()
-        if np.max(np.abs(start-np.asarray(trajectory.points[0].positions))) > .01:
-            raise RuntimeError('Robot moved since planning; trajectory was not sent.')
+        start_error = start-np.asarray(trajectory.points[0].positions)
+        if np.max(np.abs(start_error)) > .01:
+            index = int(np.argmax(np.abs(start_error)))
+            self.update('planning', 'Rejecting a stale trajectory start.',
+                        trajectory_start=list(trajectory.points[0].positions),
+                        measured_start=start.tolist(), start_error_rad=start_error.tolist())
+            raise RuntimeError(f'Robot moved since planning; trajectory was not sent. '
+                               f'{self.names[index]} start difference {np.degrees(start_error[index]):.3f} deg '
+                               '(limit 0.573 deg).')
         times = np.array([p.time_from_start.sec+p.time_from_start.nanosec/1e9 for p in trajectory.points])
         if not np.isfinite(times).all() or times[0] < 0 or np.any(np.diff(times) <= 0):
             raise RuntimeError('MoveIt trajectory has invalid timing.')
@@ -391,15 +471,26 @@ class AutomaticCalibration:
             q = self.joint_positions()
             still = np.max(np.abs(q - previous)) < 0.001 and np.max(np.abs(q - target)) < 0.015
             previous = q
+            if still and stable is None:
+                self.stationary_ns = self.node.get_clock().now().nanoseconds
             stable = (stable or time.monotonic()) if still else None
             if stable is not None and time.monotonic() - stable >= 0.7:
                 return
         raise RuntimeError('Robot did not settle at the requested pose.')
 
     def capture(self):
+        # Only frames exposed after the robot stopped (stamp vs stamp, so this
+        # holds for any camera latency). 50 ms covers exposure time.
+        self.min_capture_stamp_ns = None if self.stationary_ns is None else self.stationary_ns + 50_000_000
+        try:
+            return self._capture()
+        finally:
+            self.min_capture_stamp_ns = None
+
+    def _capture(self):
         for _ in range(2):
             self.check()
-            end = time.monotonic() + 3
+            end = time.monotonic() + 3 + self.freshness(1.0)
             while not self.board_ready() and time.monotonic() < end:
                 self.check()
                 self.stop_event.wait(0.1)
@@ -417,7 +508,7 @@ class AutomaticCalibration:
         # After settling, require a detection captured after the stop, not the
         # last transform from the preceding movement.
         after = self.node.get_clock().now().nanoseconds
-        end = time.monotonic() + 4
+        end = time.monotonic() + 4 + self.freshness(1.0)
         while time.monotonic() < end:
             self.check()
             try:
@@ -450,7 +541,7 @@ class AutomaticCalibration:
         if stamp != self.monitor_stamp:
             self.monitor_stamp, self.monitor_at = stamp, time.monotonic()
         age = (self.node.get_clock().now().nanoseconds - stamp) / 1e9
-        if not -.1 <= age <= .35 or time.monotonic() - self.monitor_at > .75:
+        if not -.1 <= age <= self.freshness(.35) or time.monotonic() - self.monitor_at > .75:
             raise TrackingInterrupted('Camera feedback stale during motion; pausing.')
         observation = self.optical_tracking @ board
         if not self.framing.contains(observation, margin=.03):
@@ -460,7 +551,7 @@ class AutomaticCalibration:
 
     def wait_for_tracking(self):
         """Called only after controller cancellation and measured settling."""
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 5 + self.freshness(.2)
         first_stamp = last_stamp = None
         count = 0
         while time.monotonic() < deadline:
@@ -472,7 +563,7 @@ class AutomaticCalibration:
                     self.node.tracking_marker_frame, rclpy.time.Time())
                 stamp = rclpy.time.Time.from_msg(stamped.header.stamp).nanoseconds
                 age = (self.node.get_clock().now().nanoseconds-stamp)/1e9
-                if not -.1 <= age <= .2 or not self.framing.contains(self.optical_tracking @ board, margin=.03):
+                if not -.1 <= age <= self.freshness(.2) or not self.framing.contains(self.optical_tracking @ board, margin=.03):
                     raise ValueError('Waiting for fresh, fully visible board.')
                 if last_stamp is not None and stamp < last_stamp:
                     raise ValueError('Camera timestamp went backwards.')
@@ -489,7 +580,9 @@ class AutomaticCalibration:
         raise RuntimeError('Board did not return with stable detection within 5 seconds. Robot remains stopped; recenter the board and retry.')
 
     def configure_robot(self, root):
-        self.names = chain_joints(root, self.node.robot_base_frame, self.node.robot_effector_frame)
+        # Moved joints end at the motion tip; the camera link may sit earlier in this chain.
+        self.names = chain_joints(root, self.node.robot_base_frame,
+                                  getattr(self.node, 'robot_motion_tip_frame', '') or self.node.robot_effector_frame)
         if len(self.names)<3:
             raise ValueError('Calibration requires at least three controlled joints.')
         limits = [root.find(f"joint[@name='{name}']/limit") for name in self.names]
@@ -529,6 +622,7 @@ class AutomaticCalibration:
                 raise RuntimeError('Robot description is unavailable.')
             req = GetParameters.Request(names=['robot_description'])
             urdf = self.wait(self.description.call_async(req), 3).values[0].string_value
+            self.robot_description = urdf
             root = ET.fromstring(urdf)
             self.configure_robot(root)
             if not self.action.wait_for_server(timeout_sec=2):
@@ -536,15 +630,24 @@ class AutomaticCalibration:
             if not self.planning.wait_for_service(timeout_sec=2):
                 raise RuntimeError('MoveIt /plan_kinematic_path is unavailable; no motion was sent.')
             initial = self.joint_positions()
+            self.require_joint_limits(initial)
             if not self.collision_free_path(initial, initial):
                 raise RuntimeError('Current robot pose is in collision in the MoveIt scene; no motion was sent.')
             self.settle(initial)
-            from .bootstrap_calibration import BootstrapSession
-            BootstrapSession(self, root).run()
+            if n.solver_name == 'intrinsic_pose':
+                from .intrinsic_acquisition import IntrinsicSession
+                self.session = IntrinsicSession(self, root)
+            else:
+                from .bootstrap_calibration import BootstrapSession
+                self.session = BootstrapSession(self, root)
+            self.session.run()
             self.check()
-            self.update('saving', 'Internal consistency and uncertainty passed; saving without independent validation.', validation=None)
+            self.update('saving', 'Uncertainty passed; checking held-out views and saving.')
             response = n.save_calibration_service_callback(Trigger.Request(), Trigger.Response())
             self.check()
+            acceptance = getattr(n, '_last_acceptance', None)
+            if acceptance is not None:
+                self.update('saving', response.message, validation=acceptance)
             if not response.success:
                 raise RuntimeError(response.message)
             self.update('completed', response.message, active=False)
@@ -552,12 +655,23 @@ class AutomaticCalibration:
             self.update('stopped', str(exc), active=False)
         except Exception as exc:
             n.get_logger().error(f'Automatic calibration: {exc}')
-            self.update('failed', str(exc), active=False)
+            self.update('failed', str(exc) + self._keep_failed_dataset(), active=False)
         finally:
             with self.lock:
                 if self.goal is not None:
                     self.goal.cancel_goal_async()
                     self.goal = None
+
+    def _keep_failed_dataset(self):
+        """A failed run is still evidence: store its raw data for offline analysis."""
+        writer = getattr(self.node, 'write_failed_dataset', None)
+        if writer is None or len(getattr(self.node, 'robot_samples', [])) < 1:
+            return ''
+        try:
+            path = writer()
+        except Exception as exc:  # noqa: BLE001
+            return f' (dataset not stored: {exc})'
+        return f' Raw data kept in {path}.' if path else ''
 
     def close(self):
         self.stop(None, Trigger.Response())

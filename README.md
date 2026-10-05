@@ -1,3 +1,8 @@
+> **Default calibration architecture (2026-10-01):** Intrinsic-style staged acquisition
+> and Shah + joint pose optimization. See [architecture and operation](docs/intrinsic_architecture.md)
+> and [upstream attribution](THIRD_PARTY_NOTICES.md). Older reprojection/AX=XB
+> documentation below describes explicitly selectable legacy modes.
+
 # ROS2 hand-eye calibration
 This is a minimal ROS2 port of the functionality in the easy_handeye calibration package. The original README can be found below.
 
@@ -20,6 +25,8 @@ pip3 install "numpy>=1.21.6,<1.28.0" "opencv-contrib-python>=4.5.0,<4.10.0" "sci
 **Why?** ROS2 Humble requires NumPy 1.x (not 2.x) for C API compatibility. Installing packages together prevents dependency conflicts.
 
 ## Usage
+Solver, acceptance gate, datasets, offline re-solve, touch-off and the welding-gun Apply: [docs/validated_calibration.md](docs/validated_calibration.md).
+
 **Launch file**
 ```bash
 ros2 launch hand_eye_calibration calibration.launch.py

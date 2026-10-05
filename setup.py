@@ -10,6 +10,7 @@ setup(
     version='0.0.0',
     packages=[package_name],
     data_files=[
+        ('share/hand_eye_calibration', ['THIRD_PARTY_NOTICES.md', 'LICENSE.intrinsic']),
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
@@ -36,6 +37,10 @@ setup(
             'handeye_realsense_mount_args = hand_eye_calibration.realsense_mount_cli:main',
             'tool_tcp_calibration = hand_eye_calibration.pivot_calibration_node:main',
             'tool_tcp_calibration_publisher = hand_eye_calibration.pivot_publish_node:main',
+            'handeye_intrinsic_solve = hand_eye_calibration.intrinsic_offline_cli:main',
+            'handeye_offline_solve = hand_eye_calibration.offline_solve_cli:main',
+            'handeye_welding_gun_apply = hand_eye_calibration.welding_gun_apply_cli:main',
+            'tcp_offline_solve = hand_eye_calibration.tcp_offline_solve_cli:main',
         ],
     },
 )

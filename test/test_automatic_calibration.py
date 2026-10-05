@@ -134,10 +134,14 @@ def synthetic_sequence(monkeypatch, *, bad_validation=False, reachable=True, rob
     monkeypatch.setattr(bootstrap, 'BootstrapSession', session)
     params = {'auto_joint_names': robot_profile.get('names',[f'joint{i}' for i in range(1,7)]) if robot_profile else [f'joint{i}' for i in range(1,7)]}
     node = SimpleNamespace(get_parameter=lambda name: SimpleNamespace(value=params[name]),
-        robot_base_frame='base', tracking_base_frame='camera', robot_effector_frame='wrist',
-        robot_samples=[], tracking_samples=[], sample_metrics=[], _publish_status=Mock(),
+        solver_name='reprojection', robot_base_frame='base', tracking_base_frame='camera', robot_effector_frame='wrist',
+        robot_samples=[], tracking_samples=[], sample_metrics=[], sample_roles=[], _publish_status=Mock(),
         _last_uncertainty=None, _last_calibration_detail=None, get_logger=lambda: Mock())
     runner.node = node
+    runner.capture_role = 'training'
+    runner.min_training_samples = 20; runner.max_training_samples = 30; runner.validation_views = 5
+    node.training_indices = lambda: [i for i,role in enumerate(node.sample_roles) if role == 'training']
+    node.training_count = lambda: len(node.training_indices())
     def configure(root):
         runner.names=params['auto_joint_names']
         limits=[root.find(f"joint[@name='{name}']/limit") for name in runner.names]
@@ -158,6 +162,7 @@ def synthetic_sequence(monkeypatch, *, bad_validation=False, reachable=True, rob
     runner.joint_positions = lambda: current[0].copy()
     runner.settle = lambda _: None
     runner.observed_board = lambda **_: observation()
+    runner.wait_for_tracking = lambda: None
     runner.tf = Mock(side_effect=AssertionError('No initial camera transform exists'))
     runner.update = lambda state, message, **values: runner.status.update(state=state, message=message, **values)
     runner.camera_info = CameraInfo(width=640, height=480, k=[600.,0.,320.,0.,600.,240.,0.,0.,1.])
@@ -174,13 +179,23 @@ def synthetic_sequence(monkeypatch, *, bad_validation=False, reachable=True, rob
         session = runner.session
         runner.sample_events.append((len(node.robot_samples)+1, session.estimate is not None,
             None if session.view_planner is None else float(np.max(np.abs(current[0]-session.view_planner.goal)))))
-        if bad_validation and session.estimate is not None and (len(session.views)+1)%3 == 0:
+        if bad_validation and runner.capture_role == 'validation':
             tracking[0,3] += .05
         node.robot_samples.append(as_sample(physical_robot(current[0])))
         node.tracking_samples.append(as_sample(tracking)); node.sample_metrics.append({})
+        node.sample_roles.append(runner.capture_role)
         return True
     runner.capture = capture
-    node.get_calibration = lambda: CalibrationBackend.compute_calibration(node.robot_samples, node.tracking_samples)
+    def calibration(full=False):
+        ids = node.training_indices()
+        result = CalibrationBackend.compute_calibration([node.robot_samples[i] for i in ids], [node.tracking_samples[i] for i in ids])
+        # Acquisition fixture: exact synthetic data and a passing quality report.
+        node._last_reprojection = {'board_in_base':as_sample(board),
+            'uncertainty':{'worst_direction_sigma_m':.001},
+            'board_spread':{'position_rms_m':0.},
+            'leave_one_out':{'position_rms_m':0.,'reprojection_rms_px':0.}}
+        return result
+    node.get_calibration = calibration
     node._compute_uncertainty = lambda cal: {'worst_direction_sigma_m': .001, 'n_bootstrap':40, 'worst_direction_axis':[0.,0.,1.]}
     node.save_calibration_service_callback = Mock(return_value=SimpleNamespace(success=True, message='Saved'))
     return runner, node, mount
@@ -191,14 +206,17 @@ def test_complete_sequence_saves_only_training_samples(monkeypatch):
     runner.run()
     assert runner.status['state'] == 'completed', runner.status
     assert not runner.active
-    assert len(node.robot_samples) == 15  # six initial + nine targeted, all used in the solve
-    assert runner.status['initial_samples'] == 6
-    assert runner.status['targeted_samples'] == 9
-    assert [event[1] for event in runner.sample_events] == [False]*6+[True]*9
-    assert all(event[2] is not None and event[2] < .003 for event in runner.sample_events[6:])
+    assert len(node.robot_samples) == 25
+    assert node.training_count() == 20
+    assert node.sample_roles[-5:] == ['validation']*5
+    assert runner.status['initial_samples'] >= 7
+    assert runner.status['targeted_samples'] == 20-runner.session.bootstrap_count
+    b=runner.session.bootstrap_count
+    assert [event[1] for event in runner.sample_events] == [False]*b+[True]*(25-b)
+    assert all(event[2] is not None and event[2] < .003 for event in runner.sample_events[b:])
     assert all(call.kwargs['speed_scale'] == 1. for call in runner.move.call_args_list)
     runner.tf.assert_not_called()
-    assert runner.status['validation'] is None
+    assert runner.status['validation']['passed']
     node.save_calibration_service_callback.assert_called_once()
     np.testing.assert_allclose(sample_matrix(node.get_calibration()), mount, atol=1e-6)
     assert not np.allclose(runner.move.call_args.args[0], np.zeros(6))  # stays at the final useful view
@@ -208,7 +226,7 @@ def test_failed_validation_preserves_saved_calibration(monkeypatch):
     runner, node, _ = synthetic_sequence(monkeypatch, bad_validation=True)
     runner.run()
     assert runner.status['state'] == 'failed'
-    assert 'inconsistent' in runner.status['message']
+    assert 'Independent validation failed' in runner.status['message']
     node.save_calibration_service_callback.assert_not_called()
 
 
@@ -260,3 +278,31 @@ def test_real_path_fails_closed_if_collision_service_is_missing():
     with pytest.raises(RuntimeError, match='unavailable'):
         runner.move(np.array([.1]))
     runner.action.send_goal_async.assert_not_called()
+
+
+def test_teach_mode_rejected_before_start():
+    runner = bare_runner()
+    runner._teaching(SimpleNamespace(data=True))
+    response = runner.start(None, SimpleNamespace(success=False, message=''))
+    assert not response.success
+    assert 'teach mode' in response.message
+    assert runner.thread is None
+
+
+def test_stale_teach_feedback_blocks_motion():
+    runner = bare_runner()
+    runner._teaching(SimpleNamespace(data=False))
+    assert runner.motion_block_reason() is None
+    runner.teaching_at -= 2
+    assert 'stale' in runner.motion_block_reason()
+
+
+def test_initial_joint_limits_report_actual_joint_and_do_not_clamp():
+    runner = bare_runner()
+    runner.names = ['joint1', 'joint5']
+    runner.lower = np.array([-2.618, -1.22]); runner.upper = np.array([2.168, 1.22])
+    runner.require_joint_limits(np.array([0., 1.21]))
+    q = np.array([0., 1.24])
+    with pytest.raises(RuntimeError, match=r'joint5=.*allowed'):
+        runner.require_joint_limits(q)
+    assert q[1] == 1.24

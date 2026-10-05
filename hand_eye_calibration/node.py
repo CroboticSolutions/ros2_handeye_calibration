@@ -30,6 +30,9 @@ from tf2_ros.transform_listener import TransformListener
 
 from .calibration_backend import CalibrationBackend
 from .calibration_status import build_calibration_status, status_to_json
+from .capture_timing import LatencyModel, ObservationBuffer, frame_record, parse_observation
+from . import acceptance as acceptance_gate
+from . import calibration_dataset
 
 
 def get_transform(tf_message: Transform):
@@ -85,6 +88,9 @@ class DataCollector(Node):
         self.declare_parameter('tracking_marker_frame', "")
         self.declare_parameter('robot_base_frame', "")
         self.declare_parameter('robot_effector_frame', "")
+        # Link that ends the moved joint chain (MoveIt group/controller). Empty: robot_effector_frame.
+        # Differs when the camera sits before the last joint, e.g. Piper camera on link5, chain to link6.
+        self.declare_parameter('robot_motion_tip_frame', "")
         # options are eye-in-hand or eye-on-base
         self.declare_parameter('calibration_type', "eye-on-base")
         self.declare_parameter('calibration_file', os.path.expanduser("~/.ros/hand_eye_calibration.yaml"))
@@ -106,11 +112,37 @@ class DataCollector(Node):
         # resamples), which is why it runs on save or on explicit request
         # rather than after every capture. 0 disables it.
         self.declare_parameter('bootstrap_samples', 30)
+        # Raw ChArUco corners from the detector: the final solve minimises
+        # their reprojection error, and their stamps measure camera latency.
+        self.declare_parameter('observation_topic', '/charuco_detector/observation')
+        # < 0: measure latency from observation stamps. >= 0: use this value.
+        self.declare_parameter('camera_latency_s', -1.0)
+        self.declare_parameter('latency_margin_s', 0.25)
+        # A frame is used only if the robot was already at the same pose this
+        # long before the frame's stamp (exposure after the robot stopped).
+        self.declare_parameter('stationary_window_s', 0.3)
+        # 'reprojection' (default) or 'axxb' (closed form + AX=XB refinement only).
+        self.declare_parameter('solver', 'intrinsic_pose')
+        self.declare_parameter('estimate_intrinsics', False)
+        # Every save writes the raw dataset (corners, poses, joints, images)
+        # here, so the result can be re-solved and compared offline.
+        self.declare_parameter('dataset_dir', os.path.expanduser('~/.ros/hand_eye_calibration_runs'))
+        self.declare_parameter('dataset_save_images', True)
+        # 'enforce': a result that fails acceptance is written only as
+        # <calibration_file>.rejected.yaml. 'warn': written anyway, flagged.
+        self.declare_parameter('acceptance_mode', 'enforce')
+        for key, value in acceptance_gate.DEFAULT_LIMITS.items():
+            self.declare_parameter('accept_' + key, value)
+        # Touch-off validation: TCP frame that is brought onto a board corner.
+        self.declare_parameter('touchoff_tcp_frame', 'arm_tcp')
+        self.declare_parameter('touchoff_corner_id', 0)
 
         self.tracking_base_frame = str(self.get_parameter('tracking_base_frame').value)
         self.tracking_marker_frame = str(self.get_parameter('tracking_marker_frame').value)
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value)
         self.robot_effector_frame = str(self.get_parameter('robot_effector_frame').value)
+        self.robot_motion_tip_frame = (str(self.get_parameter('robot_motion_tip_frame').value)
+                                       or self.robot_effector_frame)
         self.calibration_type = str(self.get_parameter('calibration_type').value)
         self.pointcloud_topic = str(self.get_parameter('pointcloud_topic').value)
         self.image_topic = str(self.get_parameter('image_topic').value)
@@ -119,6 +151,22 @@ class DataCollector(Node):
         self.capture_burst_duration_s = float(self.get_parameter('capture_burst_duration_s').value)
         self.capture_burst_samples = int(self.get_parameter('capture_burst_samples').value)
         self.bootstrap_samples = int(self.get_parameter('bootstrap_samples').value)
+        self.solver_name = str(self.get_parameter('solver').value)
+        if self.solver_name not in ('intrinsic_pose', 'reprojection', 'axxb'):
+            raise ValueError("solver must be 'intrinsic_pose', 'reprojection' or 'axxb'")
+        self.estimate_intrinsics = bool(self.get_parameter('estimate_intrinsics').value)
+        self.stationary_window_s = float(self.get_parameter('stationary_window_s').value)
+        self.acceptance_mode = str(self.get_parameter('acceptance_mode').value)
+        if self.acceptance_mode not in ('enforce', 'warn'):
+            raise ValueError("acceptance_mode must be 'enforce' or 'warn'")
+        self.acceptance_limits = {key: type(value)(self.get_parameter('accept_' + key).value)
+                                  for key, value in acceptance_gate.DEFAULT_LIMITS.items()}
+        self.latency = LatencyModel(margin_s=float(self.get_parameter('latency_margin_s').value),
+                                    configured_s=float(self.get_parameter('camera_latency_s').value))
+        self.observations = ObservationBuffer()
+        self._camera_model = None
+        self._board_spec_seen = None
+        self._latest_image = None
 
         # The capture callback blocks for the duration of the capture burst
         # while it waits for fresh TF. Put the services in their own callback
@@ -167,11 +215,31 @@ class DataCollector(Node):
         self.robot_samples = list()
         self.tracking_samples = list()
         self.sample_metrics = list()
+        # Parallel to robot_samples: raw frames, joints, role, one image.
+        self.sample_frames = list()
+        self.sample_joints = list()
+        self.sample_roles = list()
+        self.sample_images = list()
+        self._last_reprojection = None
+        self._last_acceptance = None
+        self._reprojection_state = None
+        self.touchoff_references = {}
+        self.touchoff_results = []
         self._preflight_logged = False
         self._last_pointcloud_frame = None
         self._last_camera_info_frame = None
         self._last_calibration_detail = None
         self._last_uncertainty = None
+
+        self.create_subscription(String, str(self.get_parameter('observation_topic').value),
+                                 self._observation_callback, 20)
+        if bool(self.get_parameter('dataset_save_images').value) and self.image_topic:
+            from sensor_msgs.msg import Image
+            from rclpy.qos import qos_profile_sensor_data
+            self.create_subscription(Image, self.image_topic, self._image_callback, qos_profile_sensor_data)
+        for name, callback in (('touchoff_reference', self.touchoff_reference_callback),
+                               ('touchoff_capture', self.touchoff_capture_callback)):
+            self.create_service(Trigger, mname + '/' + name, callback, callback_group=self._service_cb_group)
 
         self.create_timer(2.0, self.preflight_timer_callback)
         self._publish_status(None, None)
@@ -188,13 +256,106 @@ class DataCollector(Node):
             last_sample_metrics=last_metrics,
             estimate=cal,
             uncertainty=self._last_uncertainty,
+            training_count=self.training_count(),
+            min_save_samples=self.acceptance_limits['min_samples'],
+            acceptance=self._last_acceptance,
+            reprojection=self._reprojection_summary(),
+            timing=self.latency.stats(),
+            touchoff=self.touchoff_results[-5:],
         )
+        if self.solver_name == 'intrinsic_pose':
+            report = self._last_reprojection
+            passed = bool(self._last_acceptance and self._last_acceptance['passed'])
+            status.update(solver='intrinsic_pose', pose_calibration=self._reprojection_summary(),
+                          reprojection=None, ready_to_save=passed,
+                          readiness='excellent' if passed else 'collecting',
+                          summary='Pose calibration accepted.' if passed else
+                          'Collect diverse poses; joint solve and independent validation determine acceptance.')
         self._status_payload = status
         if hasattr(self, "automatic"):
             status = {**status, "automatic": dict(self.automatic.status)}
         msg = String()
         msg.data = status_to_json(status)
         self.status_pub.publish(msg)
+
+    # ------------------------------------------------------------------
+    # Raw observations, latency and sample bookkeeping
+    # ------------------------------------------------------------------
+    def _observation_callback(self, msg):
+        observation = parse_observation(msg.data)
+        if observation is None:
+            return
+        self.latency.add((self.get_clock().now().nanoseconds - observation['stamp_ns']) / 1e9)
+        self.observations.add(observation)
+        if observation.get('camera'):
+            self._camera_model = observation['camera']
+        if observation.get('board'):
+            self._board_spec_seen = observation['board']
+
+    def _image_callback(self, msg):
+        self._latest_image = msg
+
+    def freshness_limit(self, base_s):
+        return self.latency.limit(base_s)
+
+    def training_indices(self):
+        return [i for i, role in enumerate(self.sample_roles) if role == 'training']
+
+    def validation_indices(self):
+        return [i for i, role in enumerate(self.sample_roles) if role == 'validation']
+
+    def training_count(self):
+        return len(self.training_indices())
+
+    def clear_samples(self):
+        for values in (self.robot_samples, self.tracking_samples, self.sample_metrics, self.sample_frames,
+                       self.sample_joints, self.sample_roles, self.sample_images):
+            values.clear()
+        self._last_uncertainty = self._last_calibration_detail = None
+        self._last_reprojection = self._last_acceptance = self._reprojection_state = None
+
+    def drop_last_sample(self):
+        for values in (self.robot_samples, self.tracking_samples, self.sample_metrics, self.sample_frames,
+                       self.sample_joints, self.sample_roles, self.sample_images):
+            if values:
+                values.pop()
+        self._last_uncertainty = None
+
+    def _current_joints(self):
+        joints = getattr(getattr(self, 'automatic', None), 'joints', None)
+        if joints is None:
+            return None
+        return {n: float(p) for n, p in zip(joints.name, joints.position)}
+
+    def _encode_image(self, stamps):
+        msg = self._latest_image
+        if msg is None:
+            return None
+        try:
+            import cv2
+            from cv_bridge import CvBridge
+            frame = CvBridge().imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            ok, data = cv2.imencode('.png', frame)
+            if not ok:
+                return None
+            stamp = rclpy.time.Time.from_msg(msg.header.stamp).nanoseconds
+            return {'stamp_ns': stamp, 'png': data.tobytes(), 'matches_frame': stamp in stamps}
+        except Exception as exc:  # noqa: BLE001 - images are optional evidence
+            self.get_logger().warning(f'Could not store calibration image: {exc}')
+            return None
+
+    def _robot_was_stationary(self, stamp_msg, reference):
+        """Robot pose `stationary_window_s` before the frame equals the pose at it."""
+        if self.stationary_window_s <= 0:
+            return True
+        earlier = rclpy.time.Time.from_msg(stamp_msg) - Duration(seconds=self.stationary_window_s)
+        try:
+            before = get_transform(self._lookup_robot_at(earlier.to_msg(), timeout_s=0.1).transform)
+        except TransformException:
+            return False
+        delta = np.linalg.inv(transform_to_matrix(before)) @ transform_to_matrix(reference)
+        moved_m, moved_rad = matrix_to_residual(delta)
+        return moved_m < 0.0005 and math.degrees(moved_rad) < 0.05
 
     def preflight_timer_callback(self):
         if self._preflight_logged:
@@ -429,10 +590,16 @@ class DataCollector(Node):
         # (e.g. rclpy.spin_once) raises "Executor is already spinning" and
         # aborts the whole capture. The TF buffer is instead kept fresh by the
         # listener running on another executor thread; see _service_cb_group.
-        burst_deadline = time.monotonic() + max(1.5, self.capture_burst_duration_s)
+        max_age = self.freshness_limit(1.0)
+        burst_deadline = time.monotonic() + max(1.5, self.capture_burst_duration_s) + max(0.0, max_age - 1.0)
+        # Automatic mode: only frames exposed after the measured settle time.
+        min_stamp_ns = getattr(getattr(self, 'automatic', None), 'min_capture_stamp_ns', None) \
+            if hasattr(self, 'automatic') and self.automatic.active else None
         seen_stamps = set()
         tracking_burst = []
         robot_burst = []
+        frames = []
+        moving_frames = 0
 
         while len(tracking_burst) < self.capture_burst_samples and time.monotonic() < burst_deadline:
             if hasattr(self, 'automatic') and self.automatic.active:
@@ -443,9 +610,12 @@ class DataCollector(Node):
                     self.tracking_base_frame, self.tracking_marker_frame, rclpy.time.Time())
             except TransformException:
                 continue
-            age = (self.get_clock().now().nanoseconds - rclpy.time.Time.from_msg(tracking_k.header.stamp).nanoseconds) / 1e9
-            if not -0.1 <= age < 1.0:
+            stamp_ns = rclpy.time.Time.from_msg(tracking_k.header.stamp).nanoseconds
+            age = (self.get_clock().now().nanoseconds - stamp_ns) / 1e9
+            if not -0.1 <= age < max_age:
                 continue
+            if min_stamp_ns is not None and stamp_ns < min_stamp_ns:
+                continue  # exposed before the robot had settled
             stamp_key = (tracking_k.header.stamp.sec, tracking_k.header.stamp.nanosec)
             if stamp_key in seen_stamps:
                 continue  # no new detector frame published yet
@@ -454,12 +624,21 @@ class DataCollector(Node):
                 robot_k = self._lookup_robot_at(tracking_k.header.stamp, timeout_s=0.3)
             except TransformException:
                 continue
+            robot_pose = get_transform(robot_k.transform)
+            if not self._robot_was_stationary(tracking_k.header.stamp, robot_pose):
+                moving_frames += 1
+                continue
             tracking_burst.append(tracking_k)
             robot_burst.append(robot_k)
+            observation = self.observations.get(stamp_ns)
+            if observation is not None:
+                frames.append(frame_record(observation, robot_pose, stamp_ns))
 
         if len(tracking_burst) < 3:
             resp.success = False
-            resp.message = 'Need at least 3 fresh, time-synchronized board frames. Check detection and use_sim_time.'
+            resp.message = ('Need at least 3 fresh, time-synchronized board frames taken while the robot was still'
+                            f' (max stamp age {max_age:.2f} s, {moving_frames} frame(s) during motion). '
+                            'Hold the robot still; check detection, camera latency and use_sim_time.')
             return resp
 
         robot_list = [get_transform(t.transform) for t in robot_burst]
@@ -490,9 +669,22 @@ class DataCollector(Node):
         metrics['burst_robot_rotation_dev_deg'] = robot_spread['max_rotation_dev_deg']
         self._log_sample_quality(metrics)
 
+        metrics['raw_frames'] = len(frames)
+        metrics['camera_latency'] = self.latency.stats()
         self.robot_samples.append(robot_avg)
         self.tracking_samples.append(tracking_avg)
         self.sample_metrics.append(metrics)
+        self.sample_frames.append(frames)
+        self.sample_joints.append(self._current_joints())
+        role = getattr(getattr(self, 'automatic', None), 'capture_role', 'training') \
+            if hasattr(self, 'automatic') and self.automatic.active else 'training'
+        self.sample_roles.append(role)
+        self.sample_images.append(self._encode_image({f['stamp_ns'] for f in frames})
+                                  if bool(self.get_parameter('dataset_save_images').value) else None)
+        if not frames:
+            self.get_logger().warning(
+                'No raw ChArUco observations matched this sample; is the detector publishing '
+                f"{self.get_parameter('observation_topic').value}? The reprojection solver will skip it.")
         # The cached uncertainty described the previous sample set; it is stale
         # the moment a new sample lands. Re-estimating here would add seconds to
         # every capture, so drop it and let save/estimate_uncertainty redo it.
@@ -513,15 +705,109 @@ class DataCollector(Node):
         resp.message = msg
         return resp
 
-    def get_calibration(self):
-        if len(self.robot_samples) < 4:
+    def _training_samples(self):
+        idx = self.training_indices()
+        return [self.robot_samples[i] for i in idx], [self.tracking_samples[i] for i in idx]
+
+    def _dataset_samples(self, indices):
+        return [{'robot': self.robot_samples[i], 'tracking': self.tracking_samples[i],
+                 'frames': self.sample_frames[i], 'joints': self.sample_joints[i]} for i in indices]
+
+    def _camera(self):
+        from .reprojection_calibration import Camera
+        if self._camera_model is None:
+            return None
+        return Camera.from_dict(self._camera_model)
+
+    def _reprojection_summary(self):
+        report = self._last_reprojection
+        if not report:
+            return None
+        keys = ('board_in_base', 'pose_metrics', 'geometry', 'algorithm', 'optimizer', 'upstream_commit', 'solver', 'reprojection_rms_px', 'training_views', 'rejected_views', 'board_spread',
+                'leave_one_out', 'validation_views', 'initial_delta_translation_m',
+                'initial_delta_rotation_deg', 'intrinsics', 'refinement_comparison',
+                'axxb_rejected_views', 'reprojection_rejected_views', 'kept_views')
+        summary = {k: report.get(k) for k in keys if report.get(k) is not None}
+        for key in ('board_spread', 'leave_one_out', 'validation_views'):
+            if isinstance(summary.get(key), dict):
+                summary[key] = {k: v for k, v in summary[key].items() if not k.startswith('per_view')}
+        return summary
+
+    def _solve_reprojection(self, closed_form, full=False, rejected_indices=()):
+        """Final estimate from corner pixels. `full` adds leave-one-out,
+        validation views and bootstrap (seconds); otherwise only the fit."""
+        from .reprojection_calibration import Dataset, calibrate, pose_matrix
+        if self.solver_name != 'reprojection':
+            return None
+        camera = self._camera()
+        training, validation = self.training_indices(), self.validation_indices()
+        if camera is None or any(not self.sample_frames[i] for i in training):
+            return None
+        order = training + validation
+        dataset = Dataset(self._dataset_samples(order), camera, self.calibration_type)
+        if len(dataset) != len(order):
+            return None
+        report = calibrate(dataset, pose_matrix(closed_form), estimate_intrinsics=self.estimate_intrinsics,
+                           validation_indices=list(range(len(training), len(order))),
+                           bootstrap_samples=self.bootstrap_samples if full else 0, leave_one_out=full,
+                           excluded_indices=rejected_indices, compare_refinement_cv=full)
+        solution = report.pop('_solution')
+        # Map dataset indices back to sample indices for reporting.
+        for key in ('rejected_views', 'axxb_rejected_views', 'reprojection_rejected_views', 'kept_views'):
+            report[key] = [order[i] for i in report[key]]
+        for fold in (report.get('refinement_comparison') or {}).get('folds', []):
+            fold['held_out'] = order[fold['held_out']]
+            fold['fit_indices'] = [order[i] for i in fold['fit_indices']]
+        report['training_sample_indices'] = training
+        report['validation_sample_indices'] = validation
+        report['closed_form_transform'] = list(closed_form)
+        self._reprojection_state = (dataset, solution)
+        return report
+
+    def _get_intrinsic_calibration(self, full=False):
+        from . import intrinsic_solver as solver
+        robot, tracking = self._training_samples()
+        if len(robot) < 3:
+            return None
+        # Cache only training inputs: held-out frames cannot influence the fit.
+        key = (tuple(map(tuple, robot)), tuple(map(tuple, tracking)))
+        cached = getattr(self, '_intrinsic_fit_cache', None)
+        try:
+            report = dict(cached[1]) if cached is not None and cached[0] == key else solver.solve(robot, tracking)
+            if full and 'uncertainty' not in report:
+                report['uncertainty'] = solver.uncertainty(robot, tracking, report, self.bootstrap_samples)
+            self._intrinsic_fit_cache = (key, dict(report))
+            ids = self.validation_indices()
+            if ids:
+                report['validation_views'] = solver.metrics(
+                    np.array([solver.matrix(self.robot_samples[i]) for i in ids]),
+                    np.array([solver.matrix(self.tracking_samples[i]) for i in ids]),
+                    solver.matrix(report['transform']), solver.matrix(report['board_in_base']))
+        except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+            self._last_reprojection = self._last_calibration_detail = None
+            self.get_logger().error(f'Intrinsic pose solve failed: {exc}')
+            return None
+        self._last_reprojection = report
+        self._last_acceptance = solver.evaluate(report, require_validation=bool(getattr(getattr(self, 'automatic', None), 'active', False)))
+        self._reprojection_state = None
+        self._last_uncertainty = report.get('uncertainty')
+        self._last_calibration_detail = dict(transform=report['transform'], algorithm_used='SHAH+NONLINEAR',
+                                             kept_indices=list(range(len(robot))), rejected_indices=[],
+                                             refinement={'optimizer':'scipy_least_squares'})
+        return report['transform']
+
+    def get_calibration(self, full=False):
+        if self.solver_name == 'intrinsic_pose':
+            return self._get_intrinsic_calibration(full)
+        robot, tracking = self._training_samples()
+        if len(robot) < 4:
             self.get_logger().info("Not enough samples yet...")
             return None
 
         self.get_logger().info("Estimating ...")
         try:
             detail = CalibrationBackend.compute_calibration_detailed(
-                samples_robot=self.robot_samples, samples_tracking=self.tracking_samples)
+                samples_robot=robot, samples_tracking=tracking)
         except (RuntimeError, ValueError) as exc:
             # The backend translates OpenCV's cv2.error into RuntimeError, so
             # a degenerate pose set surfaces here as a failed service call
@@ -530,6 +816,30 @@ class DataCollector(Node):
             self._last_calibration_detail = None
             return None
 
+        self._last_reprojection = None
+        try:
+            report = self._solve_reprojection(detail['transform'], full=full,
+                                              rejected_indices=detail['rejected_indices'])
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+            self.get_logger().error(f"Reprojection solve failed, keeping the closed-form estimate: {exc}")
+            report = None
+        if report is not None:
+            self._last_reprojection = report
+            detail = dict(detail)
+            detail['axxb_transform'] = detail['transform']
+            detail['transform'] = report['transform']
+            # Report residuals on the final survivor set, not the earlier
+            # AX=XB set if pixel refinement rejected more views.
+            global_to_training = {v: i for i, v in enumerate(report['training_sample_indices'])}
+            detail['kept_indices'] = [global_to_training[i] for i in report['kept_views']]
+            detail['rejected_indices'] = [global_to_training[i] for i in report['rejected_views']]
+            detail['residuals'] = CalibrationBackend.pairwise_residuals(
+                robot, tracking, report['transform'], indices=detail['kept_indices'])
+            self.get_logger().info(
+                f"Reprojection solve: RMS {report['reprojection_rms_px']:.2f} px over {report['training_views']} views, "
+                f"moved the AX=XB estimate by {report['initial_delta_translation_m'] * 1000:.2f} mm / "
+                f"{report['initial_delta_rotation_deg']:.3f} deg; board spread "
+                f"{report['board_spread']['position_rms_m'] * 1000:.2f} mm RMS")
         self._last_calibration_detail = detail
         if detail['rejected_indices']:
             self.get_logger().warning(
@@ -538,7 +848,7 @@ class DataCollector(Node):
             )
         refinement = detail['refinement']
         self.get_logger().info(
-            f"Hand-eye algorithm: {detail['algorithm_used']} (auto-selected by cross-validating "
+            f"Hand-eye algorithm: {detail['algorithm_used']} (selected by leave-one-pose-out validation of "
             "Tsai/Park/Horaud/Andreff/Daniilidis); nonlinear refinement moved the estimate by "
             f"{refinement['delta_translation_m'] * 1000:.2f}mm / {refinement['delta_rotation_deg']:.3f}deg"
         )
@@ -550,14 +860,20 @@ class DataCollector(Node):
         Returns None when disabled or when there is not enough data. Slow by
         design (a full refit per resample), so callers decide when to pay it.
         """
+        if self.solver_name == 'intrinsic_pose':
+            if cal is None:
+                return None
+            self._get_intrinsic_calibration(full=True)
+            return self._last_uncertainty
         if self.bootstrap_samples <= 0:
             return None
         detail = self._last_calibration_detail
         if cal is None or detail is None:
             return None
 
+        robot, tracking = self._training_samples()
         cache_key = (tuple(cal), detail['algorithm_used'], self.bootstrap_samples,
-                     tuple(map(tuple, self.robot_samples)), tuple(map(tuple, self.tracking_samples)))
+                     tuple(map(tuple, robot)), tuple(map(tuple, tracking)))
         cached = getattr(self, '_uncertainty_cache', None)
         if cached is not None and cached[0] == cache_key:
             self._last_uncertainty = cached[1]
@@ -567,13 +883,24 @@ class DataCollector(Node):
             "this takes a few seconds..."
         )
         try:
-            uncertainty = CalibrationBackend.bootstrap_uncertainty(
-                samples_robot=self.robot_samples,
-                samples_tracking=self.tracking_samples,
-                nominal_transform=cal,
-                algorithm=detail['algorithm_used'],
-                n_bootstrap=self.bootstrap_samples,
-            )
+            state = self._reprojection_state
+            if (self._last_reprojection is not None and state is not None
+                    and list(cal) == list(self._last_reprojection['transform'])):
+                from .reprojection_calibration import ReprojectionSolver
+                solver = ReprojectionSolver(state[0], estimate_intrinsics=self.estimate_intrinsics)
+                uncertainty = solver.bootstrap(state[1], n=self.bootstrap_samples)
+                if uncertainty is not None:
+                    uncertainty['guidance'] = CalibrationBackend._uncertainty_guidance(
+                        uncertainty['worst_direction_sigma_m'], uncertainty['best_direction_sigma_m'],
+                        np.asarray(uncertainty['worst_direction_axis']))
+            else:
+                uncertainty = CalibrationBackend.bootstrap_uncertainty(
+                    samples_robot=robot,
+                    samples_tracking=tracking,
+                    nominal_transform=cal,
+                    algorithm=detail['algorithm_used'],
+                    n_bootstrap=self.bootstrap_samples,
+                )
         except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
             self.get_logger().warning(f"Uncertainty estimation failed: {exc}")
             return None
@@ -636,8 +963,13 @@ class DataCollector(Node):
             resp.success = False
             resp.message = 'Automatic calibration is running; use Stop first.'
             return resp
-        """Save current calibration estimate to YAML file for later publishing."""
-        cal = self.get_calibration()
+        """Save current calibration estimate to YAML file for later publishing.
+
+        The raw dataset is always written. The active calibration file is
+        replaced only when the acceptance gate passes (or acceptance_mode is
+        'warn'); otherwise the candidate goes to <calibration_file>.rejected.yaml.
+        """
+        cal = self.get_calibration(full=True)
         if cal is None:
             resp.success = False
             resp.message = "Not enough samples (need at least 4). Capture more points first."
@@ -649,12 +981,28 @@ class DataCollector(Node):
             # Record how well-determined the saved numbers actually are, so the
             # YAML carries its own error bars rather than a bare transform.
             uncertainty = self._compute_uncertainty(cal)
+            report = self._last_reprojection
+            if report is not None:
+                report['uncertainty'] = uncertainty
+            limits = dict(self.acceptance_limits)
             if self.automatic.active:
-                from .calibration_quality import position_uncertainty_ok
-                if not position_uncertainty_ok(uncertainty, self.automatic.max_position_sigma):
-                    resp.success = False
-                    resp.message = 'Automatic uncertainty target was not met; no calibration was saved.'
-                    return resp
+                limits['max_position_sigma_m'] = self.automatic.max_position_sigma
+            if self.solver_name == 'intrinsic_pose':
+                from .intrinsic_solver import evaluate
+                verdict = evaluate(report, sigma_limit=limits['max_position_sigma_m'],
+                                   min_samples=max(20, limits['min_samples']),
+                                   require_validation=self.automatic.active)
+            else:
+                verdict = acceptance_gate.evaluate(report, self.training_count(), limits)
+            if report is None and self.solver_name == 'axxb':
+                # Explicit legacy mode: judge on sample count and bootstrap only.
+                verdict = acceptance_gate.evaluate(
+                    {'uncertainty': uncertainty, 'board_spread': {'position_rms_m': 0.0},
+                     'leave_one_out': {'position_rms_m': 0.0, 'reprojection_rms_px': 0.0}},
+                    self.training_count(), limits)
+                verdict['summary'] += ' (legacy AX=XB mode: no held-out validation)'
+            self._last_acceptance = verdict
+            detail = self._last_calibration_detail or {}
             data = {
                 'calibration_type': self.calibration_type,
                 'tracking_base_frame': self.tracking_base_frame,
@@ -669,6 +1017,8 @@ class DataCollector(Node):
                 'camera_info_frame': self._last_camera_info_frame,
                 'marker_size_m': self.marker_size if self.marker_size > 0.0 else None,
                 'sample_count': len(self.robot_samples),
+                'training_sample_count': self.training_count(),
+                'validation_sample_indices': self.validation_indices(),
                 'sample_metrics': self.sample_metrics,
                 'diversity': diversity,
                 'residuals': residuals,
@@ -677,42 +1027,189 @@ class DataCollector(Node):
                     'tx': cal[0], 'ty': cal[1], 'tz': cal[2],
                     'qx': cal[3], 'qy': cal[4], 'qz': cal[5], 'qw': cal[6],
                 },
-                'algorithm_used': (self._last_calibration_detail or {}).get('algorithm_used'),
-                'rejected_sample_indices': (self._last_calibration_detail or {}).get('rejected_indices'),
-                'nonlinear_refinement': (self._last_calibration_detail or {}).get('refinement'),
+                'solver': self.solver_name,
+                'algorithm_used': detail.get('algorithm_used'),
+                'algorithm_selection': detail.get('algorithm_selection'),
+                'axxb_transform': None if self.solver_name == 'intrinsic_pose' else detail.get('axxb_transform', detail.get('transform')),
+                'rejected_sample_indices': [self.training_indices()[i] for i in detail.get('rejected_indices', [])],
+                'nonlinear_refinement': detail.get('refinement'),
+                'reprojection': self._reprojection_summary() if self.solver_name != 'intrinsic_pose' else None,
+                'pose_calibration': self._reprojection_summary() if self.solver_name == 'intrinsic_pose' else None,
                 'uncertainty': uncertainty,
+                'acceptance': verdict,
+                'camera_latency': self.latency.stats(),
+                'camera_model': self._camera_model,
+                'board_spec': self._board_spec_seen,
             }
-            os.makedirs(os.path.dirname(os.path.abspath(cal_file)) or '.', exist_ok=True)
             if self.automatic.active:
                 self.automatic.check()
                 data['automatic_validation'] = self.automatic.status.get('validation')
                 data['automatic_fit_consistency'] = self.automatic.status.get('fit_consistency')
-                data['automatic_sample_plan'] = {'initial': 6, 'targeted': 9, 'independent_validation': 0}
+                data['automatic_sample_plan'] = {
+                    'initial': self.automatic.status.get('initial_samples', 0),
+                    'targeted': self.automatic.status.get('targeted_samples', 0),
+                    'independent_validation': len(self.validation_indices())}
                 data['automatic_position_sigma_limit_m'] = self.automatic.max_position_sigma
-            import tempfile
-            import shutil
-            if os.path.exists(cal_file):
-                shutil.copy2(cal_file, cal_file + '.previous')
-            with tempfile.NamedTemporaryFile(mode='w', dir=os.path.dirname(os.path.abspath(cal_file)), delete=False) as f:
-                yaml.dump(data, f, default_flow_style=False)
-                temporary = f.name
+            run_dir = None
             try:
-                if self.automatic.active:
-                    self.automatic.check()
-                os.replace(temporary, cal_file)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
+                run_dir = calibration_dataset.write_run(
+                    os.path.expanduser(str(self.get_parameter('dataset_dir').value)), self, data)
+                data['dataset_path'] = run_dir
+            except OSError as exc:
+                self.get_logger().error(f'Could not write the calibration dataset: {exc}')
+            accepted = verdict['passed'] or self.acceptance_mode == 'warn'
+            target = cal_file if accepted else cal_file + '.rejected.yaml'
+            self._write_yaml_atomic(target, data, keep_previous=accepted)
+            if run_dir:
+                self._write_yaml_atomic(os.path.join(run_dir, 'calibration.yaml'), data, keep_previous=False)
             self._publish_status(cal, self.sample_metrics[-1] if self.sample_metrics else None)
-            self.get_logger().info("Calibration saved to %s" % cal_file)
+            if not accepted:
+                self.get_logger().error(f"Calibration NOT saved as active: {verdict['summary']} Candidate: {target}")
+                resp.success = False
+                resp.message = f"Acceptance failed; active calibration unchanged. {verdict['summary']} Candidate: {target}"
+                return resp
+            note = '' if verdict['passed'] else f" WARNING (acceptance_mode=warn): {verdict['summary']}"
+            self.get_logger().info("Calibration saved to %s%s" % (cal_file, note))
             resp.success = True
-            resp.message = "Saved to " + cal_file
+            resp.message = "Saved to " + cal_file + note + (f" (dataset {run_dir})" if run_dir else '')
         except Exception as e:
             self.get_logger().error("Failed to save calibration: %s" % str(e))
             resp.success = False
             resp.message = str(e)
         return resp
 
+    # ------------------------------------------------------------------
+    # Touch-off validation (independent of the calibration's own data)
+    # ------------------------------------------------------------------
+    def _latest_observation(self, max_age_s):
+        items = list(self.observations.items.values())
+        if not items:
+            return None
+        latest = items[-1]
+        age = (self.get_clock().now().nanoseconds - latest['stamp_ns']) / 1e9
+        return latest if -0.1 <= age <= max_age_s else None
+
+    def touchoff_reference_callback(self, req, resp):
+        """With the robot still and the board detected, record where the board
+        is in the robot base: (a) through the calibration currently in TF
+        (URDF/applied) and (b) through the in-memory candidate, if any."""
+        if hasattr(self, 'automatic') and self.automatic.active:
+            resp.success, resp.message = False, 'Automatic calibration is running; use Stop first.'
+            return resp
+        if self.calibration_type != 'eye-in-hand':
+            resp.success, resp.message = False, 'Touch-off is implemented for eye-in-hand only.'
+            return resp
+        observation = self._latest_observation(self.freshness_limit(1.0))
+        if observation is None:
+            resp.success, resp.message = False, 'No fresh ChArUco observation; the board must be detected.'
+            return resp
+        stamp = rclpy.time.Time(nanoseconds=observation['stamp_ns']).to_msg()
+        try:
+            robot = get_transform(self._lookup_robot_at(stamp, timeout_s=0.3).transform)
+        except TransformException as exc:
+            resp.success, resp.message = False, f'Robot pose at the image stamp is unavailable: {exc}'
+            return resp
+        if not self._robot_was_stationary(stamp, robot):
+            resp.success, resp.message = False, 'Robot was moving when the image was taken; hold still and retry.'
+            return resp
+        camera_board = transform_to_matrix(observation['pose'])
+        corners = {int(i): p for i, p in zip(observation['ids'], observation['object_points'])}
+        references = {}
+        try:
+            applied = self.tf_buffer.lookup_transform(self.robot_base_frame, self.tracking_base_frame, stamp,
+                                                      Duration(seconds=0.3))
+            references['applied_tf'] = transform_to_matrix(get_transform(applied.transform)) @ camera_board
+        except TransformException:
+            pass
+        detail = self._last_calibration_detail
+        if detail and detail.get('transform'):
+            references['candidate'] = (transform_to_matrix(robot) @ transform_to_matrix(detail['transform'])
+                                       @ camera_board)
+        if not references:
+            resp.success, resp.message = False, 'Neither a camera TF nor an in-memory calibration is available.'
+            return resp
+        self.touchoff_references = {'boards': references, 'corners': corners, 'stamp_ns': observation['stamp_ns']}
+        resp.success = True
+        resp.message = (f"Board reference stored from {', '.join(references)} with {len(corners)} corners. "
+                        f"Now jog {self.get_parameter('touchoff_tcp_frame').value} onto corner "
+                        f"{self.get_parameter('touchoff_corner_id').value} and call touchoff_capture.")
+        return resp
+
+    def touchoff_capture_callback(self, req, resp):
+        """Compare the physical TCP position on a board corner with where the
+        camera said that corner is. The error contains hand-eye, TCP and robot
+        kinematic error together, which is what a seam actually experiences."""
+        if hasattr(self, 'automatic') and self.automatic.active:
+            resp.success, resp.message = False, 'Automatic calibration is running; use Stop first.'
+            return resp
+        ref = self.touchoff_references
+        if not ref:
+            resp.success, resp.message = False, 'Call touchoff_reference first (board visible, robot still).'
+            return resp
+        corner_id = int(self.get_parameter('touchoff_corner_id').value)
+        if corner_id not in ref['corners']:
+            resp.success, resp.message = False, (f'Corner {corner_id} was not detected in the reference view; '
+                                                 f"detected ids: {sorted(ref['corners'])[:20]}...")
+            return resp
+        tcp_frame = str(self.get_parameter('touchoff_tcp_frame').value)
+        try:
+            first = self.tf_buffer.lookup_transform(self.robot_base_frame, tcp_frame, rclpy.time.Time())
+            time.sleep(0.3)
+            second = self.tf_buffer.lookup_transform(self.robot_base_frame, tcp_frame, rclpy.time.Time())
+        except TransformException as exc:
+            resp.success, resp.message = False, f'TCP frame {tcp_frame} unavailable: {exc}'
+            return resp
+        p1 = np.array(get_transform(first.transform)[:3])
+        tip = np.array(get_transform(second.transform)[:3])
+        if np.linalg.norm(tip - p1) > 0.0005:
+            resp.success, resp.message = False, 'Robot is moving; hold the tip on the corner and retry.'
+            return resp
+        corner = np.r_[np.asarray(ref['corners'][corner_id], dtype=float), 1.0]
+        result = {'timestamp': datetime.now(timezone.utc).isoformat(), 'corner_id': corner_id,
+                  'tcp_frame': tcp_frame, 'tcp_base': [float(v) for v in tip], 'errors': {}}
+        parts = []
+        for name, board in ref['boards'].items():
+            predicted = (board @ corner)[:3]
+            error = tip - predicted
+            result['errors'][name] = {'vector_m': [float(v) for v in error], 'norm_m': float(np.linalg.norm(error)),
+                                      'predicted_base': [float(v) for v in predicted]}
+            parts.append(f"{name}: {np.linalg.norm(error) * 1000:.1f} mm "
+                         f"(dx {error[0] * 1000:+.1f}, dy {error[1] * 1000:+.1f}, dz {error[2] * 1000:+.1f})")
+        self.touchoff_results.append(result)
+        try:
+            directory = os.path.join(os.path.expanduser(str(self.get_parameter('dataset_dir').value)), 'touchoff')
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, 'touchoff_log.yaml'), 'a') as f:
+                yaml.safe_dump([calibration_dataset.plain(result)], f, sort_keys=False)
+        except OSError as exc:
+            self.get_logger().warning(f'Could not log touch-off result: {exc}')
+        self._publish_status(None, None)
+        message = f'Touch-off corner {corner_id}: ' + '; '.join(parts)
+        self.get_logger().info(message)
+        resp.success, resp.message = True, message
+        return resp
+
+    def write_failed_dataset(self):
+        return calibration_dataset.write_run(
+            os.path.expanduser(str(self.get_parameter('dataset_dir').value)), self, None)
+
+    def _write_yaml_atomic(self, path, data, keep_previous):
+        import tempfile
+        import shutil
+        directory = os.path.dirname(os.path.abspath(path)) or '.'
+        os.makedirs(directory, exist_ok=True)
+        if keep_previous and os.path.exists(path):
+            shutil.copy2(path, path + '.previous')
+        with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as f:
+            yaml.safe_dump(calibration_dataset.plain(data), f, default_flow_style=False, sort_keys=False)
+            temporary = f.name
+        try:
+            if self.automatic.active:
+                self.automatic.check()
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 def main():
     import signal

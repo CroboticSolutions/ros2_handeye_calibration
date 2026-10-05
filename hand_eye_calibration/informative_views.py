@@ -43,7 +43,7 @@ class InformativeViews:
     def __init__(self, session, initial, current, observation):
         self.s = session
         self.camera = lambda q: session.fk.camera(q) @ session.estimate
-        self.board = self.camera(current) @ observation
+        self.board = session.board.copy()
         self.reference = self.camera(current)
         self.center = (self.board @ np.r_[session.r.framing.center, 1])[:3]
         self.depth = float((np.linalg.inv(self.reference) @ np.r_[self.center, 1])[2])
@@ -60,18 +60,29 @@ class InformativeViews:
         self.pending_candidates = False
         # Camera rotations, not individual joint rotations. All targets look at
         # the measured board centre; several distances add depth diversity.
+        # Wider than the original 6-30 deg: large, non-parallel rotations and
+        # real depth change constrain translation (Tsai; Zivid guidance). The
+        # board-normal limit keeps ChArUco corners well conditioned.
         offsets = []
-        for angle in (6, 10, 16, 22, 30):
+        for angle in (8, 14, 22, 30, 38):
             offsets += [(angle,0,0),(-angle,0,0),(0,angle,0),(0,-angle,0),
                         (angle,angle,0),(-angle,-angle,0),(angle,-angle,0),(-angle,angle,0),
                         (0,0,angle),(0,0,-angle),(angle,0,angle),(-angle,0,-angle)]
+        offsets += [(0,0,60),(0,0,-60),(15,0,45),(-15,0,-45),(0,15,-45),(0,-15,45)]
+        reference_position = self.reference[:3,3].copy()
+        excursion = float(getattr(session.r, 'max_camera_excursion', 0.) or 0.)
         for i, angles in enumerate(offsets):
             session.r.check()
             desired = self.reference.copy()
             desired[:3,:3] = self.reference[:3,:3] @ Rotation.from_euler('xyz',angles,degrees=True).as_matrix()
-            scale = (1., .92, 1.08)[i%3]
+            scale = (1., .85, 1.2)[i%3]
             desired[:3,3] = self.center - desired[:3,:3] @ [0.,0.,self.depth*scale]
-            if not session.r.framing.contains(np.linalg.inv(desired)@self.board, margin=.13):
+            if excursion > 0 and np.linalg.norm(desired[:3,3]-reference_position) > excursion:
+                continue
+            view = np.linalg.inv(desired)@self.board
+            if np.degrees(np.arccos(min(1., abs(float(view[2,2]))))) > 50:
+                continue
+            if not session.r.framing.contains(view, margin=.13):
                 continue
             def residual(q):
                 session.r.check()
@@ -88,7 +99,7 @@ class InformativeViews:
         s = self.s
         # Observations are measured at sample endpoints; during transit the
         # caller propagates the fixed board estimate without requiring detection.
-        board = self.camera(current) @ observation
+        board = self.board
         if hasattr(s.r, "show_board_estimate") and hasattr(s.r, "board_marker_pub"):
             s.r.show_board_estimate(board)
         if self.goal is not None and np.max(np.abs(self.goal-current)) < .003:
@@ -97,9 +108,9 @@ class InformativeViews:
         if self.goal is None:
             self.remaining = None
             self.advancing = False
-            if getattr(self, 'selection_view_count', -1) != len(s.views):
+            if getattr(self, 'selection_view_count', -1) != len(s.views) + len(s.validation):
                 self.tried_targets = set()
-                self.selection_view_count = len(s.views)
+                self.selection_view_count = len(s.views) + len(s.validation)
             information = ViewInformation(s.views,s.estimate,board,s.r.framing)
             ranked = sorted(self.targets, key=lambda q: information.gain(s.fk.camera(q))
                             / (1.+np.max(np.abs(q-current))/.1), reverse=True)
@@ -110,7 +121,7 @@ class InformativeViews:
                 key = tuple(np.round(target,6))
                 if key in self.tried_targets:
                     continue
-                if not informative_view(s.fk.camera(target),s.views):
+                if not informative_view(s.fk.camera(target),s.views + s.validation):
                     self.targets = [q for q in self.targets if q is not target]
                     continue
                 if requests >= self.MAX_PLAN_REQUESTS:
@@ -125,8 +136,9 @@ class InformativeViews:
                     self.rejections['visibility'] = self.rejections.get('visibility',0)+1
                     continue
                 self.targets = [q for q in self.targets if q is not target]
-                self.trajectory = s.r.planned_trajectory
-                self.goal = np.asarray(self.trajectory.points[-1].positions, dtype=float)
+                self.trajectory = getattr(s.r, 'planned_trajectory', None)
+                self.goal = (np.asarray(self.trajectory.points[-1].positions, dtype=float)
+                             if self.trajectory is not None else np.asarray(path[-1], dtype=float))
                 self.route = [q.copy() for q in path[1:]]
                 break
         self.pending_candidates = self.goal is None and any(
@@ -142,6 +154,7 @@ class InformativeViews:
 
     def reject_goal(self):
         self.goal = None
+        self.trajectory = None
         self.route = []
         self.remaining = None
         self.advancing = False

@@ -46,6 +46,8 @@ from scipy.spatial.transform import Rotation as Rot
 
 from .pivot_backend import PivotCalibrationBackend
 from .pivot_status import build_tool_tcp_status, status_to_json
+from . import tcp_quality
+from .calibration_dataset import plain
 
 TIP_ROUND = "tip"
 # The axis-alignment round keeps the historical key "axis_ref" so the GUI
@@ -93,6 +95,24 @@ class PivotCollector(Node):
         self.declare_parameter('capture_rotation_p95_limit_deg', 0.20)
         self.declare_parameter('duplicate_orientation_limit_deg', 5.0)
         self.declare_parameter('max_tf_age_s', 0.25)
+        # Acceptance gate (tcp_quality.DEFAULT_LIMITS); 'warn' saves anyway.
+        self.declare_parameter('acceptance_mode', 'enforce')
+        for key, value in tcp_quality.DEFAULT_LIMITS.items():
+            self.declare_parameter('accept_' + key, value)
+        self.declare_parameter('dataset_dir', os.path.expanduser('~/.ros/tool_tcp_calibration_runs'))
+        # Nominal neck angle (tool axis vs flange Z) from CAD; < 0 disables the check.
+        self.declare_parameter('cad_axis_angle_deg', 35.0)
+        # 'bend_plane': TCP +X in the torch-neck bend plane; 'legacy': flange-X hint.
+        self.declare_parameter('tcp_roll_convention', 'bend_plane')
+        # Reorientation check motion.
+        self.declare_parameter('reorient_angle_deg', 25.0)
+        self.declare_parameter('reorient_spin_deg', 45.0)
+        self.declare_parameter('reorient_standoff_m', 0.005)
+        self.declare_parameter('reorient_clearance_m', 0.03)
+        self.declare_parameter('auto_group', '')
+        self.declare_parameter('auto_controller', '')
+        self.declare_parameter('auto_check_collisions', True)
+        self.declare_parameter('motion_heartbeat_timeout_s', 0.0)
 
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value)
         self.robot_flange_frame = str(self.get_parameter('robot_flange_frame').value)
@@ -110,6 +130,21 @@ class PivotCollector(Node):
         self.duplicate_orientation_limit_deg = float(
             self.get_parameter('duplicate_orientation_limit_deg').value)
         self.max_tf_age_s = float(self.get_parameter('max_tf_age_s').value)
+        self.acceptance_mode = str(self.get_parameter('acceptance_mode').value)
+        if self.acceptance_mode not in ('enforce', 'warn'):
+            raise ValueError("acceptance_mode must be 'enforce' or 'warn'")
+        self.acceptance_limits = {k: type(v)(self.get_parameter('accept_' + k).value)
+                                  for k, v in tcp_quality.DEFAULT_LIMITS.items()}
+        self.cad_axis_angle_deg = float(self.get_parameter('cad_axis_angle_deg').value)
+        self.roll_convention = str(self.get_parameter('tcp_roll_convention').value)
+        from .tcp_reorientation import TcpMotion
+        self.motion = TcpMotion(
+            self, self.robot_base_frame, self.robot_flange_frame,
+            group=str(self.get_parameter('auto_group').value),
+            controller=str(self.get_parameter('auto_controller').value),
+            check_collisions=bool(self.get_parameter('auto_check_collisions').value),
+            heartbeat_timeout=float(self.get_parameter('motion_heartbeat_timeout_s').value))
+        self.reorient_index = 0
 
         # Separate from the TransformListener's default group: TF updates must
         # continue on another executor thread while a capture service waits for
@@ -137,6 +172,10 @@ class PivotCollector(Node):
         self.compute_axis_service = self.create_service(
             Trigger, mname + "/compute_axis", self.compute_axis_cb,
             callback_group=self._callback_group)
+        self.reorient_next_service = self.create_service(
+            Trigger, mname + "/reorient_next", self.reorient_next_cb, callback_group=self._callback_group)
+        self.motion_stop_service = self.create_service(
+            Trigger, mname + "/motion_stop", self.motion_stop_cb, callback_group=self.motion.cb)
         self.save_calibration_service = self.create_service(
             Trigger, mname + "/save_calibration", self.save_calibration_cb,
             callback_group=self._callback_group)
@@ -215,10 +254,35 @@ class PivotCollector(Node):
             align_samples=self.samples[ALIGN_ROUND],
             axis=self.axis_result,
         )
+        acceptance = self._acceptance(tip_pivot, validation_result)
+        status['acceptance'] = acceptance
+        status['rotation_spans_deg'] = tcp_quality.rotation_spans_deg(self.samples[TIP_ROUND])
+        status['cad_axis_deviation_deg'] = self._cad_deviation()
+        status['reorientation'] = {**self.motion.state, 'next_index': self.reorient_index,
+                                   'targets': 6}
+        # Save stays possible with a fit: the node then writes the active file
+        # only if acceptance passes, otherwise a .rejected.yaml candidate + dataset.
         msg = String()
         msg.data = status_to_json(status)
         self.status_pub.publish(msg)
         return tip_pivot, status
+
+    def _cad_deviation(self):
+        if self.axis_result is None:
+            return None
+        return tcp_quality.cad_axis_deviation_deg(self.axis_result['axis_dir'], self.cad_axis_angle_deg)
+
+    def _acceptance(self, tip_pivot, validation_result):
+        return tcp_quality.evaluate(
+            tip_pivot, tcp_quality.rotation_spans_deg(self.samples[TIP_ROUND]), validation_result,
+            axis=self.axis_result, axis_mode=self._current_mode() == 'axis',
+            cad_deviation=self._cad_deviation(), limits=self.acceptance_limits)
+
+    def _current_joints(self):
+        joints = self.motion.joints
+        if joints is None or time.monotonic() - self.motion.joint_at > 1.0:
+            return None
+        return {n: float(p) for n, p in zip(joints.name, joints.position)}
 
     def _round_label(self, round_key):
         return {
@@ -326,6 +390,9 @@ class PivotCollector(Node):
                 "rotation_p95_deg": aggregate["rotation_p95_deg"],
                 "rotation_max_deg": aggregate["rotation_max_deg"],
                 "nearest_orientation_deg": None if not np.isfinite(nearest_deg) else nearest_deg,
+                "joints": self._current_joints(),
+                "reorientation_target": (self.reorient_index - 1 if round_key == VALIDATION_ROUND
+                                         and self.motion.state.get('state') == 'done' else None),
             }
         )
         if round_key == TIP_ROUND:
@@ -391,9 +458,10 @@ class PivotCollector(Node):
         label = self._round_label(round_key)
         self.samples[round_key] = []
         self.sample_metadata[round_key] = []
-        if round_key == TIP_ROUND:
+        if round_key in (TIP_ROUND, VALIDATION_ROUND):
             self.samples[VALIDATION_ROUND] = []
             self.sample_metadata[VALIDATION_ROUND] = []
+            self.reorient_index = 0
         if round_key != VALIDATION_ROUND:
             self.axis_result = None
         self._publish_status()
@@ -456,8 +524,15 @@ class PivotCollector(Node):
             resp.message = str(ex)
             return resp
 
+        if self.roll_convention == 'bend_plane':
+            frame = tcp_quality.bend_plane_frame(self.axis_result['axis_dir'])
+            if frame is not None:
+                self.axis_result.update(quaternion=frame['quaternion'],
+                                        rotation_matrix=frame['rotation_matrix'],
+                                        roll_convention=frame['roll_convention'])
         self._publish_status()
         a = self.axis_result
+        cad = self._cad_deviation()
         resp.success = True
         resp.message = (
             f"Axis computed from {a['sample_count']} alignment pose(s)"
@@ -466,7 +541,56 @@ class PivotCollector(Node):
                 if a["sample_count"] > 1
                 else " (single pose — accuracy = your manual alignment)"
             )
+            + ("" if cad is None else f"; {cad:.1f}° from the CAD neck angle")
         )
+        return resp
+
+    # ------------------------------------------------------------------
+    # Reorientation check
+    # ------------------------------------------------------------------
+    def reorient_next_cb(self, req, resp):
+        tip_pivot = self._compute_round(TIP_ROUND)
+        if tip_pivot is None:
+            resp.success, resp.message = False, 'Fit the tip first (tip round).'
+            return resp
+        if self.motion.active:
+            resp.success, resp.message = False, 'A reorientation move is already running.'
+            return resp
+        if self.reorient_index >= 6:
+            resp.success, resp.message = False, 'All 6 reorientation poses done. Reset the validation round to repeat.'
+            return resp
+        try:
+            flange = self.tf_buffer.lookup_transform(self.robot_base_frame, self.robot_flange_frame,
+                                                     rclpy.time.Time(), Duration(seconds=0.2))
+        except TransformException as exc:
+            resp.success, resp.message = False, f'Flange pose unavailable: {exc}'
+            return resp
+        current = get_transform(flange.transform)
+        reference = PivotCalibrationBackend.aggregate_pose_burst(self.samples[TIP_ROUND])['pose'][3:]
+        targets = tcp_quality.reorientation_targets(
+            reference, float(self.get_parameter('reorient_angle_deg').value),
+            float(self.get_parameter('reorient_spin_deg').value), self.spike_axis_base)
+        index = self.reorient_index
+        self.active_round = VALIDATION_ROUND
+
+        def done(ok):
+            if ok:
+                self.reorient_index = index + 1
+            self._publish_status()
+
+        self.motion.run_step(np.asarray(current), targets[index], tip_pivot['tcp_translation'],
+                             tip_pivot['fixed_point'], self.spike_axis_base,
+                             float(self.get_parameter('reorient_clearance_m').value),
+                             float(self.get_parameter('reorient_standoff_m').value), done)
+        self._publish_status()
+        resp.success = True
+        resp.message = (f'Reorientation pose {index + 1}/6 started: the tool rotates about its fitted tip above the '
+                        'spike. Keep the E-stop at hand.')
+        return resp
+
+    def motion_stop_cb(self, req, resp):
+        self.motion.stop()
+        resp.success, resp.message = True, 'Stop requested; cancelling the trajectory.'
         return resp
 
     def save_calibration_cb(self, req: Trigger.Request, resp: Trigger.Response):
@@ -478,13 +602,9 @@ class PivotCollector(Node):
             )
             return resp
 
-        if not status["ready_to_save"]:
-            resp.success = False
-            resp.message = (
-                "Calibration is not yet saveable: capture at least four full-rank tip "
-                "poses; in axis mode also compute the alignment axis. Quality and "
-                "held-out validation remain recommended but do not block saving."
-            )
+        acceptance = status['acceptance']
+        if tip_pivot is not None and len(self.samples[TIP_ROUND]) < PivotCalibrationBackend.MIN_SAMPLES:
+            resp.success, resp.message = False, 'Not enough tip samples.'
             return resp
 
         # An alignment round was started but the axis was not (re)computed: saving
@@ -584,9 +704,24 @@ class PivotCollector(Node):
                     'alignment_sample_count': self.axis_result.get('sample_count'),
                 }
 
-            os.makedirs(os.path.dirname(os.path.abspath(cal_file)) or '.', exist_ok=True)
-            with open(cal_file, 'w') as f:
-                yaml.dump(data, f, default_flow_style=False)
+            if self.axis_result is not None:
+                data['axis_calibration']['roll_convention'] = self.axis_result.get('roll_convention', 'legacy_flange_x')
+                data['axis_calibration']['cad_axis_angle_deg'] = self.cad_axis_angle_deg
+                data['axis_calibration']['cad_axis_deviation_deg'] = self._cad_deviation()
+            data['rotation_spans_deg'] = status['rotation_spans_deg']
+            data['acceptance'] = acceptance
+            data['raw_samples']['joint_names'] = list(self.motion.names or [])
+            run_dir = self._write_dataset(data)
+            data['dataset_path'] = run_dir
+            accepted = acceptance['passed'] or self.acceptance_mode == 'warn'
+            target = cal_file if accepted else cal_file + '.rejected.yaml'
+            self._write_yaml_atomic(target, data, keep_previous=accepted)
+            if not accepted:
+                self.get_logger().error(f"TCP calibration NOT saved as active: {acceptance['summary']}")
+                resp.success = False
+                resp.message = (f"Acceptance failed; active TCP unchanged. {acceptance['summary']} "
+                                f"Candidate: {target}; dataset: {run_dir}")
+                return resp
             self.get_logger().info(f"TCP calibration saved to {cal_file}")
             resp.success = True
             orientation_note = (
@@ -594,8 +729,9 @@ class PivotCollector(Node):
                 if self.axis_result is not None
                 else "TCP orientation defaults to flange orientation."
             )
+            warning = '' if acceptance['passed'] else f" WARNING (acceptance_mode=warn): {acceptance['summary']}"
             resp.message = (
-                f"Saved to {cal_file}. {orientation_note} "
+                f"Saved to {cal_file}.{warning} {orientation_note} "
                 "Apply with tool_tcp_cli --update-xacro, rebuild the description package, "
                 "and restart the stack before using arm/set_eelink."
             )
@@ -604,6 +740,57 @@ class PivotCollector(Node):
             resp.success = False
             resp.message = str(e)
         return resp
+
+    @staticmethod
+    def _write_yaml_atomic(path, data, keep_previous):
+        import shutil
+        import tempfile
+        directory = os.path.dirname(os.path.abspath(path)) or '.'
+        os.makedirs(directory, exist_ok=True)
+        if keep_previous and os.path.exists(path):
+            shutil.copy2(path, path + '.previous')
+        with tempfile.NamedTemporaryFile('w', dir=directory, delete=False) as f:
+            yaml.safe_dump(plain(data), f, default_flow_style=False, sort_keys=False)
+            temporary = f.name
+        os.replace(temporary, path)
+
+
+
+    def _write_dataset(self, data):
+        """Raw TCP run (flange poses, joints, rounds, URDF) for offline re-solving."""
+        import json
+        root = os.path.expanduser(str(self.get_parameter('dataset_dir').value))
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        run = os.path.join(root, stamp)
+        suffix = 1
+        while os.path.exists(run):
+            run = os.path.join(root, f'{stamp}_{suffix}')
+            suffix += 1
+        try:
+            os.makedirs(run)
+            urdf = None
+            try:
+                from rcl_interfaces.srv import GetParameters
+                if self.motion.description.wait_for_service(timeout_sec=0.5):
+                    future = self.motion.description.call_async(GetParameters.Request(names=['robot_description']))
+                    end = time.monotonic() + 2
+                    while not future.done() and time.monotonic() < end:
+                        time.sleep(0.02)
+                    if future.done():
+                        urdf = future.result().values[0].string_value
+            except Exception:  # noqa: BLE001 - URDF is optional context
+                urdf = None
+            dataset = {'format_version': 1, 'kind': 'tool_tcp', 'created': datetime.now(timezone.utc).isoformat(),
+                       'robot_base_frame': self.robot_base_frame, 'robot_flange_frame': self.robot_flange_frame,
+                       'spike_axis_base': self.spike_axis_base, 'robot_description': urdf,
+                       'raw_samples': data['raw_samples'], 'online_result': {
+                           k: data.get(k) for k in ('transform', 'acceptance', 'rms_residual_m', 'fixed_point_base_frame')}}
+            with open(os.path.join(run, 'dataset.json'), 'w') as f:
+                json.dump(plain(dataset), f)
+            return run
+        except OSError as exc:
+            self.get_logger().error(f'Could not write the TCP dataset: {exc}')
+            return None
 
 
 def main():

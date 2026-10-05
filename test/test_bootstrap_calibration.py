@@ -21,8 +21,10 @@ def test_initial_transform_is_not_requested_and_checks_never_become_training(mon
     assert r.status['state'] == 'completed'
     r.tf.assert_not_called()
     assert not r.ik.mock_calls
-    assert len(n.robot_samples) == len(r.session.views) == 15
-    assert r.status['validation'] is None
+    assert len(n.robot_samples) == 25
+    assert len(r.session.views) == 20
+    assert len(r.session.validation) == 5
+    assert r.status['validation']['passed']
 
 
 def test_incorrect_first_estimate_is_not_used_to_predict_motion_or_saved(monkeypatch):
@@ -118,3 +120,38 @@ def test_bootstrap_timing_respects_real_joint_speed_and_acceleration(distance):
     duration = stamp.sec + stamp.nanosec/1e9
     assert 1.5*distance/duration <= .06 + 1e-8
     assert 6*distance/duration**2 <= .12 + 1e-8
+
+
+def test_timed_path_with_small_tracking_residual_is_captured_not_replayed(monkeypatch):
+    from types import SimpleNamespace
+    r, n, truth = synthetic_sequence(monkeypatch)
+    actual = [r.joint_positions()]
+    r.joint_positions = lambda: actual[0].copy()
+    original_move = r.move.side_effect
+    def local_move(q, **kwargs):
+        original_move(q, **kwargs)
+        actual[0] = q.copy()
+    r.move.side_effect = local_move
+    used = []
+    def plan(start, goal):
+        r.planned_trajectory = SimpleNamespace(points=[SimpleNamespace(positions=start.copy()),
+                                                       SimpleNamespace(positions=goal.copy())])
+        return [start.copy(), goal.copy()]
+    r.plan_joint_path = plan
+    def execute(trajectory):
+        assert all(trajectory is not old for old in used), 'Timed trajectory replayed'
+        np.testing.assert_allclose(trajectory.points[0].positions, actual[0], atol=1e-10)
+        used.append(trajectory)
+        target = trajectory.points[-1].positions.copy()
+        target[0] += .005  # Inside controller goal tolerance, outside old .003 gate.
+        # Drive the fake physical robot through bounded increments, as in the fixture.
+        while np.max(np.abs(target-actual[0])) > .00001:
+            d=target-actual[0]
+            local_move(actual[0]+d*min(1.,.05/np.max(np.abs(d))))
+    r.move_planned = execute
+    r.run()
+    assert r.status['state'] == 'completed', r.status
+    assert len(n.robot_samples) == 25
+    assert len(used) == 25-r.session.bootstrap_count
+    assert all(.0049 < event[2] < .0051 for event in r.sample_events[r.session.bootstrap_count:])
+    np.testing.assert_allclose(bootstrap_calibration.sample_pose(n.get_calibration()), truth, atol=1e-6)

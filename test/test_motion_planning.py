@@ -43,12 +43,15 @@ def test_actual_route_is_followed_instead_of_straight_line(monkeypatch):
     planner=informative_views.InformativeViews.__new__(informative_views.InformativeViews)
     planner.s=NS(r=runner,estimate=np.eye(4),views=[],fk=NS(camera=robot),MAX_STEP=.05)
     planner.camera=robot;planner.goal=None;planner.route=[];planner.targets=[path[-1]]
-    q=path[0];visited=[]
-    for _ in range(6):
-        q=planner.next_step(q,np.eye(4));visited.append(q)
-    np.testing.assert_allclose(visited[0],[0,.05])
-    np.testing.assert_allclose(visited[3],[.1,.1])
-    np.testing.assert_allclose(visited[-1],[.1,0])
+    # The goal is the planned endpoint and the route keeps MoveIt's corners, so
+    # execution follows the planned path, not a straight joint-space line.
+    goal=planner.next_step(path[0],np.eye(4))
+    np.testing.assert_allclose(goal,[.1,0])
+    np.testing.assert_allclose(np.array(planner.route),np.array(path[1:]))
+    # Progress along the route keeps the same goal without re-planning.
+    for q in path[1:3]:
+        np.testing.assert_allclose(planner.next_step(q,np.eye(4)),[.1,0])
+    assert len(planner.route)==1
     runner.plan_joint_path.assert_called_once()
 
 

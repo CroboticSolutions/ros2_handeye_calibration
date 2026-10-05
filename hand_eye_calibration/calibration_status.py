@@ -193,9 +193,19 @@ def build_calibration_status(
     last_sample_metrics: dict[str, Any] | None,
     estimate: list[float] | None = None,
     uncertainty: dict[str, Any] | None = None,
+    training_count: int | None = None,
+    min_save_samples: int = MIN_SAMPLES,
+    acceptance: dict[str, Any] | None = None,
+    reprojection: dict[str, Any] | None = None,
+    timing: dict[str, Any] | None = None,
+    touchoff: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     last_warnings = _sample_warnings(last_sample_metrics)
     readiness = _readiness(sample_count, diversity, residuals, last_warnings)
+    training = sample_count if training_count is None else training_count
+    if readiness in ("ready_to_save", "excellent") and training < min_save_samples:
+        # The acceptance gate would refuse the save; do not offer it.
+        readiness = "collecting"
     guidance = list(diversity.get("guidance") or [])
     guidance.extend(last_warnings)
     if uncertainty and uncertainty.get("guidance"):
@@ -207,6 +217,8 @@ def build_calibration_status(
         summary = "Ready to save — quality is sufficient."
     elif sample_count < MIN_SAMPLES:
         summary = f"Need at least {MIN_SAMPLES} samples before calibration is valid."
+    elif training < min_save_samples:
+        summary = f"Keep collecting — saving needs at least {min_save_samples} diverse samples."
     else:
         summary = "Keep collecting — improve pose diversity before saving."
 
@@ -236,6 +248,11 @@ def build_calibration_status(
         "residuals": residuals,
         "uncertainty": uncertainty,
         "last_sample_warning": last_warnings[0] if last_warnings else None,
+        "min_save_samples": min_save_samples,
+        "acceptance": acceptance,
+        "reprojection": reprojection,
+        "camera_latency": timing,
+        "touchoff": touchoff or [],
     }
     if estimate is not None and len(estimate) >= 7:
         payload["estimate"] = {

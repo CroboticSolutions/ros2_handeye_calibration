@@ -30,6 +30,10 @@ def _launch_tcp_calibration_setup(context, *_args, **_kwargs):
             {'capture_rotation_p95_limit_deg': float(lc['capture_rotation_p95_limit_deg'])},
             {'duplicate_orientation_limit_deg': float(lc['duplicate_orientation_limit_deg'])},
             {'max_tf_age_s': float(lc['max_tf_age_s'])},
+            {'motion_heartbeat_timeout_s': float(lc['motion_heartbeat_timeout_s'])},
+            {'cad_axis_angle_deg': float(lc['cad_axis_angle_deg'])},
+            {'acceptance_mode': lc['acceptance_mode']},
+            {'dataset_dir': os.path.expanduser(lc['dataset_dir'])},
         ],
     )
     return [pivot_node]
@@ -81,6 +85,12 @@ def generate_launch_description():
             DeclareLaunchArgument('capture_rotation_p95_limit_deg', default_value='0.20'),
             DeclareLaunchArgument('duplicate_orientation_limit_deg', default_value='5.0'),
             DeclareLaunchArgument('max_tf_age_s', default_value='0.25'),
+            DeclareLaunchArgument('motion_heartbeat_timeout_s', default_value='0.0',
+                                  description='>0: reorientation motion stops when the GUI heartbeat is silent this long'),
+            DeclareLaunchArgument('cad_axis_angle_deg', default_value='35.0',
+                                  description='Nominal torch-neck angle vs flange Z; <0 disables the CAD check'),
+            DeclareLaunchArgument('acceptance_mode', default_value='enforce'),
+            DeclareLaunchArgument('dataset_dir', default_value='~/.ros/tool_tcp_calibration_runs'),
             OpaqueFunction(function=_launch_tcp_calibration_setup),
         ]
     )

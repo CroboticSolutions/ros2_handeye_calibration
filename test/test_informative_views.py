@@ -53,7 +53,9 @@ def test_uncertainty_cache_invalidates_on_measurement_change(monkeypatch):
     compute=Mock(return_value=uncertainty)
     monkeypatch.setattr(CalibrationBackend,'bootstrap_uncertainty',compute)
     n=SimpleNamespace(bootstrap_samples=40,_last_calibration_detail={'algorithm_used':'Tsai'},
-                      robot_samples=[[0]*7],tracking_samples=[[0]*7],get_logger=lambda:Mock())
+                      robot_samples=[[0]*7],tracking_samples=[[0]*7],get_logger=lambda:Mock(),
+                      _reprojection_state=None,_last_reprojection=None)
+    n._training_samples=lambda:(n.robot_samples,n.tracking_samples)
     cal=[0,0,0,0,0,0,1]
     DataCollector._compute_uncertainty(n,cal)
     DataCollector._compute_uncertainty(n,cal)
@@ -72,10 +74,10 @@ def test_planner_does_not_choose_a_path_with_bad_visibility_or_collision(visible
     camera=lambda q:pose((0,float(q[0])*180/np.pi,0))
     framing=SimpleNamespace(contains=lambda *a,**k:visible)
     runner=SimpleNamespace(check=Mock(),framing=framing,collision_free_path=Mock(return_value=collision_free))
-    planner.s=SimpleNamespace(estimate=np.eye(4),r=runner,views=[pose()],fk=SimpleNamespace(camera=camera),MAX_STEP=.05)
+    planner.s=SimpleNamespace(estimate=np.eye(4),r=runner,views=[pose()],validation=[],fk=SimpleNamespace(camera=camera),MAX_STEP=.05)
     runner.plan_joint_path=lambda start,end:[start,end] if runner.collision_free_path(start,end) else None
     planner.route=[]
-    planner.camera=camera;planner.goal=None;planner.targets=[np.array([.15])]
+    planner.board=pose(translation=(0,0,1));planner.camera=camera;planner.goal=None;planner.targets=[np.array([.15])]
     assert planner.next_step(np.array([0.]),pose(translation=(0,0,1))) is None
     runner.collision_free_path.assert_called_once()
 

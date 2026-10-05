@@ -49,17 +49,18 @@ def test_plateau_before_pose_budget_stops_and_does_not_save(monkeypatch):
     at_plateau=[]
     def capped(self):
         if len(n.robot_samples)>=8:
-            if not at_plateau: at_plateau.append(r.move.call_count)
+            if not at_plateau: at_plateau.append(self.attempts)
             return
         capture(self)
         if len(n.robot_samples)>=8 and not at_plateau:
-            at_plateau.append(r.move.call_count)
+            at_plateau.append(self.attempts)
     monkeypatch.setattr(BootstrapSession,'capture',capped)
     n._compute_uncertainty=lambda _: {'worst_direction_sigma_m':.01227,'n_bootstrap':40}
     r.run()
     assert at_plateau, r.status
     assert r.status['state']=='failed'
-    assert r.move.call_count-at_plateau[0]<=48
+    # Movement attempts, not controller goals: a planned transit may be several goals.
+    assert r.session.attempts-at_plateau[0]<=48
     assert any(word in r.status['message'] for word in ('stalled','exhausted','unvisited'))
     n.save_calibration_service_callback.assert_not_called()
 

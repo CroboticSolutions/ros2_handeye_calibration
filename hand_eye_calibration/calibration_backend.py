@@ -259,33 +259,56 @@ class CalibrationBackend:
         return np.asarray(rot, dtype=np.float64), np.asarray(tr, dtype=np.float64).reshape(-1)
 
     @staticmethod
-    def _select_algorithm(samples_robot, samples_tracking, indices):
+    def algorithm_cv_scores(samples_robot, samples_tracking, indices):
+        """Leave one pose out. Fit N-1 poses; score only pairs involving the
+        omitted pose. Never score the training pairs as validation evidence.
+        A method must fit every fold; failed folds cannot improve its rank.
         """
-        Closed-form hand-eye solutions (Tsai, Park, Horaud, Andreff, Daniilidis)
-        are all "1989-1998 era" linear solutions that can disagree sharply on
-        noisy/degenerate pose sets. Instead of hard-coding one, fit all of them
-        and keep whichever has the lowest AX=XB residual on the actual data —
-        a cheap cross-validation that also flags badly-conditioned sample sets
-        (if every method disagrees a lot, something is wrong with the samples).
-        """
-        best = None
-        for algo in CalibrationBackend.AVAILABLE_ALGORITHMS:
+        indices = list(indices)
+        if len(indices) < CalibrationBackend.MIN_SAMPLES:
+            raise ValueError('Need at least 4 poses for algorithm cross-validation')
+        scores = {}
+        Rg, tg = CalibrationBackend._to_rot_tr_arrays(samples_robot)
+        Rc, tc = CalibrationBackend._to_rot_tr_arrays(samples_tracking)
+        for algorithm in CalibrationBackend.AVAILABLE_ALGORITHMS:
+            translations, rotations = [], []
+            try:
+                for held in indices:
+                    train = [i for i in indices if i != held]
+                    rot, tr = CalibrationBackend._fit(samples_robot, samples_tracking, train, algorithm)
+                    if not np.isfinite(rot).all() or not np.isfinite(tr).all():
+                        raise ValueError('Non-finite fit')
+                    errors = [CalibrationBackend._pair_residual_rt(
+                        Rg[held], tg[held], Rg[j], tg[j], Rc[held], tc[held], Rc[j], tc[j], rot, tr)
+                        for j in train]
+                    translations.append(float(np.mean([v[0] for v in errors])))
+                    rotations.append(float(np.mean([v[1] for v in errors])))
+                score = CalibrationBackend._combined_score(np.mean(translations), np.mean(rotations))
+                if not math.isfinite(score):
+                    raise ValueError('Non-finite validation error')
+                scores[algorithm] = dict(score=float(score), folds=len(indices),
+                    mean_translation_m=float(np.mean(translations)), mean_rotation_deg=float(np.mean(rotations)))
+            except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+                scores[algorithm] = dict(score=None, folds=len(translations), error=str(exc))
+        return scores
+
+    @staticmethod
+    def _select_algorithm(samples_robot, samples_tracking, indices, with_scores=False):
+        scores = CalibrationBackend.algorithm_cv_scores(samples_robot, samples_tracking, indices)
+        # Refit the selected method on all supplied training poses. Dedicated
+        # validation poses must not be supplied by callers.
+        for algo in sorted(scores, key=lambda a: scores[a]['score'] if scores[a]['score'] is not None else math.inf):
+            if scores[algo]['score'] is None:
+                continue
             try:
                 rot, tr = CalibrationBackend._fit(samples_robot, samples_tracking, indices, algo)
-            except RuntimeError:
-                continue  # this solver could not handle these poses; try the next
-            if not np.all(np.isfinite(rot)) or not np.all(np.isfinite(tr)):
+                if not np.isfinite(rot).all() or not np.isfinite(tr).all():
+                    continue
+                result = (algo, rot, tr)
+                return result + (scores,) if with_scores else result
+            except (RuntimeError, ValueError, np.linalg.LinAlgError):
                 continue
-            cal = CalibrationBackend._rot_tr_to_list(rot, tr)
-            res = CalibrationBackend.pairwise_residuals(samples_robot, samples_tracking, cal, indices=indices)
-            if res is None:
-                continue
-            score = CalibrationBackend._combined_score(res['mean_translation_m'], res['mean_rotation_deg'])
-            if best is None or score < best[0]:
-                best = (score, algo, rot, tr)
-        if best is None:
-            raise RuntimeError("No hand-eye algorithm converged on the given samples")
-        return best[1], best[2], best[3]
+        raise RuntimeError('No hand-eye algorithm passed all leave-one-pose-out folds')
 
     # ------------------------------------------------------------------
     # Outlier rejection (greedy, MAD-based over all-pairs residual scores)
@@ -402,11 +425,13 @@ class CalibrationBackend:
             raise ValueError(f"Need at least {CalibrationBackend.MIN_SAMPLES} samples, got {n}")
         all_idx = list(range(n))
 
+        selection_scores = None
         if algorithm is not None:
             algo_used = algorithm
             rot, tr = CalibrationBackend._fit(samples_robot, samples_tracking, all_idx, algorithm)
         else:
-            algo_used, rot, tr = CalibrationBackend._select_algorithm(samples_robot, samples_tracking, all_idx)
+            algo_used, rot, tr, selection_scores = CalibrationBackend._select_algorithm(
+                samples_robot, samples_tracking, all_idx, with_scores=True)
 
         if reject_outliers:
             kept, rejected, rot, tr = CalibrationBackend._reject_outliers(samples_robot, samples_tracking, algo_used)
@@ -429,6 +454,8 @@ class CalibrationBackend:
             'transform': transform,
             'closed_form_transform': closed_form_transform,
             'algorithm_used': algo_used,
+            'algorithm_selection': {'method': 'leave_one_pose_out' if algorithm is None else 'explicit',
+                                    'scores': selection_scores},
             'kept_indices': kept,
             'rejected_indices': rejected,
             'refinement': refine_info,
