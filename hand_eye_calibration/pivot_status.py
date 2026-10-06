@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 MIN_SAMPLES = 4
-TARGET_SAMPLES = 10
+TARGET_SAMPLES = 8
 MIN_ROTATION_SPAN_DEG = 40.0
 MIN_AXIS_ROTATION_SPAN_DEG = 15.0
 

@@ -48,6 +48,8 @@ from .pivot_backend import PivotCalibrationBackend
 from .pivot_status import build_tool_tcp_status, status_to_json
 from . import tcp_quality
 from .calibration_dataset import plain
+from .charuco_touchoff_node import CHARUCO_ROUND, CharucoTouchoffMixin
+from .rotation_check_node import RotationCheckMixin
 
 TIP_ROUND = "tip"
 # The axis-alignment round keeps the historical key "axis_ref" so the GUI
@@ -73,7 +75,7 @@ def _parse_axis(value) -> list:
     return nums
 
 
-class PivotCollector(Node):
+class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
 
     def __init__(self):
         mname = "tool_tcp_calibration"
@@ -199,6 +201,8 @@ class PivotCollector(Node):
         self.axis_result = None
 
         self._preflight_logged = False
+        self._init_charuco(mname)
+        self._init_rotation_check(mname)
         self.create_timer(2.0, self._preflight_timer_cb)
         self._publish_status()
 
@@ -260,6 +264,8 @@ class PivotCollector(Node):
         status['cad_axis_deviation_deg'] = self._cad_deviation()
         status['reorientation'] = {**self.motion.state, 'next_index': self.reorient_index,
                                    'targets': 6}
+        status['charuco'] = self._charuco_status()
+        status['rotation_check'] = self._rotation_check_status()
         # Save stays possible with a fit: the node then writes the active file
         # only if acceptance passes, otherwise a .rejected.yaml candidate + dataset.
         msg = String()
@@ -289,6 +295,7 @@ class PivotCollector(Node):
             TIP_ROUND: "tip",
             ALIGN_ROUND: "alignment",
             VALIDATION_ROUND: "validation",
+            CHARUCO_ROUND: "ChArUco touch-off",
         }[round_key]
 
     def _capture_burst(self):
@@ -352,6 +359,8 @@ class PivotCollector(Node):
         )
 
     def capture_point_cb(self, req: Trigger.Request, resp: Trigger.Response):
+        if self.active_round == CHARUCO_ROUND:
+            return self.cto_capture_cb(req, resp)
         try:
             aggregate = self._capture_burst()
         except (TransformException, ValueError) as ex:
@@ -367,7 +376,7 @@ class PivotCollector(Node):
             tip_pivot, current_status = self._publish_status()
             if tip_pivot is None or not current_status["tip"]["ready_to_save"]:
                 resp.success = False
-                resp.message = "Finish a high-quality 20-touch tip fit before validation."
+                resp.message = "Finish a high-quality 8-touch tip fit before validation."
                 return resp
             comparison_samples = self.samples[TIP_ROUND] + self.samples[VALIDATION_ROUND]
 
@@ -434,6 +443,8 @@ class PivotCollector(Node):
         return resp
 
     def remove_last_sample_cb(self, req: Trigger.Request, resp: Trigger.Response):
+        if self.active_round == CHARUCO_ROUND:
+            return self.cto_remove_last_cb(req, resp)
         round_key = self.active_round
         label = self._round_label(round_key)
         if not self.samples[round_key]:
@@ -454,6 +465,8 @@ class PivotCollector(Node):
         return resp
 
     def reset_cb(self, req: Trigger.Request, resp: Trigger.Response):
+        if self.active_round == CHARUCO_ROUND:
+            return self.cto_reset_cb(req, resp)
         round_key = self.active_round
         label = self._round_label(round_key)
         self.samples[round_key] = []
@@ -594,6 +607,8 @@ class PivotCollector(Node):
         return resp
 
     def save_calibration_cb(self, req: Trigger.Request, resp: Trigger.Response):
+        if self.active_round == CHARUCO_ROUND:
+            return self.cto_save_cb(req, resp)
         tip_pivot, status = self._publish_status()
         if tip_pivot is None:
             resp.success = False
@@ -796,7 +811,7 @@ class PivotCollector(Node):
 def main():
     rclpy.init()
     node = PivotCollector()
-    executor = MultiThreadedExecutor(num_threads=3)
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()
