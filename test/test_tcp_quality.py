@@ -145,3 +145,44 @@ def test_node_rejects_the_first_gun_tcp_pattern_and_accepts_a_good_run(node):
     from hand_eye_calibration.tcp_offline_solve_cli import load, solve
     out = solve(load(saved['dataset_path']))
     assert out['acceptance']['passed']
+
+
+def test_nominal_neck_frame_tilts_the_flange_axis_towards_the_tip():
+    frame = tcp_quality.nominal_neck_frame(22.0, TIP)
+    m = np.array(frame['rotation_matrix'])
+    np.testing.assert_allclose(m.T @ m, np.eye(3), atol=1e-12)
+    side = np.array([TIP[0], TIP[1], 0.0]) / np.linalg.norm(TIP[:2])
+    assert m[:, 2] @ side == pytest.approx(math.sin(math.radians(22)))
+    assert tcp_quality.cad_axis_deviation_deg(m[:, 2], 22.0) == pytest.approx(0, abs=1e-9)
+    assert frame['azimuth_deg'] == pytest.approx(math.degrees(math.atan2(TIP[1], TIP[0])))
+    assert tcp_quality.nominal_neck_frame(0.0, TIP)['quaternion'] == [0.0, 0.0, 0.0, 1.0]
+    with pytest.raises(ValueError):
+        tcp_quality.nominal_neck_frame(22.0, [0.0, 0.0, 0.3])
+
+
+def test_cad_axis_deviation_is_reported_but_never_gates():
+    good = touches(10, noise=0.0002)
+    pivot = PivotCalibrationBackend.compute_pivot(good)
+    validation = PivotCalibrationBackend.validate_pivot(touches(3, seed=5, noise=0.0002), pivot)
+    axis = {'sample_count': 3, 'alignment_spread_deg': 0.2}
+    verdict = tcp_quality.evaluate(pivot, tcp_quality.rotation_spans_deg(good), validation,
+                                   axis=axis, axis_mode=True, cad_deviation=40.0)
+    assert verdict['passed'], verdict['summary']
+    assert all(c['name'] != 'cad_axis_deviation_deg' for c in verdict['checks'])
+
+
+def test_node_saves_orientation_from_the_nominal_neck_angle(node):
+    n, cal = node
+    n.nominal_neck_angle_deg = 22.0
+    n.samples['tip'] = touches(10, noise=0.0002)
+    n.sample_metadata['tip'] = [{}] * 10
+    n.samples['validation'] = touches(3, seed=7, noise=0.0002)
+    n.sample_metadata['validation'] = [{}] * 3
+    response = n.save_calibration_cb(Trigger.Request(), Trigger.Response())
+    assert response.success, response.message
+    saved = yaml.safe_load(cal.read_text())
+    assert saved['calibration_mode'] == 'nominal'
+    assert saved['axis_calibration']['method'] == 'nominal_neck_angle'
+    q = [saved['transform'][k] for k in ('qx', 'qy', 'qz', 'qw')]
+    z = Rotation.from_quat(q).as_matrix()[:, 2]
+    assert math.degrees(math.acos(z[2])) == pytest.approx(22.0, abs=0.01)

@@ -25,10 +25,11 @@ DEFAULT_LIMITS = {
     # Reorientation / held-out touches, scored without refitting.
     'min_validation_samples': 3,
     'max_validation_m': 0.001,
-    # Axis (6-point style): several alignments, consistent, close to CAD.
+    # Axis (6-point style): several alignments, consistent. The deviation from
+    # the CAD neck angle is reported only: a tool of unknown geometry must still
+    # be calibratable the first time.
     'min_align_samples': 3,
     'max_align_spread_deg': 1.0,
-    'max_cad_axis_deviation_deg': 5.0,
 }
 
 
@@ -68,6 +69,39 @@ def bend_plane_frame(axis_dir, flange_axis=(0.0, 0.0, 1.0)):
             'axis_dir': [float(v) for v in z], 'roll_convention': 'x_in_neck_bend_plane'}
 
 
+def nominal_neck_frame(angle_deg, tip_translation, flange_axis=(0.0, 0.0, 1.0)):
+    """flange -> tool rotation from the nominal neck angle on the torch data sheet.
+
+    The bend direction is not on the data sheet; it is taken from the measured
+    tip: a bent neck carries the tip sideways in its bend plane, so the tip's
+    offset perpendicular to the flange axis gives the azimuth. The wire axis is
+    the flange axis tilted by the neck angle towards that offset. Raises
+    ValueError when the tip has (almost) no side offset for a bent neck."""
+    f = np.asarray(flange_axis, dtype=float)
+    f /= np.linalg.norm(f)
+    angle = math.radians(float(angle_deg))
+    t = np.asarray(tip_translation, dtype=float)
+    side = t - (t @ f) * f
+    if abs(angle) < 1e-9:
+        return {'rotation_matrix': np.eye(3).tolist(), 'quaternion': [0.0, 0.0, 0.0, 1.0],
+                'axis_dir': [float(v) for v in f], 'azimuth_deg': None,
+                'roll_convention': 'flange', 'neck_angle_deg': 0.0}
+    if np.linalg.norm(side) < 0.001:
+        raise ValueError('The measured tip has no side offset from the flange axis, so the '
+                         'neck bend direction cannot be derived from it.')
+    u = side / np.linalg.norm(side)
+    z = math.cos(angle) * f + math.sin(angle) * u
+    # Same roll as bend_plane_frame, built directly: the bend plane is known
+    # from u even for angles below that function's straight-tool threshold.
+    x = f - (f @ z) * z
+    x /= np.linalg.norm(x)
+    matrix = np.column_stack([x, np.cross(z, x), z])
+    return {'rotation_matrix': matrix.tolist(),
+            'quaternion': [float(v) for v in Rotation.from_matrix(matrix).as_quat()],
+            'axis_dir': [float(v) for v in z], 'roll_convention': 'x_in_neck_bend_plane',
+            'azimuth_deg': math.degrees(math.atan2(u[1], u[0])), 'neck_angle_deg': float(angle_deg)}
+
+
 def cad_axis_deviation_deg(axis_dir, cad_angle_deg, flange_axis=(0.0, 0.0, 1.0)):
     """|angle(axis, flange Z) - CAD neck angle|. Catches a wrong or flipped axis."""
     if cad_angle_deg is None or cad_angle_deg < 0:
@@ -82,6 +116,7 @@ def _check(name, value, limit, ok, detail):
 
 
 def evaluate(pivot, spans, validation, axis=None, axis_mode=False, cad_deviation=None, limits=None):
+    # cad_deviation is accepted for callers but never gates: it is reported only.
     limits = {**DEFAULT_LIMITS, **(limits or {})}
     checks = []
     n = 0 if pivot is None else len(pivot.get('per_sample_residuals_m') or [])
@@ -113,9 +148,6 @@ def evaluate(pivot, spans, validation, axis=None, axis_mode=False, cad_deviation
             checks.append(_check('align_spread_deg', spread, limits['max_align_spread_deg'],
                                  spread is not None and spread <= limits['max_align_spread_deg'],
                                  'agreement between alignments'))
-        if cad_deviation is not None:
-            checks.append(_check('cad_axis_deviation_deg', cad_deviation, limits['max_cad_axis_deviation_deg'],
-                                 cad_deviation <= limits['max_cad_axis_deviation_deg'], 'neck angle vs CAD'))
     failed = [c for c in checks if not c['passed']]
     summary = 'All TCP acceptance checks passed.' if not failed else 'Failed: ' + ', '.join(
         f"{c['name']}={_fmt(c['value'])} (limit {_fmt(c['limit'])})" for c in failed)

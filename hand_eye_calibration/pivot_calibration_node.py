@@ -24,6 +24,7 @@ Two modes, driven from the GUI (no relaunch needed to switch):
   keeps the internal key "axis_ref" for GUI/bridge backward-compat.
 """
 
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -37,7 +38,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from rclpy.time import Duration
 from geometry_msgs.msg import Transform
-from std_msgs.msg import String
+from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -102,8 +103,13 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         for key, value in tcp_quality.DEFAULT_LIMITS.items():
             self.declare_parameter('accept_' + key, value)
         self.declare_parameter('dataset_dir', os.path.expanduser('~/.ros/tool_tcp_calibration_runs'))
-        # Nominal neck angle (tool axis vs flange Z) from CAD; < 0 disables the check.
+        # Nominal neck angle (tool axis vs flange Z) from CAD; the measured axis's
+        # deviation from it is reported, never enforced. < 0 disables it.
         self.declare_parameter('cad_axis_angle_deg', 35.0)
+        # Neck angle from the torch data sheet; >= 0 sets the TCP orientation from
+        # it (bend direction from the measured tip) when no axis is measured.
+        # < 0: off. The GUI sets it live on <node>/from_gui/nominal_neck_angle.
+        self.declare_parameter('nominal_neck_angle_deg', -1.0)
         # 'bend_plane': TCP +X in the torch-neck bend plane; 'legacy': flange-X hint.
         self.declare_parameter('tcp_roll_convention', 'bend_plane')
         # Reorientation check motion.
@@ -138,6 +144,7 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         self.acceptance_limits = {k: type(v)(self.get_parameter('accept_' + k).value)
                                   for k, v in tcp_quality.DEFAULT_LIMITS.items()}
         self.cad_axis_angle_deg = float(self.get_parameter('cad_axis_angle_deg').value)
+        self.nominal_neck_angle_deg = float(self.get_parameter('nominal_neck_angle_deg').value)
         self.roll_convention = str(self.get_parameter('tcp_roll_convention').value)
         from .tcp_reorientation import TcpMotion
         self.motion = TcpMotion(
@@ -188,6 +195,8 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             history=HistoryPolicy.KEEP_LAST,
         )
         self.status_pub = self.create_publisher(String, mname + "/status", status_qos)
+        self.create_subscription(Float64, mname + '/from_gui/nominal_neck_angle',
+                                 self._nominal_neck_cb, 10, callback_group=self._callback_group)
 
         self.tf_buffer = Buffer()
         self._listener = TransformListener(self.tf_buffer, self)
@@ -262,6 +271,12 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         status['acceptance'] = acceptance
         status['rotation_spans_deg'] = tcp_quality.rotation_spans_deg(self.samples[TIP_ROUND])
         status['cad_axis_deviation_deg'] = self._cad_deviation()
+        nominal = self._nominal_axis(tip_pivot)
+        status['nominal_axis'] = (None if nominal is None else
+                                  {**{k: nominal.get(k) for k in ('neck_angle_deg', 'azimuth_deg',
+                                                                  'axis_dir', 'quaternion', 'error')},
+                                   'used': (self.axis_result is None and 'error' not in nominal
+                                            and not nominal.get('waiting_for_tip'))})
         status['reorientation'] = {**self.motion.state, 'next_index': self.reorient_index,
                                    'targets': 6}
         status['charuco'] = self._charuco_status()
@@ -272,6 +287,23 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         msg.data = status_to_json(status)
         self.status_pub.publish(msg)
         return tip_pivot, status
+
+    def _nominal_neck_cb(self, msg):
+        value = float(msg.data)
+        self.nominal_neck_angle_deg = value if math.isfinite(value) and 0.0 <= value < 90.0 else -1.0
+        self._publish_status()
+
+    def _nominal_axis(self, tip_pivot):
+        """Orientation from the nominal neck angle, or None when it is off."""
+        if self.nominal_neck_angle_deg < 0:
+            return None
+        if tip_pivot is None:
+            return {'neck_angle_deg': self.nominal_neck_angle_deg, 'waiting_for_tip': True}
+        try:
+            return tcp_quality.nominal_neck_frame(self.nominal_neck_angle_deg,
+                                                  tip_pivot['tcp_translation'])
+        except ValueError as ex:
+            return {'error': str(ex), 'neck_angle_deg': self.nominal_neck_angle_deg}
 
     def _cad_deviation(self):
         if self.axis_result is None:
@@ -635,12 +667,22 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             return resp
 
         mode = self._current_mode()
+        nominal = self._nominal_axis(tip_pivot) if self.axis_result is None else None
+        if nominal is not None and 'error' in nominal:
+            resp.success = False
+            resp.message = (f"Nominal neck angle {self.nominal_neck_angle_deg:g}°: {nominal['error']} "
+                            "Clear the neck angle to save position only.")
+            return resp
+        if nominal is not None:
+            mode = 'nominal'
 
         cal_file = os.path.expanduser(str(self.get_parameter('calibration_file').value))
         try:
             if self.axis_result is not None:
                 q = self.axis_result["quaternion"]
                 qx, qy, qz, qw = q[0], q[1], q[2], q[3]
+            elif nominal is not None:
+                qx, qy, qz, qw = nominal['quaternion']
             else:
                 # Orientation is not observable from a single-point pivot touch;
                 # default to the flange orientation until an axis-calibration
@@ -719,6 +761,14 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
                     'alignment_sample_count': self.axis_result.get('sample_count'),
                 }
 
+            if nominal is not None:
+                data['axis_calibration'] = {
+                    'method': 'nominal_neck_angle',
+                    'neck_angle_deg': nominal['neck_angle_deg'],
+                    'azimuth_deg_from_tip': nominal['azimuth_deg'],
+                    'axis_dir_flange_frame': nominal['axis_dir'],
+                    'roll_convention': nominal['roll_convention'],
+                }
             if self.axis_result is not None:
                 data['axis_calibration']['roll_convention'] = self.axis_result.get('roll_convention', 'legacy_flange_x')
                 data['axis_calibration']['cad_axis_angle_deg'] = self.cad_axis_angle_deg
@@ -742,7 +792,10 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             orientation_note = (
                 "TCP orientation from the fitted tool axis."
                 if self.axis_result is not None
-                else "TCP orientation defaults to flange orientation."
+                else (f"TCP orientation from the nominal {nominal['neck_angle_deg']:g}° neck angle, "
+                      f"bend direction {nominal['azimuth_deg']:.0f}° from the measured tip."
+                      if nominal is not None and nominal.get('azimuth_deg') is not None
+                      else "TCP orientation defaults to flange orientation.")
             )
             warning = '' if acceptance['passed'] else f" WARNING (acceptance_mode=warn): {acceptance['summary']}"
             resp.message = (
