@@ -33,6 +33,7 @@ from .calibration_status import build_calibration_status, status_to_json
 from .capture_timing import LatencyModel, ObservationBuffer, frame_record, parse_observation
 from . import acceptance as acceptance_gate
 from . import calibration_dataset
+from . import board_check
 
 
 def get_transform(tf_message: Transform):
@@ -127,6 +128,12 @@ class DataCollector(Node):
         # Every save writes the raw dataset (corners, poses, joints, images)
         # here, so the result can be re-solved and compared offline.
         self.declare_parameter('dataset_dir', os.path.expanduser('~/.ros/hand_eye_calibration_runs'))
+        # Depth calibration sweep (depth_sweep.py): aligned depth of the tracking camera;
+        # depth_info_topic set = native depth with its own calibration (Gazebo).
+        self.declare_parameter('depth_topic', '')
+        self.declare_parameter('depth_info_topic', '')
+        self.declare_parameter('depth_sweep_views', 12)
+        self.declare_parameter('depth_dataset_dir', os.path.expanduser('~/.ros/depth_calibration'))
         self.declare_parameter('dataset_save_images', True)
         # 'enforce': a result that fails acceptance is written only as
         # <calibration_file>.rejected.yaml. 'warn': written anyway, flagged.
@@ -225,6 +232,8 @@ class DataCollector(Node):
         self._reprojection_state = None
         self.touchoff_references = {}
         self.touchoff_results = []
+        self.board_check_views = {}
+        self.board_check_summary = None
         self._preflight_logged = False
         self._last_pointcloud_frame = None
         self._last_camera_info_frame = None
@@ -238,13 +247,19 @@ class DataCollector(Node):
             from rclpy.qos import qos_profile_sensor_data
             self.create_subscription(Image, self.image_topic, self._image_callback, qos_profile_sensor_data)
         for name, callback in (('touchoff_reference', self.touchoff_reference_callback),
-                               ('touchoff_capture', self.touchoff_capture_callback)):
+                               ('touchoff_capture', self.touchoff_capture_callback),
+                               ('board_check_add', self.board_check_add_callback),
+                               ('board_check_reset', self.board_check_reset_callback)):
             self.create_service(Trigger, mname + '/' + name, callback, callback_group=self._service_cb_group)
 
         self.create_timer(2.0, self.preflight_timer_callback)
         self._publish_status(None, None)
         from .automatic_calibration import AutomaticCalibration
         self.automatic = AutomaticCalibration(self)
+        from . import depth_sweep
+        self.create_service(Trigger, mname + '/depth_sweep_start',
+                            lambda req, resp: depth_sweep.start(self.automatic, req, resp),
+                            callback_group=self._service_cb_group)
 
     def _publish_status(self, cal, last_metrics):
         diversity = self._diversity_summary()
@@ -262,6 +277,7 @@ class DataCollector(Node):
             reprojection=self._reprojection_summary(),
             timing=self.latency.stats(),
             touchoff=self.touchoff_results[-5:],
+            board_check=self.board_check_summary,
         )
         if self.solver_name == 'intrinsic_pose':
             report = self._last_reprojection
@@ -1089,29 +1105,25 @@ class DataCollector(Node):
         age = (self.get_clock().now().nanoseconds - latest['stamp_ns']) / 1e9
         return latest if -0.1 <= age <= max_age_s else None
 
-    def touchoff_reference_callback(self, req, resp):
-        """With the robot still and the board detected, record where the board
-        is in the robot base: (a) through the calibration currently in TF
-        (URDF/applied) and (b) through the in-memory candidate, if any."""
+    def _board_in_base_now(self):
+        """Board pose in the robot base from the latest still view: (a) through
+        the calibration currently in TF (URDF/applied) and (b) through the
+        in-memory candidate, if any. Returns (references, corners, stamp_ns) or
+        an error string."""
         if hasattr(self, 'automatic') and self.automatic.active:
-            resp.success, resp.message = False, 'Automatic calibration is running; use Stop first.'
-            return resp
+            return 'Automatic calibration is running; use Stop first.'
         if self.calibration_type != 'eye-in-hand':
-            resp.success, resp.message = False, 'Touch-off is implemented for eye-in-hand only.'
-            return resp
+            return 'Board validation is implemented for eye-in-hand only.'
         observation = self._latest_observation(self.freshness_limit(1.0))
         if observation is None:
-            resp.success, resp.message = False, 'No fresh ChArUco observation; the board must be detected.'
-            return resp
+            return 'No fresh ChArUco observation; the board must be detected.'
         stamp = rclpy.time.Time(nanoseconds=observation['stamp_ns']).to_msg()
         try:
             robot = get_transform(self._lookup_robot_at(stamp, timeout_s=0.3).transform)
         except TransformException as exc:
-            resp.success, resp.message = False, f'Robot pose at the image stamp is unavailable: {exc}'
-            return resp
+            return f'Robot pose at the image stamp is unavailable: {exc}'
         if not self._robot_was_stationary(stamp, robot):
-            resp.success, resp.message = False, 'Robot was moving when the image was taken; hold still and retry.'
-            return resp
+            return 'Robot was moving when the image was taken; hold still and retry.'
         camera_board = transform_to_matrix(observation['pose'])
         corners = {int(i): p for i, p in zip(observation['ids'], observation['object_points'])}
         references = {}
@@ -1126,13 +1138,57 @@ class DataCollector(Node):
             references['candidate'] = (transform_to_matrix(robot) @ transform_to_matrix(detail['transform'])
                                        @ camera_board)
         if not references:
-            resp.success, resp.message = False, 'Neither a camera TF nor an in-memory calibration is available.'
+            return 'Neither a camera TF nor an in-memory calibration is available.'
+        return references, corners, observation['stamp_ns']
+
+    def touchoff_reference_callback(self, req, resp):
+        """With the robot still and the board detected, record where the board
+        is in the robot base (see _board_in_base_now)."""
+        found = self._board_in_base_now()
+        if isinstance(found, str):
+            resp.success, resp.message = False, found
             return resp
-        self.touchoff_references = {'boards': references, 'corners': corners, 'stamp_ns': observation['stamp_ns']}
+        references, corners, stamp_ns = found
+        self.touchoff_references = {'boards': references, 'corners': corners, 'stamp_ns': stamp_ns}
         resp.success = True
         resp.message = (f"Board reference stored from {', '.join(references)} with {len(corners)} corners. "
                         f"Now jog {self.get_parameter('touchoff_tcp_frame').value} onto corner "
                         f"{self.get_parameter('touchoff_corner_id').value} and call touchoff_capture.")
+        return resp
+
+    def board_check_add_callback(self, req, resp):
+        """Board stability check: add the current still view. The board must not
+        move between views; the robot moves to a new pose for each."""
+        found = self._board_in_base_now()
+        if isinstance(found, str):
+            resp.success, resp.message = False, found
+            return resp
+        references, corners, stamp_ns = found
+        if any(v['stamp_ns'] == stamp_ns for views in self.board_check_views.values() for v in views):
+            resp.success, resp.message = False, 'Same camera frame as the last view; move the robot to a new pose.'
+            return resp
+        for name, board in references.items():
+            self.board_check_views.setdefault(name, []).append(
+                {'board_base': board, 'corners': corners, 'stamp_ns': stamp_ns})
+        summary = board_check.summarize(self.board_check_views)
+        self.board_check_summary = summary
+        self._publish_status(None, None)
+        parts = []
+        for name, res in summary['sources'].items():
+            if 'position_rms_m' in res:
+                parts.append(f"{name}: RMS {res['position_rms_m'] * 1000:.2f} mm, max "
+                             f"{res['position_max_m'] * 1000:.2f} mm, rot {res['rotation_max_deg']:.2f}°")
+            else:
+                parts.append(f"{name}: {res.get('message', '')}")
+        resp.success = True
+        resp.message = f"View {summary['views']} added. " + '; '.join(parts)
+        return resp
+
+    def board_check_reset_callback(self, req, resp):
+        self.board_check_views = {}
+        self.board_check_summary = None
+        self._publish_status(None, None)
+        resp.success, resp.message = True, 'Board stability check cleared.'
         return resp
 
     def touchoff_capture_callback(self, req, resp):

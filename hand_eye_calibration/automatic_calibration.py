@@ -266,7 +266,7 @@ class AutomaticCalibration:
                     self.board_marker.action = Marker.DELETE
                     self.board_marker_pub.publish(self.board_marker)
                     self.board_marker = None
-                self.status = {**self.status, 'active': True, 'state': 'preparing', 'pose': 0,
+                self.status = {**self.status, 'active': True, 'state': 'preparing', 'pose': 0, 'mode': 'calibration',
                                'accepted': 0, 'message': 'Checking initial view and controller.', 'validation': None, 'phase': 'bootstrap', 'skipped': 0,
                                'position_sigma_m': None, 'position_sigma_limit_m': self.max_position_sigma,
                                'target_samples': self.min_training_samples, 'max_training_samples': self.max_training_samples,

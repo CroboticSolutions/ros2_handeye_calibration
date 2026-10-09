@@ -199,6 +199,7 @@ def build_calibration_status(
     reprojection: dict[str, Any] | None = None,
     timing: dict[str, Any] | None = None,
     touchoff: list[dict[str, Any]] | None = None,
+    board_check: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_warnings = _sample_warnings(last_sample_metrics)
     readiness = _readiness(sample_count, diversity, residuals, last_warnings)
@@ -253,6 +254,7 @@ def build_calibration_status(
         "reprojection": reprojection,
         "camera_latency": timing,
         "touchoff": touchoff or [],
+        "board_check": board_check,
     }
     if estimate is not None and len(estimate) >= 7:
         payload["estimate"] = {
