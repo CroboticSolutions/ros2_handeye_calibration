@@ -40,6 +40,7 @@ setup(
             'handeye_intrinsic_solve = hand_eye_calibration.intrinsic_offline_cli:main',
             'handeye_offline_solve = hand_eye_calibration.offline_solve_cli:main',
             'handeye_welding_gun_apply = hand_eye_calibration.welding_gun_apply_cli:main',
+            'active_calibration_publisher = hand_eye_calibration.active_calibration_node:main',
             'tcp_offline_solve = hand_eye_calibration.tcp_offline_solve_cli:main',
         ],
     },
