@@ -2,6 +2,7 @@
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
+from .motion_planning import SAMPLER_JOINT_MARGIN_RAD
 from .view_information import ViewInformation
 
 
@@ -47,8 +48,9 @@ class InformativeViews:
         self.reference = self.camera(current)
         self.center = (self.board @ np.r_[session.r.framing.center, 1])[:3]
         self.depth = float((np.linalg.inv(self.reference) @ np.r_[self.center, 1])[2])
-        self.lower = session.r.lower.copy()
-        self.upper = session.r.upper.copy()
+        # IK targets stay inside the limits by a margin (see motion_planning).
+        self.lower = session.r.lower + SAMPLER_JOINT_MARGIN_RAD
+        self.upper = session.r.upper - SAMPLER_JOINT_MARGIN_RAD
         self.targets = []
         self.goal = None
         self.route = []

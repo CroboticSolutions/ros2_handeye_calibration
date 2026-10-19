@@ -94,3 +94,34 @@ def test_failed_top_candidates_do_not_starve_later_reachable_target(monkeypatch)
     assert planner.pending_candidates
     assert planner.next_step(np.zeros(1),np.eye(4)) is not None
     assert runner.plan_joint_path.call_count==7
+
+
+def planning_runner(start, seen, points):
+    from sensor_msgs.msg import JointState
+    def request(req):seen.append(req);return response(['a','b'],points)
+    return NS(check=lambda:None,planning=NS(wait_for_service=lambda **_:True,call_async=request),
+        names=['a','b'],move_group='arm',joints=JointState(name=['a','b'],position=list(start)),
+        lower=-np.ones(2),upper=np.ones(2),wait=lambda r,_:r,joint_positions=lambda:start.copy())
+
+
+def test_start_just_past_a_limit_is_planned_from_the_limit():
+    # Run 20261014_090523: robot settled at j5 = 1.22028 > 1.22 and MoveIt refused the return.
+    start=np.array([0.,1.0028]);goal=np.array([.1,.9]);seen=[]
+    path=plan_joint_path(planning_runner(start,seen,[[0,1],[.1,.9]]),start,goal)
+    assert path is not None
+    assert seen[0].motion_plan_request.start_state.joint_state.position[1]==1.
+    # A goal that was such a measured pose is likewise planned at the limit.
+    seen.clear();back=np.array([0.,1.0028])
+    assert plan_joint_path(planning_runner(goal,seen,[[.1,.9],[0,1]]),goal,back) is not None
+    assert seen[0].motion_plan_request.goal_constraints[0].joint_constraints[1].position==1.
+
+
+def test_start_well_past_a_limit_is_sent_unchanged():
+    start=np.array([0.,1.02]);seen=[]
+    runner=planning_runner(start,seen,[[0,1.02],[.1,.9]])
+    request=runner.planning.call_async
+    def refused(req):
+        result=request(req);result.motion_plan_response.error_code.val=-1;return result
+    runner.planning.call_async=refused
+    assert plan_joint_path(runner,start,np.array([.1,.9])) is None
+    assert seen[0].motion_plan_request.start_state.joint_state.position[1]==1.02

@@ -195,3 +195,20 @@ def test_initial_stop_is_not_swallowed():
     s.r.check=stop
     with pytest.raises(RuntimeError,match='Operator stop'):s.sample_initial()
     assert calls['ik']==0
+
+
+def test_sampler_ik_keeps_targets_inside_joint_limits():
+    # Run 20261014_090523: a target on j5's limit settled past it and blocked the return path.
+    from types import SimpleNamespace
+    from hand_eye_calibration.intrinsic_acquisition import IntrinsicSession
+    from hand_eye_calibration.motion_planning import SAMPLER_JOINT_MARGIN_RAD
+    s=IntrinsicSession.__new__(IntrinsicSession)
+    s.underactuated=True
+    s.r=SimpleNamespace(check=lambda:None,joint_positions=lambda:np.zeros(6),
+                        lower=np.full(6,-1.22),upper=np.full(6,1.22))
+    def camera(q):
+        pose=np.eye(4);pose[:3,3]=q[:3]*.1;return pose
+    s.fk=SimpleNamespace(camera=camera)
+    target=np.eye(4);target[:3,3]=[.13,0,0]  # needs q0 = 1.3, past the limit
+    q=s.ik(target,nearest=True)
+    assert q[0]<=1.22-SAMPLER_JOINT_MARGIN_RAD+1e-9

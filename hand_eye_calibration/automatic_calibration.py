@@ -11,7 +11,7 @@ from action_msgs.msg import GoalStatus
 from control_msgs.action import FollowJointTrajectory
 from moveit_msgs.srv import GetStateValidity, GetMotionPlan
 from controller_manager_msgs.srv import ListControllers
-from .motion_planning import plan_joint_path
+from .motion_planning import START_BOUNDS_TOLERANCE_RAD, plan_joint_path
 from .robot_configuration import chain_joints, matching_group, matching_controller
 from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
@@ -91,19 +91,10 @@ class AutomaticCalibration:
             node.declare_parameter(key, value)
         # Held-out views collected after the training set; never used in the fit.
         self.intrinsic_return_to_base = bool(node.get_parameter('intrinsic_return_to_base').value)
-        self.validation_views = max(3, int(node.get_parameter('auto_validation_views').value))
         # > 0: the run stops when no operator heartbeat (GUI page open) arrives
         # within this many seconds. The GUI launch passes 3 s.
         self.heartbeat_timeout = float(node.get_parameter('auto_heartbeat_timeout_s').value)
-        self.max_camera_excursion = float(node.get_parameter('auto_max_camera_excursion_m').value)
-        self.max_position_sigma = float(node.get_parameter('auto_max_position_sigma_m').value)
-        self.min_training_samples = max(12, int(node.get_parameter('auto_min_training_samples').value))
-        self.max_training_samples = int(node.get_parameter('auto_max_training_samples').value)
-        if self.max_training_samples < self.min_training_samples:
-            raise ValueError('auto_max_training_samples must be >= auto_min_training_samples; '
-                             'rebuild the calibration package and restart the collector to update launch defaults.')
-        if not np.isfinite(self.max_position_sigma) or self.max_position_sigma <= 0:
-            raise ValueError('Invalid automatic calibration quality limits.')
+        self.read_acquisition_limits()
         self.check_collisions = bool(node.get_parameter("auto_check_collisions").value)
         self.status["enabled"] = bool(node.get_parameter("auto_enabled").value)
         self.group = ReentrantCallbackGroup()
@@ -143,7 +134,9 @@ class AutomaticCalibration:
         return None
 
     def require_joint_limits(self, positions):
-        outside = (positions < self.lower) | (positions > self.upper)
+        # Same small tolerance as planning: a pose stopped at a limit reads slightly past it.
+        outside = ((positions < self.lower - START_BOUNDS_TOLERANCE_RAD) |
+                   (positions > self.upper + START_BOUNDS_TOLERANCE_RAD))
         if np.any(outside):
             detail = '; '.join(f'{name}={np.degrees(q):.3f} deg, allowed '
                                f'[{np.degrees(lo):.3f}, {np.degrees(hi):.3f}] deg'
@@ -244,6 +237,24 @@ class AutomaticCalibration:
         self.check()
         return future.result()
 
+    def read_acquisition_limits(self):
+        """View counts, excursion and sigma limit; re-read at every start so a
+        `ros2 param set` applies to the next run (e.g. a larger kinematic dataset)."""
+        node = self.node
+        validation_views = max(3, int(node.get_parameter('auto_validation_views').value))
+        max_camera_excursion = float(node.get_parameter('auto_max_camera_excursion_m').value)
+        max_position_sigma = float(node.get_parameter('auto_max_position_sigma_m').value)
+        min_training_samples = max(12, int(node.get_parameter('auto_min_training_samples').value))
+        max_training_samples = int(node.get_parameter('auto_max_training_samples').value)
+        if max_training_samples < min_training_samples:
+            raise ValueError('auto_max_training_samples must be >= auto_min_training_samples; '
+                             'rebuild the calibration package and restart the collector to update launch defaults.')
+        if not np.isfinite(max_position_sigma) or max_position_sigma <= 0:
+            raise ValueError('Invalid automatic calibration quality limits.')
+        self.validation_views, self.max_camera_excursion = validation_views, max_camera_excursion
+        self.max_position_sigma = max_position_sigma
+        self.min_training_samples, self.max_training_samples = min_training_samples, max_training_samples
+
     def start(self, req, resp):
         with self.lock:
             if not self.node.get_parameter('auto_enabled').value:
@@ -259,6 +270,11 @@ class AutomaticCalibration:
             elif not self.heartbeat_ok():
                 resp.message = 'No operator heartbeat; start automatic calibration from the open GUI page.'
             else:
+                try:
+                    self.read_acquisition_limits()
+                except ValueError as exc:
+                    resp.message = str(exc)
+                    return resp
                 self.stop_event.clear()
                 self.capture_role = 'training'
                 self.min_capture_stamp_ns = None

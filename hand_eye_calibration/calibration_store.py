@@ -23,27 +23,32 @@ import yaml
 CURRENT = 'current.yaml'
 FEMTO_HANDEYE = 'femto_bolt_handeye'
 WELDING_GUN_TCP = 'welding_gun_tcp'
+# FANUC CRX (robot crx10ia_l / crx10ia): wrist camera mounts and the welding TCP.
+CRX_FEMTO_HANDEYE = FEMTO_HANDEYE
+CRX_D435_HANDEYE = 'realsense_d435_handeye'
+CRX_WELDING_TCP = 'welding_tcp'
 
 
 def root():
     return os.path.expanduser(os.environ.get('ARMS_CALIBRATION_DIR', '~/.ros/calibration'))
 
 
-def robot_id():
-    return os.environ.get('ARMS_ROBOT_ID', 'piper')
+def robot_id(robot=None):
+    """Store robot directory: ``robot`` (e.g. crx10ia_l), else $ARMS_ROBOT_ID, else piper."""
+    return robot or os.environ.get('ARMS_ROBOT_ID', 'piper')
 
 
-def mount_dir(mount):
-    return os.path.join(root(), robot_id(), mount)
+def mount_dir(mount, robot=None):
+    return os.path.join(root(), robot_id(robot), mount)
 
 
-def current_path(mount):
-    return os.path.join(mount_dir(mount), CURRENT)
+def current_path(mount, robot=None):
+    return os.path.join(mount_dir(mount, robot), CURRENT)
 
 
-def resolve(mount, default_path):
+def resolve(mount, default_path, robot=None):
     """File the xacro should load: the active version, else the repo default."""
-    path = current_path(mount)
+    path = current_path(mount, robot)
     return path if os.path.exists(path) else default_path
 
 
@@ -52,8 +57,8 @@ def load(path):
         return yaml.safe_load(f)
 
 
-def active(mount, default_path=None):
-    path = current_path(mount)
+def active(mount, default_path=None, robot=None):
+    path = current_path(mount, robot)
     if os.path.exists(path):
         data = load(path)
         data['_file'] = os.path.realpath(path)
@@ -73,28 +78,28 @@ def sha256(path):
     return h.hexdigest()
 
 
-def _version_file(mount, calibration_id):
+def _version_file(mount, calibration_id, robot=None):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', calibration_id or ''):
         raise ValueError(f'Invalid calibration id {calibration_id!r}')
-    return os.path.join(mount_dir(mount), f'calib_{calibration_id}.yaml')
+    return os.path.join(mount_dir(mount, robot), f'calib_{calibration_id}.yaml')
 
 
-def save_version(mount, record, now=None):
+def save_version(mount, record, now=None, robot=None):
     """Write an immutable version; returns (calibration_id, path, full record). Does not activate."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     calibration_id = now.strftime('%Y%m%dT%H%M%S%fZ')
-    previous = active(mount)
+    previous = active(mount, robot=robot)
     record = {
         'calibration_id': calibration_id,
         'created_utc': now.isoformat(),
-        'robot_id': robot_id(),
+        'robot_id': robot_id(robot),
         'mount': mount,
         'host': socket.gethostname(),
         'previous_id': previous.get('calibration_id') if previous else None,
         **record,
     }
-    os.makedirs(mount_dir(mount), exist_ok=True)
-    path = _version_file(mount, calibration_id)
+    os.makedirs(mount_dir(mount, robot), exist_ok=True)
+    path = _version_file(mount, calibration_id, robot)
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
         yaml.safe_dump(record, f, sort_keys=False)
@@ -102,26 +107,26 @@ def save_version(mount, record, now=None):
     return calibration_id, path, record
 
 
-def ensure_seeded(mount, default_path):
+def ensure_seeded(mount, default_path, robot=None):
     """First use: store the default as an activated version, so a rollback to
     what the robot ran before the first Apply is always possible."""
-    if os.path.exists(current_path(mount)) or not os.path.exists(default_path):
+    if os.path.exists(current_path(mount, robot)) or not os.path.exists(default_path):
         return None
     data = load(default_path)
     data.pop('calibration_id', None)
     data['label'] = f'imported from {default_path}'
     data['updated'] = []
-    calibration_id, _path, _record = save_version(mount, data)
-    activate(mount, calibration_id)
+    calibration_id, _path, _record = save_version(mount, data, robot=robot)
+    activate(mount, calibration_id, robot)
     return calibration_id
 
 
-def activate(mount, calibration_id):
+def activate(mount, calibration_id, robot=None):
     """Atomically point current.yaml at an existing version."""
-    path = _version_file(mount, calibration_id)
+    path = _version_file(mount, calibration_id, robot)
     if not os.path.isfile(path):
-        raise FileNotFoundError(f'No calibration {calibration_id!r} for {mount} in {mount_dir(mount)}')
-    link = current_path(mount)
+        raise FileNotFoundError(f'No calibration {calibration_id!r} for {mount} in {mount_dir(mount, robot)}')
+    link = current_path(mount, robot)
     tmp = link + '.tmp'
     if os.path.lexists(tmp):
         os.unlink(tmp)
@@ -130,11 +135,12 @@ def activate(mount, calibration_id):
     return path
 
 
-def versions(mount):
+def versions(mount, robot=None):
     """Newest first, with the fields a UI needs to pick a rollback target."""
-    current = os.path.realpath(current_path(mount)) if os.path.exists(current_path(mount)) else None
+    link = current_path(mount, robot)
+    current = os.path.realpath(link) if os.path.exists(link) else None
     out = []
-    for path in sorted(glob.glob(os.path.join(mount_dir(mount), 'calib_*.yaml')), reverse=True):
+    for path in sorted(glob.glob(os.path.join(mount_dir(mount, robot), 'calib_*.yaml')), reverse=True):
         try:
             data = load(path)
         except (OSError, yaml.YAMLError):

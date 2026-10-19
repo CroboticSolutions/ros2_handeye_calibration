@@ -302,6 +302,7 @@ def test_initial_joint_limits_report_actual_joint_and_do_not_clamp():
     runner.names = ['joint1', 'joint5']
     runner.lower = np.array([-2.618, -1.22]); runner.upper = np.array([2.168, 1.22])
     runner.require_joint_limits(np.array([0., 1.21]))
+    runner.require_joint_limits(np.array([0., 1.22028]))  # stopped at the limit (run 20261014_090523)
     q = np.array([0., 1.24])
     with pytest.raises(RuntimeError, match=r'joint5=.*allowed'):
         runner.require_joint_limits(q)

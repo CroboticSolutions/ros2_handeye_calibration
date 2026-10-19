@@ -4,6 +4,22 @@ import numpy as np
 from moveit_msgs.srv import GetMotionPlan
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
 
+# A robot stopped at a joint limit reads up to ~3.3 mrad past it (PiPER j5: URDF
+# 1.22 rad, firmware 70 deg = 1.2217 rad, plus tracking error), and MoveIt's
+# CheckStartStateBounds then refuses every plan. Starts (and goals such as the
+# return to such a reference pose) this close to a limit are planned at the
+# limit; anything further still fails.
+START_BOUNDS_TOLERANCE_RAD = .005
+# Local IK samplers keep targets this far inside the limits, so a settled
+# target never ends up past one (run 20261014_090523: j5 = 1.22028 > 1.22).
+SAMPLER_JOINT_MARGIN_RAD = .05
+
+
+def clamp_near_limits(q, lower, upper):
+    q=np.asarray(q,float)
+    near=(q>=lower-START_BOUNDS_TOLERANCE_RAD)&(q<=upper+START_BOUNDS_TOLERANCE_RAD)
+    return np.where(near,np.clip(q,lower,upper),q)
+
 
 def decode_path(response, names, start, goal, lower, upper):
     if response is None or response.motion_plan_response.error_code.val != MoveItErrorCodes.SUCCESS:
@@ -46,6 +62,9 @@ def decode_path(response, names, start, goal, lower, upper):
 
 def plan_joint_path(runner, start, goal):
     runner.check()
+    measured=np.asarray(start,float)
+    start=clamp_near_limits(measured,runner.lower,runner.upper)
+    goal=clamp_near_limits(goal,runner.lower,runner.upper)
     if not runner.planning.wait_for_service(timeout_sec=1):
         raise RuntimeError('MoveIt /plan_kinematic_path is unavailable; no calibration motion was sent.')
     req=GetMotionPlan.Request()
@@ -67,7 +86,7 @@ def plan_joint_path(runner, start, goal):
     motion.goal_constraints=[constraints]
     result=runner.wait(runner.planning.call_async(req),5)
     runner.check()
-    if np.max(np.abs(runner.joint_positions()-start))>.01:
+    if np.max(np.abs(runner.joint_positions()-measured))>.01:
         raise RuntimeError('Robot moved during planning; no calibration motion was sent.')
     path = decode_path(result,runner.names,start,goal,runner.lower,runner.upper)
     runner.planned_trajectory = None

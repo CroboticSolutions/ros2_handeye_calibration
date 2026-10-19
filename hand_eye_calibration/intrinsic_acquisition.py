@@ -11,7 +11,10 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from .visibility import BoardFraming, CameraKinematics
+from .closed_form_views import ClosedFormViews, POOL_PER_VIEW
+from .joint_space_views import JointSpaceViews
 from .bootstrap_calibration import _clear_samples, sample_pose
+from .motion_planning import SAMPLER_JOINT_MARGIN_RAD
 from . import intrinsic_solver as solver
 
 
@@ -51,8 +54,18 @@ class IntrinsicSession:
         self.r.framing=BoardFraming(runner.board_spec,info)
         self.fk=CameraKinematics(root,self.n.robot_base_frame,self.n.robot_effector_frame,runner.names,np.eye(4))
         # Camera before the last joint (Piper on link5): fewer than six joints move it, so
-        # arbitrary 6-D targets are unreachable and the nearest reachable pose is used.
+        # arbitrary 6-D targets are unreachable; views come from sampled joints instead.
         self.underactuated=sum(kind!='fixed' for _,_,kind,_ in getattr(self.fk,'chain',[(0,0,'revolute',0)]*6))<6
+        # Main/validation views from a wide pool: closed-form IK for a 6-joint camera chain
+        # (closed_form_views), sampled joints + FK for a camera before the last joint
+        # (joint_space_views). None keeps the local random sampler (no closed form, no URDF).
+        self.closed_form=None
+        if self.underactuated and hasattr(self.fk,'chain'):
+            self.closed_form=JointSpaceViews(self.fk,runner.names,runner.lower,runner.upper)
+        elif not self.underactuated and getattr(runner,'robot_description',None):
+            self.closed_form=ClosedFormViews.create(
+                runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
+                runner.names,runner.lower,runner.upper,self.fk.camera)
         self.initial=self.r.joint_positions().copy()
         self.views=[];self.validation=[];self.estimate=None;self.board=None
         self.attempts=0;self.rejections={}
@@ -72,8 +85,9 @@ class IntrinsicSession:
             self.r.check();actual=self.fk.camera(q)
             return np.r_[(actual[:3,3]-pose[:3,3])/.01,
                          R.from_matrix(pose[:3,:3].T@actual[:3,:3]).as_rotvec()/.05]
-        fit=least_squares(residual,np.clip(current,self.r.lower+1e-8,self.r.upper-1e-8),
-                          bounds=(self.r.lower,self.r.upper),max_nfev=100)
+        lower=self.r.lower+SAMPLER_JOINT_MARGIN_RAD;upper=self.r.upper-SAMPLER_JOINT_MARGIN_RAD
+        fit=least_squares(residual,np.clip(current,lower+1e-8,upper-1e-8),
+                          bounds=(lower,upper),max_nfev=100)
         e=residual(fit.x)
         if np.linalg.norm(e[:3])<=.2 and np.linalg.norm(e[3:])<=.2:return fit.x
         # Nearest reachable pose; callers re-check framing and duplicates on the actual pose.
@@ -175,11 +189,52 @@ class IntrinsicSession:
             raise RuntimeError('Collected poses do not constrain all rotation axes; no calibration saved')
         return report
 
+    def duplicate(self, actual):
+        return any(R.from_matrix(p[:3,:3].T@actual[:3,:3]).magnitude()<np.deg2rad(3)
+                   and np.linalg.norm(p[:3,3]-actual[:3,3])<.02 for p in self.views+self.validation)
+
+    def collected_or_failed(self, target, phase, failures):
+        """(captured, consecutive capture failures); three capture failures stop the run."""
+        if self.collect(target,phase):
+            return True,0
+        failures+=int(self.last_failure=='capture')
+        if failures>=3:
+            raise RuntimeError('Three sampled poses failed capture; robot stopped, no calibration saved')
+        self.rejections['path_or_capture']=self.rejections.get('path_or_capture',0)+1
+        return False,failures
+
+    def sample_closed_form(self, count, phase, reference, center):
+        """Greedy views from the closed-form pool; returns how many were captured."""
+        label=getattr(self.closed_form,'label','closed-form IK')
+        self.r.update('planning',f'Sampling {phase} views around the board with {label}.')
+        pool,sampled=self.closed_form.pool(self.board,center,self.estimate,self.r.framing,reference,
+                                           self.r.max_camera_excursion,self.initial,self.rng,
+                                           POOL_PER_VIEW*count,check=self.r.check)
+        message=f'{label[0].upper()+label[1:]}: {len(pool)} reachable, framed {phase} views of {sampled} sampled.'
+        self.r.update('planning',message,closed_form_pool=len(pool),closed_form_sampled=sampled)
+        if hasattr(self.n,'get_logger'):
+            self.n.get_logger().info(message)
+        collected=0;failures=0
+        while collected<count and pool:
+            self.r.check()
+            target,actual=pool.pop(ClosedFormViews.best(pool,[p[:3,:3] for p in self.views+self.validation]))
+            if self.duplicate(actual):continue
+            captured,failures=self.collected_or_failed(target,phase,failures)
+            collected+=int(captured)
+            self.r.update('planning',f'Collected {collected}/{count} {phase} views ({label}).',
+                          planner_rejections=self.rejections)
+        return collected
+
     def sample_main(self, count, phase):
         # Freeze the planning reference for the entire collection phase.
         reference=self.fk.camera(self.initial)@self.estimate
         center=(self.board@np.r_[self.r.framing.center,1])[:3]
         collected=0;tries=0;failures=0
+        if self.closed_form is not None:
+            collected=self.sample_closed_form(count,phase,reference,center)
+            if collected<count:
+                self.r.update('planning',f'View pool exhausted at {collected}/{count} {phase} views; '
+                              'continuing with local random views.')
         while collected<count and tries<count*20:
             self.r.check();tries+=1
             desired=random_camera_pose(reference,center,self.rng,np.array([.06,.06,.04]))
@@ -193,16 +248,9 @@ class IntrinsicSession:
                 if (np.linalg.norm(camera[:3,3]-reference[:3,3])>self.r.max_camera_excursion
                         or not self.r.framing.contains(np.linalg.inv(camera)@self.board,margin=.13)):continue
             # Avoid near-duplicates, while keeping every successfully captured pose.
-            previous=self.views+self.validation
-            if any(R.from_matrix(p[:3,:3].T@actual[:3,:3]).magnitude()<np.deg2rad(3)
-                   and np.linalg.norm(p[:3,3]-actual[:3,3])<.02 for p in previous):continue
-            if self.collect(target,phase):
-                collected+=1;failures=0
-            else:
-                failures+=int(self.last_failure=='capture')
-                if failures>=3:
-                    raise RuntimeError('Three sampled poses failed capture; robot stopped, no calibration saved')
-                self.rejections['path_or_capture']=self.rejections.get('path_or_capture',0)+1
+            if self.duplicate(actual):continue
+            captured,failures=self.collected_or_failed(target,phase,failures)
+            collected+=int(captured)
             self.r.update('planning',f'Collected {collected}/{count} {phase} views.',planner_rejections=self.rejections)
         if collected<count:
             raise RuntimeError(f'Only {collected}/{count} {phase} views were collected; no calibration saved')
