@@ -186,3 +186,33 @@ def test_node_saves_orientation_from_the_nominal_neck_angle(node):
     q = [saved['transform'][k] for k in ('qx', 'qy', 'qz', 'qw')]
     z = Rotation.from_quat(q).as_matrix()[:, 2]
     assert math.degrees(math.acos(z[2])) == pytest.approx(22.0, abs=0.01)
+
+
+def test_crx_flange_axis_x_tilts_the_neck_from_x_and_defaults_position_only_to_x():
+    tip = [0.39, 0.0, -0.09]
+    frame = tcp_quality.nominal_neck_frame(45.0, tip, (1.0, 0.0, 0.0))
+    np.testing.assert_allclose(frame['axis_dir'], [math.sqrt(0.5), 0.0, -math.sqrt(0.5)], atol=1e-12)
+    assert tcp_quality.cad_axis_deviation_deg(frame['axis_dir'], 45.0, (1.0, 0.0, 0.0)) == pytest.approx(0, abs=1e-9)
+    straight = tcp_quality.nominal_neck_frame(0.0, tip, (1.0, 0.0, 0.0))
+    np.testing.assert_allclose(np.array(straight['rotation_matrix'])[:, 2], [1, 0, 0], atol=1e-12)
+    np.testing.assert_allclose(Rotation.from_quat(tcp_quality.flange_axis_quaternion((1, 0, 0))).apply([0, 0, 1]),
+                               [1, 0, 0], atol=1e-12)
+    assert tcp_quality.flange_axis_quaternion() == [0.0, 0.0, 0.0, 1.0]
+
+
+@pytest.mark.parametrize('neck', [22.0, -1.0])
+def test_node_uses_the_flange_axis_parameter(node, neck):
+    n, cal = node
+    n.flange_axis = [1.0, 0.0, 0.0]
+    n.nominal_neck_angle_deg = neck
+    n.samples['tip'] = touches(10, noise=0.0002)
+    n.sample_metadata['tip'] = [{}] * 10
+    n.samples['validation'] = touches(3, seed=7, noise=0.0002)
+    n.sample_metadata['validation'] = [{}] * 3
+    response = n.save_calibration_cb(Trigger.Request(), Trigger.Response())
+    assert response.success, response.message
+    saved = yaml.safe_load(cal.read_text())
+    assert saved['flange_axis'] == [1.0, 0.0, 0.0]
+    q = [saved['transform'][k] for k in ('qx', 'qy', 'qz', 'qw')]
+    z = Rotation.from_quat(q).as_matrix()[:, 2]
+    assert math.degrees(math.acos(z[0])) == pytest.approx(max(neck, 0.0), abs=0.01)

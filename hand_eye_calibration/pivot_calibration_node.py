@@ -89,6 +89,10 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         # Known spike direction in the base frame for the axis-alignment round.
         # Default: vertical (spike perpendicular to a level base).
         self.declare_parameter('spike_axis_base', '0,0,1')
+        # Tool axis out of the flange in robot_flange_frame: link6 (Piper) Z, the
+        # crx_description `flange` (Jazzy FANUC CRX) +X. Neck angle, bend plane and the
+        # position-only orientation are relative to it.
+        self.declare_parameter('flange_axis', '0,0,1')
         # Metadata only; this node never sends a CAN firmware query.
         self.declare_parameter('robot_firmware_version', 'unknown')
         self.declare_parameter('capture_burst_duration_s', 1.2)
@@ -126,6 +130,7 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         self.robot_flange_frame = str(self.get_parameter('robot_flange_frame').value)
         self.tcp_name = str(self.get_parameter('tcp_name').value)
         self.spike_axis_base = _parse_axis(self.get_parameter('spike_axis_base').value)
+        self.flange_axis = _parse_axis(self.get_parameter('flange_axis').value)
         self.robot_firmware_version = str(
             self.get_parameter('robot_firmware_version').value)
         self.capture_burst_duration_s = float(self.get_parameter('capture_burst_duration_s').value)
@@ -301,14 +306,15 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             return {'neck_angle_deg': self.nominal_neck_angle_deg, 'waiting_for_tip': True}
         try:
             return tcp_quality.nominal_neck_frame(self.nominal_neck_angle_deg,
-                                                  tip_pivot['tcp_translation'])
+                                                  tip_pivot['tcp_translation'], self.flange_axis)
         except ValueError as ex:
             return {'error': str(ex), 'neck_angle_deg': self.nominal_neck_angle_deg}
 
     def _cad_deviation(self):
         if self.axis_result is None:
             return None
-        return tcp_quality.cad_axis_deviation_deg(self.axis_result['axis_dir'], self.cad_axis_angle_deg)
+        return tcp_quality.cad_axis_deviation_deg(self.axis_result['axis_dir'], self.cad_axis_angle_deg,
+                                                  self.flange_axis)
 
     def _acceptance(self, tip_pivot, validation_result):
         return tcp_quality.evaluate(
@@ -570,7 +576,7 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             return resp
 
         if self.roll_convention == 'bend_plane':
-            frame = tcp_quality.bend_plane_frame(self.axis_result['axis_dir'])
+            frame = tcp_quality.bend_plane_frame(self.axis_result['axis_dir'], self.flange_axis)
             if frame is not None:
                 self.axis_result.update(quaternion=frame['quaternion'],
                                         rotation_matrix=frame['rotation_matrix'],
@@ -685,15 +691,16 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
                 qx, qy, qz, qw = nominal['quaternion']
             else:
                 # Orientation is not observable from a single-point pivot touch;
-                # default to the flange orientation until an axis-calibration
+                # default to the flange axis until an axis-calibration
                 # round (second touch point) or CAD data supplies a real one.
-                qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
+                qx, qy, qz, qw = tcp_quality.flange_axis_quaternion(self.flange_axis)
 
             data = {
                 'parent_frame': self.robot_flange_frame,
                 'tcp_name': self.tcp_name,
                 'robot_base_frame': self.robot_base_frame,
                 'robot_flange_frame': self.robot_flange_frame,
+                'flange_axis': [float(v) for v in self.flange_axis],
                 'robot_firmware_version': self.robot_firmware_version,
                 'calibration_mode': mode,
                 'sample_count': len(self.samples[TIP_ROUND]),

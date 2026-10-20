@@ -155,3 +155,43 @@ def test_failed_acceptance_is_refused_without_force(store):
     with pytest.raises(SystemExit, match='acceptance failed'):
         cli.apply_tcp('crx10ia_l', path)
     cli.apply_tcp('crx10ia_l', path, force=True)
+
+
+def test_tcp_torch_dimensions_are_stored_carried_over_and_build_the_collision(store):
+    path = write(store, 'tcp.yaml', {'transform': _transform(_tool([0.7, 0, -0.7], [0.39, 0, -0.09])),
+                                     'parent_frame': 'flange'})
+    torch = '{"stickout": 0.012, "nozzle_length": 0.09, "nozzle_radius": 0.009, "neck_radius": 0.02}'
+    _, record = cli.apply_tcp('crx10ia_l', path, 'real', torch=torch)
+    assert record['torch'] == {'stickout': 0.012, 'nozzle_length': 0.09, 'nozzle_radius': 0.009,
+                               'neck_radius': 0.02}
+    _, again = cli.apply_tcp('crx10ia_l', path, 'real')
+    _, shifted = cli.offset_tcp('crx10ia_l', 2.0, 'real')
+    assert again['torch'] == shifted['torch'] == record['torch']
+    current = cli.calibration_store.current_path(cli.calibration_store.CRX_WELDING_TCP, 'crx10ia_l')
+    urdf = _real_urdf('femto_bolt', tcp=current)
+    assert 'radius="0.009"' in urdf and 'radius="0.02"' in urdf
+    T = chain_from_urdf(urdf, 'torch_nozzle', 'flange')
+    tip = cli._origin_matrix(shifted['real'])
+    wire = tip[:3, :3] @ [0, 0, 1]
+    # Nozzle centre: 0.012 + 0.09 / 2 behind the wire tip, on the wire axis.
+    np.testing.assert_allclose(T[:3, 3], tip[:3, 3] - (0.012 + 0.045) * wire, atol=1e-9)
+
+
+@pytest.mark.parametrize('torch', ['{"neck_angle": 0.1}', '{"stickout": 15}', '{"nozzle_radius": -0.01}'])
+def test_tcp_torch_dimensions_are_validated(store, torch):
+    path = write(store, 'tcp.yaml', {'transform': _transform(_tool([1, 0, 0], [0.4, 0, 0]))})
+    with pytest.raises(SystemExit):
+        cli.apply_tcp('crx10ia_l', path, 'real', torch=torch)
+
+
+@pytest.mark.parametrize('mode', ['position', 'nominal'])
+def test_tcp_orientation_from_a_non_crx_flange_axis_is_refused(store, mode):
+    T = _transform(_tool([1, 0, 0], [0.4, 0, 0]))
+    old = write(store, 'old.yaml', {'transform': T, 'calibration_mode': mode})
+    piper = write(store, 'piper.yaml', {'transform': T, 'calibration_mode': mode, 'flange_axis': [0, 0, 1]})
+    for path in (old, piper):
+        with pytest.raises(SystemExit, match='flange_axis'):
+            cli.apply_tcp('crx10ia_l', path, 'real')
+    cli.apply_tcp('crx10ia_l', write(store, 'crx.yaml', {'transform': T, 'calibration_mode': mode,
+                                                        'flange_axis': [1.0, 0.0, 0.0]}), 'real')
+    cli.apply_tcp('crx10ia_l', old, 'real', force=True)

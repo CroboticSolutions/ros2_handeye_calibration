@@ -21,11 +21,16 @@ tcp     flange -> TCP link (mount welding_tcp). real: crx_description `tcp`
         smallest rotation of the active one that puts that axis on the calibrated
         tool +Z (wire). No limit on how far it may move (first calibration of an
         unknown tool). `tcp-offset --along-wire-mm` stores a manual shift.
+        --torch '{"stickout": .., "nozzle_length": .., "nozzle_radius": .., "neck_radius": ..}'
+        (metres) stores the torch dimensions with the version (crx_description's
+        crx_torch_collision.xacro builds the torch collision from them); without it
+        the active version's `torch` block is carried over.
 
 Both refuse a YAML whose acceptance check failed unless --force. The caller pushes
 the new robot_description and restarts MoveIt (GUI Apply does both).
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -231,6 +236,26 @@ def _rpy(rotation):
         return rotation.as_euler('xyz')
 
 
+# Tool axis out of the crx_description `flange` (J6 axis).
+FLANGE_AXIS = (1.0, 0.0, 0.0)
+TORCH_KEYS = ('stickout', 'nozzle_length', 'nozzle_radius', 'neck_radius')
+
+
+def parse_torch(value):
+    """Torch dimensions (metres) from a JSON object or dict; only TORCH_KEYS, each > 0 and < 1 m."""
+    data = json.loads(value) if isinstance(value, str) else dict(value)
+    unknown = sorted(set(data) - set(TORCH_KEYS))
+    if unknown:
+        raise SystemExit(f'Unknown torch keys {unknown}; expected {list(TORCH_KEYS)}.')
+    torch = {}
+    for key, v in data.items():
+        v = float(v)
+        if not 0.0 < v < 1.0:
+            raise SystemExit(f'torch {key} = {v} m is outside (0, 1) m.')
+        torch[key] = round(v, 6)
+    return torch
+
+
 def _tcp_version(robot, base, target, origin, label, extra):
     record = {
         'label': label,
@@ -241,6 +266,8 @@ def _tcp_version(robot, base, target, origin, label, extra):
         'sim': dict(base['sim']),
         'updated': [target],
     }
+    if base.get('torch'):
+        record['torch'] = dict(base['torch'])
     record[target] = {**base[target], **origin}
     a, b = _origin_matrix(base[target]), _origin_matrix(record[target])
     w = np.asarray(base[target]['wire_axis_tcp'], float)
@@ -253,13 +280,22 @@ def _tcp_version(robot, base, target, origin, label, extra):
     return calibration_store.save_version(mount, record, robot=robot)
 
 
-def apply_tcp(robot, calibration_yaml, target='real', force=False, label=None, activate=True):
+def apply_tcp(robot, calibration_yaml, target='real', force=False, label=None, activate=True,
+              torch=None):
     """Pivot/touch-off result (flange -> tool, +Z = wire) -> new TCP store version."""
     _check_robot(robot)
     data, T = load_calibration(calibration_yaml, force)
     parent = data.get('parent_frame') or data.get('robot_flange_frame')
     if parent not in (None, EFFECTOR):
         raise SystemExit(f'Expected a TCP relative to {EFFECTOR!r}, got {parent!r}.')
+    # Position-only / neck-angle orientations are built around the flange axis given to
+    # the collector; on the CRX `flange` that is +X (link6 Z would put the wire sideways).
+    axis = data.get('flange_axis')
+    if data.get('calibration_mode') in ('position', 'nominal') and not force and (
+            axis is None or not np.allclose(np.asarray(axis, float) / np.linalg.norm(axis), FLANGE_AXIS)):
+        raise SystemExit(f'{data.get("calibration_mode")!r} TCP was saved with flange_axis {axis}; the CRX '
+                         f'flange axis is {list(FLANGE_AXIS)} (tool_tcp_calibration flange_axis:=1,0,0). '
+                         'Recalibrate, or --force.')
     base = _tcp_base(robot)
     rotation = tcp_rotation(np.fromstring(base[target]['rpy'], sep=' '),
                             base[target]['wire_axis_tcp'], T[:3, 2])
@@ -282,6 +318,8 @@ def apply_tcp(robot, calibration_yaml, target='real', force=False, label=None, a
             'rms_m': data.get('rms_m') or (data.get('quality') or {}).get('rms_m'),
         },
     }
+    if torch:
+        extra['torch'] = {**(base.get('torch') or {}), **parse_torch(torch)}
     calibration_id, _path, record = _tcp_version(robot, base, target, origin, label, extra)
     if activate:
         calibration_store.activate(calibration_store.CRX_WELDING_TCP, calibration_id, robot)
@@ -345,6 +383,8 @@ def main(argv=None):
     tcp = sub.add_parser('tcp')
     tcp.add_argument('calibration_yaml', nargs='?', default='~/.ros/tool_tcp_calibration.yaml')
     tcp.add_argument('--target', choices=TCP_TARGETS, default='real')
+    tcp.add_argument('--torch', help='torch dimensions JSON in metres (keys: ' + ', '.join(TORCH_KEYS) +
+                     '); default: carried over from the active version')
     off = sub.add_parser('tcp-offset', help='shift the active TCP along the wire (new version)')
     off.add_argument('--along-wire-mm', type=float, required=True)
     off.add_argument('--target', choices=TCP_TARGETS, default='real')
@@ -370,7 +410,7 @@ def main(argv=None):
         return 0
     if args.kind == 'tcp':
         calibration_id, record = apply_tcp(robot, args.calibration_yaml, args.target, args.force,
-                                           args.label, not args.no_activate)
+                                           args.label, not args.no_activate, args.torch)
         _print_version(robot, calibration_id, record, calibration_store.CRX_WELDING_TCP, not args.no_activate)
         return 0
     if args.kind == 'tcp-offset':

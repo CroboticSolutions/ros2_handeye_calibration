@@ -69,6 +69,18 @@ def bend_plane_frame(axis_dir, flange_axis=(0.0, 0.0, 1.0)):
             'axis_dir': [float(v) for v in z], 'roll_convention': 'x_in_neck_bend_plane'}
 
 
+def flange_axis_quaternion(flange_axis=(0.0, 0.0, 1.0)):
+    """flange -> tool quaternion [x, y, z, w] whose Z is the flange axis (smallest
+    rotation from flange Z; identity for a Z flange axis)."""
+    f = np.asarray(flange_axis, dtype=float)
+    f /= np.linalg.norm(f)
+    axis = np.cross([0.0, 0.0, 1.0], f)
+    angle = math.atan2(np.linalg.norm(axis), f[2])
+    if np.linalg.norm(axis) < 1e-12:
+        axis = np.array([1.0, 0.0, 0.0])
+    return [float(v) for v in Rotation.from_rotvec(axis / np.linalg.norm(axis) * angle).as_quat()]
+
+
 def nominal_neck_frame(angle_deg, tip_translation, flange_axis=(0.0, 0.0, 1.0)):
     """flange -> tool rotation from the nominal neck angle on the torch data sheet.
 
@@ -83,7 +95,8 @@ def nominal_neck_frame(angle_deg, tip_translation, flange_axis=(0.0, 0.0, 1.0)):
     t = np.asarray(tip_translation, dtype=float)
     side = t - (t @ f) * f
     if abs(angle) < 1e-9:
-        return {'rotation_matrix': np.eye(3).tolist(), 'quaternion': [0.0, 0.0, 0.0, 1.0],
+        quat = flange_axis_quaternion(f)
+        return {'rotation_matrix': Rotation.from_quat(quat).as_matrix().tolist(), 'quaternion': quat,
                 'axis_dir': [float(v) for v in f], 'azimuth_deg': None,
                 'roll_convention': 'flange', 'neck_angle_deg': 0.0}
     if np.linalg.norm(side) < 0.001:

@@ -22,6 +22,7 @@ def _launch_tcp_calibration_setup(context, *_args, **_kwargs):
             {'tcp_name': lc['tcp_name']},
             {'calibration_file': lc['calibration_file']},
             {'spike_axis_base': lc['spike_axis_base']},
+            {'flange_axis': lc['flange_axis']},
             {'robot_firmware_version': lc['robot_firmware_version']},
             {'capture_burst_duration_s': float(lc['capture_burst_duration_s'])},
             {'capture_burst_samples': int(lc['capture_burst_samples'])},
@@ -67,6 +68,12 @@ def generate_launch_description():
                 default_value='0,0,1',
                 description='Known spike direction in the base frame for the axis-alignment '
                             'round (vertical when the base is level)',
+            ),
+            DeclareLaunchArgument(
+                'flange_axis',
+                default_value='0,0,1',
+                description='Tool axis out of the flange in robot_flange_frame '
+                            '(Piper link6: 0,0,1; crx_description flange: 1,0,0)',
             ),
             DeclareLaunchArgument(
                 'use_sim_time',
