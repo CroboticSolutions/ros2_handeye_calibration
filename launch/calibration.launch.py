@@ -47,6 +47,7 @@ def _launch_calibration_setup(context, *_args, **_kwargs):
             {'robot_base_frame': lc['robot_base_frame']},
             {'robot_effector_frame': lc['robot_effector_frame']},
             {'robot_motion_tip_frame': lc['robot_motion_tip_frame']},
+            {'touchoff_tcp_frame': lc['touchoff_tcp_frame']},
             {'calibration_type': lc['calibration_type']},
             {'calibration_file': lc['calibration_file']},
             {'auto_enabled': lc.get('auto_enabled', 'auto').lower() == 'true' or (lc.get('auto_enabled', 'auto') == 'auto' and piper_sim)},
@@ -114,6 +115,12 @@ def generate_launch_description():
                 default_value='',
                 description='End of the moved joint chain; empty uses robot_effector_frame '
                             '(set link6 when the camera is mounted on link5)',
+            ),
+            DeclareLaunchArgument(
+                'touchoff_tcp_frame',
+                default_value='arm_tcp',
+                description='Tool tip frame that touch-off validation reads (PiPER arm_tcp, '
+                            'Jazzy CRX real tcp)',
             ),
             DeclareLaunchArgument(
                 'calibration_type',
