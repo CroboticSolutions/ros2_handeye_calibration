@@ -97,5 +97,25 @@ class CornerSpreadTest(unittest.TestCase):
         self.assertEqual(CharucoBoardDetector.corner_spread(np.array([[[5.0, 5.0]]]), (0, 0)), 0.0)
 
 
+@unittest.skipUnless(ROS_AVAILABLE, "ROS 2 (rclpy) not available")
+class EffectiveMinCornersTest(unittest.TestCase):
+    def test_default_board_keeps_configured_gate(self) -> None:
+        self.assertEqual(CharucoBoardDetector.effective_min_corners(MIN_CORNERS_DEFAULT, 13, 9), 24)
+
+    def test_small_board_gate_is_reachable(self) -> None:
+        """A fully visible 4x5 board (12 corners) was rejected by the 24-corner gate."""
+        gate = CharucoBoardDetector.effective_min_corners(MIN_CORNERS_DEFAULT, 4, 5)
+        self.assertEqual(gate, 6)
+        self.assertEqual(CharucoBoardDetector.effective_min_corners(MIN_CORNERS_DEFAULT, 5, 4), 6)
+
+    def test_gate_never_exceeds_board_corners(self) -> None:
+        for sx in range(2, 15):
+            for sy in range(2, 15):
+                total = (sx - 1) * (sy - 1)
+                gate = CharucoBoardDetector.effective_min_corners(MIN_CORNERS_DEFAULT, sx, sy)
+                self.assertLessEqual(gate, total, f"{sx}x{sy}")
+                self.assertLessEqual(gate, MIN_CORNERS_DEFAULT, f"{sx}x{sy}")
+
+
 if __name__ == "__main__":
     unittest.main()

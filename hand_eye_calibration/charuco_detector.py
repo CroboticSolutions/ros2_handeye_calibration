@@ -95,6 +95,8 @@ class CharucoBoardDetector(Node):
         # repo's fixtures: a good live capture yields ~79, a half-visible board
         # ~30, so 24 rejects genuinely weak detections while staying permissive.
         # Raising this trades capture rate for pose conditioning.
+        # Small boards cap it (see effective_min_corners): a 4x5 board has only
+        # 12 interior corners and would otherwise never be accepted.
         self.declare_parameter("min_charuco_corners", 24)
         # Corners clustered in one small image region give a poorly conditioned
         # PnP even when there are many of them. This is the RMS radius of the
@@ -192,7 +194,8 @@ class CharucoBoardDetector(Node):
             f"dict={self.spec['aruco_dictionary']}, board_frame={self.board_frame}"
         )
         self.get_logger().info(
-            f"Quality gates: min_charuco_corners={self.min_charuco_corners}, "
+            f"Quality gates: min_charuco_corners={self.min_charuco_corners} "
+            f"(effective {self.min_corners} for this board), "
             f"min_charuco_corner_spread={self.min_charuco_corner_spread:.3f}, "
             f"max_reproj_error_px={self.max_reproj_error_px:.2f} "
             f"(reject={self.reject_on_reproj_error}), try_refine_markers={self.try_refine_markers}"
@@ -226,6 +229,20 @@ class CharucoBoardDetector(Node):
         # Modern (OpenCV >= 4.7) detector. Falls back handled by exception in callback.
         self.charuco_detector = cv2.aruco.CharucoDetector(self.board, charuco_params, detector_params)
         self.dictionary = dictionary
+        self.min_corners = self.effective_min_corners(
+            self.min_charuco_corners, self.spec["squares_x"], self.spec["squares_y"]
+        )
+
+    @staticmethod
+    def effective_min_corners(configured: int, squares_x: int, squares_y: int) -> int:
+        """Corner gate for this board: the configured value, capped to what the board has.
+
+        min_charuco_corners is tuned for the 13x9 board (96 interior corners).
+        On a small board it would exceed the total, so require half the board
+        (at least 6, the reprojection solver's minimum) instead.
+        """
+        total = max(0, squares_x - 1) * max(0, squares_y - 1)
+        return min(configured, total, max(6, (total + 1) // 2))
 
     def _board_spec_cb(self, msg: String):
         try:
@@ -248,7 +265,9 @@ class CharucoBoardDetector(Node):
         self.spec = new_spec
         try:
             self._build_board()
-            self.get_logger().info(f"Board spec updated from GUI: {self.spec}")
+            self.get_logger().info(
+                f"Board spec updated from GUI: {self.spec}; min corners {self.min_corners}"
+            )
         except Exception as exc:  # noqa: BLE001 - revert on bad spec
             self.spec = prev
             self._build_board()
@@ -334,11 +353,11 @@ class CharucoBoardDetector(Node):
         annotated = frame if self.annotated_pub is not None else None
         pose_ok = False
         spread = self.corner_spread(charuco_corners, gray.shape) if n_corners else 0.0
-        if n_corners < self.min_charuco_corners:
+        if n_corners < self.min_corners:
             if n_corners:
                 self._note_rejection(
-                    f"only {n_corners} ChArUco corners (need min_charuco_corners="
-                    f"{self.min_charuco_corners}) — move closer or expose more of the board"
+                    f"only {n_corners} ChArUco corners (need {self.min_corners} for this "
+                    "board) — move closer or expose more of the board"
                 )
         elif spread < self.min_charuco_corner_spread:
             self._note_rejection(
@@ -359,7 +378,7 @@ class CharucoBoardDetector(Node):
                     annotated, charuco_corners, charuco_ids, (0, 255, 0)
                 )
             label = (
-                f"corners {n_corners}/{self.min_charuco_corners}  "
+                f"corners {n_corners}/{self.min_corners}  "
                 f"spread {spread:.3f}  "
                 f"{'POSE OK' if pose_ok else 'no pose'}"
             )
