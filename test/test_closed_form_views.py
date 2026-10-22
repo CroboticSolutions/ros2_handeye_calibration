@@ -10,8 +10,8 @@ from scipy.spatial.transform import Rotation
 
 pytest.importorskip('hand_teleop.closed_form_ik')
 from hand_eye_calibration.closed_form_views import (  # noqa: E402
-    JOINT_LIMIT_MARGIN_RAD, NUMERIC_DISTANCE_SCALE, ClosedFormViews, NumericIKViews, shortest_route,
-    weakest_observability)
+    JOINT_LIMIT_MARGIN_RAD, NUMERIC_DISTANCE_SCALE, NUMERIC_JOINT_WINDOW_RAD, WRIST_CLEAR_RAD,
+    ClosedFormViews, NumericIKViews, shortest_route, weakest_observability)
 from hand_eye_calibration.visibility import BoardFraming, CameraKinematics  # noqa: E402
 
 URDF = (Path(__file__).resolve().parents[3] / 'robots/piper_ros/src/robot_description/'
@@ -234,3 +234,28 @@ def test_selected_views_are_visited_along_the_shortest_route():
     s.collected_or_failed = lambda target, phase, failures: (visited.append(target[0]) or True, 0)
     assert s.sample_closed_form(3, 'refinement', np.eye(4), np.zeros(3)) == 3
     assert visited == pytest.approx([.1, .2, .3])
+
+
+def test_numeric_views_stay_in_the_joint_window_without_a_wrist_flip(scene):
+    """The bounded solver alone wandered up to 185 deg on J6 and flipped J5 (CRX, 21.10.)."""
+    numeric = NumericIKViews(scene.fk.camera, scene.lower, scene.upper)
+    center = (BOARD @ np.r_[scene.framing.center, 1])[:3]
+    pool, _ = numeric.pool(BOARD, center, MOUNT, scene.framing, scene.reference, 0.30, INITIAL,
+                           np.random.default_rng(3), 60)
+    assert pool
+    for q, _ in pool:
+        assert np.all(np.abs(q - INITIAL) <= NUMERIC_JOINT_WINDOW_RAD + 1e-9)
+        assert np.sign(q[4]) == np.sign(INITIAL[4]) and abs(q[4]) >= WRIST_CLEAR_RAD - 1e-9
+
+
+def test_window_bounds_keep_the_wrist_side_and_the_limit_margin():
+    lower, upper = np.full(6, -3.), np.full(6, 3.)
+    views = NumericIKViews(lambda q: np.eye(4), lower, upper)
+    lo, hi = views.window_bounds(np.array([0., 0., 0., 0., -0.8, 2.95]))
+    assert hi[4] == pytest.approx(-WRIST_CLEAR_RAD)            # J5 stays negative
+    assert lo[4] == pytest.approx(-0.8 - NUMERIC_JOINT_WINDOW_RAD[4])
+    assert hi[5] == pytest.approx(3. - JOINT_LIMIT_MARGIN_RAD)  # limit margin wins
+    lo, hi = views.window_bounds(np.array([0., 0., 0., 0., 0.05, 0.]))
+    assert lo[4] < 0 < hi[4]                                    # near 0: no side imposed
+    lo, hi = views.window_bounds(np.array([0., 0., 0., 0., 0.8, 0.]))
+    assert lo[4] == pytest.approx(WRIST_CLEAR_RAD)

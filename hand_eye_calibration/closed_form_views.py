@@ -14,8 +14,8 @@ weakest singular value 3.41 -> 6.37 for 26 views, median relative rotation
 Kinematics only: MoveIt still plans and collision-checks each chosen view.
 Needs a 6R ortho-parallel chain to the effector (PiPER link6); otherwise
 ``ClosedFormViews.create`` returns None. ``NumericIKViews`` then builds the same
-pool with a damped least-squares IK on the URDF chain (CRX: y/x joint axes have
-no closed form here). Without it the local sampler mostly rolled the CRX camera
+pool with a bounded least-squares IK on the URDF chain (CRX: y/x joint axes have
+no closed form here), limited to a joint window around the reference pose. Without it the local sampler mostly rolled the CRX camera
 about its optical axis = J6 (21.10.: rotation RMS about flange x/y/z 15/4/10 deg,
 camera translation along J6 the weakest direction in every run).
 """
@@ -37,6 +37,16 @@ NUMERIC_DISTANCE_SCALE = (0.8, 1.15)
 NUMERIC_BATCH = 250
 NUMERIC_MAX_CANDIDATES = 5000
 NUMERIC_IK_TOLERANCE = (0.001, np.deg2rad(0.5))   # position m, rotation rad
+# Joint window around the reference (return) pose, 6-joint wrist order. The bounded
+# solver alone wandered: J4 to 170 deg, J6 to 185 deg from the reference and a J5
+# sign change (wrist flip) in 2-5 of 12-20 views. Offline on the 21.10. CRX scenes
+# (12 main views, 0.45 m): this window kept J4/J6 within 72-88 deg, no flips, sigma
+# 1.84-1.98 mm (unbounded 1.2-1.9 mm); +-45/60 deg needed ~24 main views for 2 mm,
+# and roll +-45 deg made sigma worse (2.4-7.4 mm).
+NUMERIC_JOINT_WINDOW_RAD = np.deg2rad([60., 60., 60., 90., 60., 90.])
+NUMERIC_DEFAULT_WINDOW_RAD = np.deg2rad(60.)   # chains with other than six joints
+WRIST_BEND_JOINT = 4                            # J5: stays on the reference's side of 0
+WRIST_CLEAR_RAD = np.deg2rad(10.)
 
 
 def translation_gain(rotations, candidate):
@@ -207,8 +217,9 @@ class NumericIK:
 class NumericIKViews(ClosedFormViews):
     """The closed-form pool and greedy selection for chains without a closed form.
 
-    One IK branch only: the solution nearest the seed (the return pose), so a
-    view never needs a wrist flip. The joint-limit margin bounds the solver.
+    The solver starts at the reference (return) pose and is bounded to a joint
+    window around it (``window_bounds``): a local optimizer alone does not stay
+    on the nearest branch. The joint-limit margin still applies.
     """
 
     label = 'numeric IK'
@@ -217,7 +228,33 @@ class NumericIKViews(ClosedFormViews):
 
     def __init__(self, effector_fk, lower, upper, margin=JOINT_LIMIT_MARGIN_RAD):
         super().__init__(None, lower, upper, margin)
+        self.limit_lower, self.limit_upper = self.lower.copy(), self.upper.copy()
         self.ik = NumericIK(effector_fk, self.lower, self.upper)
+
+    def window_bounds(self, initial):
+        """Joint limits (with margin) intersected with the window around ``initial``;
+        a 6-joint wrist keeps J5 on the side of 0 it starts on."""
+        initial = np.asarray(initial, float)
+        window = (NUMERIC_JOINT_WINDOW_RAD if len(initial) == len(NUMERIC_JOINT_WINDOW_RAD)
+                  else np.full(len(initial), NUMERIC_DEFAULT_WINDOW_RAD))
+        lower = np.maximum(self.limit_lower, initial - window)
+        upper = np.minimum(self.limit_upper, initial + window)
+        if len(initial) == 6:
+            bend = initial[WRIST_BEND_JOINT]
+            if bend <= -WRIST_CLEAR_RAD:
+                upper[WRIST_BEND_JOINT] = min(upper[WRIST_BEND_JOINT], -WRIST_CLEAR_RAD)
+            elif bend >= WRIST_CLEAR_RAD:
+                lower[WRIST_BEND_JOINT] = max(lower[WRIST_BEND_JOINT], WRIST_CLEAR_RAD)
+        return lower, upper
+
+    def pool(self, board, center, estimate, framing, reference, max_excursion, initial, rng, wanted,
+             check=lambda: None):
+        self.lower, self.upper = self.window_bounds(initial)
+        if np.any(self.lower >= self.upper):   # reference outside the limit margin
+            return [], 0
+        self.ik.lower, self.ik.upper = self.lower, self.upper
+        return super().pool(board, center, estimate, framing, reference, max_excursion, initial, rng,
+                            wanted, check)
 
     def distance_range(self, reference, center):
         distance = float(np.linalg.norm(reference[:3, 3] - center))
