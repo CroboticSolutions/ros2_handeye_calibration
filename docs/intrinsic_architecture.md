@@ -37,7 +37,8 @@ are not used. See `THIRD_PARTY_NOTICES.md` and `LICENSE.intrinsic`.
    SciPy least-squares optimizes their pose residual with squared loss and the
    initial residual variance weighting used by Intrinsic. No sample rejection,
    no AX=XB algorithm sweep, no pixel-based refinement in this mode.
-7. Local acceptance extensions: minimum 20 training views, rotation observability,
+7. Local acceptance extensions: minimum training views 6 initial + main count
+   (automatic; 20 for manual saves), rotation observability,
    pose RMS ≤3 mm / 1°, bootstrap position sigma ≤2 mm (configurable existing
    `auto_max_position_sigma_m` for automatic acquisition). These are our defaults,
    not claimed to be upstream universal thresholds.

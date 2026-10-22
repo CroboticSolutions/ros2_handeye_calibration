@@ -196,6 +196,13 @@ class DataCollector(Node):
             self.save_calibration_service_name,
             self.save_calibration_service_callback,
             callback_group=self._service_cb_group)
+        # Operator override: the current candidate becomes the active file even
+        # when acceptance fails (the YAML records forced: true and the verdict).
+        self.force_save_calibration_service = self.create_service(
+            Trigger,
+            mname + "/force_save_calibration",
+            self.force_save_calibration_service_callback,
+            callback_group=self._service_cb_group)
 
         # On-demand uncertainty: the number that answers "have I collected
         # enough samples yet?", which is exactly the question you want answered
@@ -973,7 +980,11 @@ class DataCollector(Node):
         self._publish_status(cal, self.sample_metrics[-1] if self.sample_metrics else None)
         return resp
 
-    def save_calibration_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
+    def force_save_calibration_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
+        """Save the current candidate as the active calibration despite failed acceptance."""
+        return self.save_calibration_service_callback(req, resp, force=True)
+
+    def save_calibration_service_callback(self, req: Trigger.Request, resp: Trigger.Response, force=False):
         if (hasattr(self, 'automatic') and self.automatic.active
                 and threading.current_thread() is not self.automatic.thread):
             resp.success = False
@@ -983,7 +994,8 @@ class DataCollector(Node):
 
         The raw dataset is always written. The active calibration file is
         replaced only when the acceptance gate passes (or acceptance_mode is
-        'warn'); otherwise the candidate goes to <calibration_file>.rejected.yaml.
+        'warn', or ``force``); otherwise the candidate goes to
+        <calibration_file>.rejected.yaml.
         """
         cal = self.get_calibration(full=True)
         if cal is None:
@@ -1005,9 +1017,13 @@ class DataCollector(Node):
                 limits['max_position_sigma_m'] = self.automatic.max_position_sigma
             if self.solver_name == 'intrinsic_pose':
                 from .intrinsic_solver import evaluate
+                # Automatic runs: at least six initial plus the main views, the run's
+                # own gate (12 main views by default, so 20 would reject a run that
+                # kept only six or seven initial views).
+                min_samples = (6 + self.automatic.min_training_samples if self.automatic.active
+                               else max(20, limits['min_samples']))
                 verdict = evaluate(report, sigma_limit=limits['max_position_sigma_m'],
-                                   min_samples=max(20, limits['min_samples']),
-                                   require_validation=self.automatic.active)
+                                   min_samples=min_samples, require_validation=self.automatic.active)
             else:
                 verdict = acceptance_gate.evaluate(report, self.training_count(), limits)
             if report is None and self.solver_name == 'axxb':
@@ -1066,6 +1082,8 @@ class DataCollector(Node):
                     'targeted': self.automatic.status.get('targeted_samples', 0),
                     'independent_validation': len(self.validation_indices())}
                 data['automatic_position_sigma_limit_m'] = self.automatic.max_position_sigma
+            forced = bool(force and not verdict['passed'])
+            data['forced'] = forced
             run_dir = None
             try:
                 run_dir = calibration_dataset.write_run(
@@ -1073,7 +1091,7 @@ class DataCollector(Node):
                 data['dataset_path'] = run_dir
             except OSError as exc:
                 self.get_logger().error(f'Could not write the calibration dataset: {exc}')
-            accepted = verdict['passed'] or self.acceptance_mode == 'warn'
+            accepted = verdict['passed'] or self.acceptance_mode == 'warn' or force
             target = cal_file if accepted else cal_file + '.rejected.yaml'
             self._write_yaml_atomic(target, data, keep_previous=accepted)
             if run_dir:
@@ -1084,7 +1102,9 @@ class DataCollector(Node):
                 resp.success = False
                 resp.message = f"Acceptance failed; active calibration unchanged. {verdict['summary']} Candidate: {target}"
                 return resp
-            note = '' if verdict['passed'] else f" WARNING (acceptance_mode=warn): {verdict['summary']}"
+            note = ('' if verdict['passed'] else
+                    f" FORCED despite failed acceptance: {verdict['summary']}" if forced else
+                    f" WARNING (acceptance_mode=warn): {verdict['summary']}")
             self.get_logger().info("Calibration saved to %s%s" % (cal_file, note))
             resp.success = True
             resp.message = "Saved to " + cal_file + note + (f" (dataset {run_dir})" if run_dir else '')

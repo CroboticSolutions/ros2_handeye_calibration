@@ -72,6 +72,25 @@ def test_inconsistent_robot_poses_do_not_replace_active_file(node):
     assert os.path.exists(os.path.join(rejected['dataset_path'], 'dataset.json'))
 
 
+def test_force_save_makes_a_failed_candidate_active_and_records_it(node):
+    n, calibration, _ = node
+    load(n, make_samples(robot_noise_m=.004))
+    response = n.force_save_calibration_service_callback(Trigger.Request(), Trigger.Response())
+    assert response.success, response.message
+    assert 'FORCED despite failed acceptance' in response.message
+    data = yaml.safe_load(calibration.read_text())
+    assert data['forced'] is True
+    assert not data['acceptance']['passed']          # the verdict stays truthful
+    assert os.path.exists(str(calibration) + '.previous')
+    assert yaml.safe_load(open(os.path.join(data['dataset_path'], 'calibration.yaml')))['forced'] is True
+    # A passing candidate saved through the override is not marked forced.
+    n.robot_samples.clear(); n.tracking_samples.clear(); n.sample_metrics.clear()
+    n.sample_frames.clear(); n.sample_joints.clear(); n.sample_roles.clear(); n.sample_images.clear()
+    load(n, make_samples())
+    assert n.force_save_calibration_service_callback(Trigger.Request(), Trigger.Response()).success
+    assert yaml.safe_load(calibration.read_text())['forced'] is False
+
+
 def test_too_few_samples_are_refused(node):
     n, calibration, _ = node
     load(n, make_samples(n=8))
