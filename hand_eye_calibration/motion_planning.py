@@ -70,6 +70,10 @@ def plan_joint_path(runner, start, goal):
     req=GetMotionPlan.Request()
     motion=req.motion_plan_request
     motion.group_name=runner.move_group
+    # Returns at the first solution. Group defaults such as crx10ia_l's RRTstar
+    # always use the full planning time (2.02 s vs 0.023 s per plan offline,
+    # equally short paths; brain 2026-10-22_crx_calibration_planner_speed).
+    motion.planner_id='RRTConnect'
     motion.num_planning_attempts=2
     motion.allowed_planning_time=2.
     motion.max_velocity_scaling_factor=.3

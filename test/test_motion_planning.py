@@ -77,6 +77,8 @@ def test_request_keeps_attached_state_and_never_executes_trajectory():
     assert seen[0].motion_plan_request.start_state.is_diff
     assert seen[0].motion_plan_request.start_state.joint_state.position[-1]==.03
     assert seen[0].motion_plan_request.group_name=='different_robot_arm'
+    # Not the group default: crx10ia_l's RRTstar spends the full planning time.
+    assert seen[0].motion_plan_request.planner_id=='RRTConnect'
     runner.action.send_goal_async.assert_not_called()
 
 
