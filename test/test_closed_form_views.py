@@ -10,7 +10,7 @@ from scipy.spatial.transform import Rotation
 
 pytest.importorskip('hand_teleop.closed_form_ik')
 from hand_eye_calibration.closed_form_views import (  # noqa: E402
-    JOINT_LIMIT_MARGIN_RAD, ClosedFormViews, weakest_observability)
+    JOINT_LIMIT_MARGIN_RAD, NUMERIC_DISTANCE_SCALE, ClosedFormViews, NumericIKViews, weakest_observability)
 from hand_eye_calibration.visibility import BoardFraming, CameraKinematics  # noqa: E402
 
 URDF = (Path(__file__).resolve().parents[3] / 'robots/piper_ros/src/robot_description/'
@@ -94,12 +94,13 @@ def test_greedy_views_raise_the_weakest_translation_direction(scene):
 def test_sample_main_uses_pool_then_falls_back(monkeypatch):
     from hand_eye_calibration import intrinsic_acquisition as acquisition
     s = acquisition.IntrinsicSession.__new__(acquisition.IntrinsicSession)
-    s.views, s.validation, s.rejections = [], [], {}
+    s.views, s.validation, s.rejections, s.pool_left = [], [], {}, {}
     s.initial, s.estimate, s.board, s.rng = np.zeros(6), np.eye(4), np.eye(4), np.random.default_rng(0)
     s.underactuated, s.n = False, NS()
     s.fk = NS(camera=lambda q: np.eye(4))
-    updates = []
-    s.r = NS(check=lambda: None, update=lambda *a, **kw: updates.append(a[1] if len(a) > 1 else ''),
+    updates, fields = [], {}
+    s.r = NS(check=lambda: None,
+             update=lambda *a, **kw: updates.append(a[1] if len(a) > 1 else '') or fields.update(kw),
              framing=NS(center=np.zeros(3), contains=lambda *a, **kw: True), max_camera_excursion=.3)
     poses = [np.eye(4) for _ in range(2)]
     for i, p in enumerate(poses):
@@ -120,3 +121,75 @@ def test_sample_main_uses_pool_then_falls_back(monkeypatch):
     assert [c[0][0] for c in collected[:2]] in ([0., 1.], [1., 0.])   # both pool views first
     assert len(collected) == 3 and collected[2][0][0] == 9. and fallback  # then the local sampler
     assert any('View pool exhausted at 2/3' in u for u in updates)
+    assert 'View pool exhausted at 2/3' in fields['view_sampler_warning']   # GUI alert
+    assert fields['view_sampler'] == 'local random'
+
+
+def test_numeric_pool_matches_closed_form_quality(scene):
+    """Numeric IK (any 6-joint URDF chain, CRX) on the PiPER scene: views are framed,
+    reached exactly, clear of the limits, on the nearest branch, and as informative."""
+    numeric = NumericIKViews(scene.fk.camera, scene.lower, scene.upper)
+    center = (BOARD @ np.r_[scene.framing.center, 1])[:3]
+    pool, sampled = numeric.pool(BOARD, center, MOUNT, scene.framing, scene.reference, 0.30, INITIAL,
+                                 np.random.default_rng(3), 60)
+    # One IK branch (nearest the return pose) and PiPER's tight limits: fewer than closed form.
+    assert len(pool) >= 25 and sampled <= 5000
+    distance = np.linalg.norm(scene.reference[:3, 3] - center)
+    for q, effector in pool:
+        assert np.all(q >= scene.lower + JOINT_LIMIT_MARGIN_RAD - 1e-9)
+        assert np.all(q <= scene.upper - JOINT_LIMIT_MARGIN_RAD + 1e-9)
+        actual = scene.fk.camera(q)   # IK tolerance: 1 mm, 0.5 deg
+        assert np.linalg.norm(actual[:3, 3] - effector[:3, 3]) <= 1e-3 + 1e-9
+        assert Rotation.from_matrix(effector[:3, :3].T @ actual[:3, :3]).magnitude() <= np.deg2rad(.5) + 1e-9
+        camera = effector @ MOUNT
+        assert scene.framing.contains(np.linalg.inv(camera) @ BOARD, margin=.13)
+        assert np.linalg.norm(camera[:3, 3] - scene.reference[:3, 3]) <= 0.30 + 1e-9
+        r = np.linalg.norm(camera[:3, 3] - center)
+        assert NUMERIC_DISTANCE_SCALE[0] * distance - .05 <= r <= NUMERIC_DISTANCE_SCALE[1] * distance + .05
+    chosen = [scene.fk.camera(INITIAL)[:3, :3]]
+    for _ in range(20):
+        chosen.append(pool.pop(ClosedFormViews.best(pool, chosen))[1][:3, :3])
+    relative = [np.degrees(Rotation.from_matrix(a.T @ b).magnitude()) for a, b in itertools.combinations(chosen, 2)]
+    assert np.median(relative) > 20   # local sampler: 13.7 deg
+
+
+def test_session_uses_numeric_views_without_closed_form(monkeypatch):
+    """CRX: closed_form_ik needs z joint axes, so the session must not fall back to local views."""
+    from hand_eye_calibration import intrinsic_acquisition as acquisition
+    from test_automatic_calibration import synthetic_sequence
+    from hand_eye_calibration import bootstrap_calibration
+    r, n, _ = synthetic_sequence(monkeypatch)
+    r.names = n.get_parameter('auto_joint_names').value
+    # A six-revolute URDF chain (visibility.CameraKinematics) without a closed form.
+    chain = [(np.eye(4), np.array([0., 1., 0.]), 'revolute', name) for name in r.names]
+    monkeypatch.setattr(acquisition, 'CameraKinematics',
+                        lambda *a: NS(chain=chain, camera=bootstrap_calibration.CameraKinematics(*a).camera))
+    monkeypatch.setattr(ClosedFormViews, 'create', classmethod(lambda cls, *a, **kw: None))
+    r.lower, r.upper = np.full(6, -3.), np.full(6, 3.)
+    r.robot_description = '<robot/>'
+    s = acquisition.IntrinsicSession(r, None)
+    assert isinstance(s.closed_form, NumericIKViews)
+
+
+def test_views_are_added_while_sigma_is_above_its_limit():
+    from hand_eye_calibration import intrinsic_acquisition as acquisition
+    s = acquisition.IntrinsicSession.__new__(acquisition.IntrinsicSession)
+    s.main_count, s.max_main_count, s.initial_count = 20, 26, 8
+    updates, sampled = [], []
+    s.r = NS(max_position_sigma=.002, validation_views=5, update=lambda *a, **kw: updates.append(kw))
+    s.sample_main = lambda count, phase, reuse=False: sampled.append((count, phase, reuse))
+    sigmas = iter([.003, .0015])
+    s.fit = lambda full=False: {'uncertainty': {'worst_direction_sigma_m': next(sigmas)}}
+    report = s.add_views_for_sigma({'uncertainty': {'worst_direction_sigma_m': .004}})
+    assert sampled == [(2, 'refinement', True), (2, 'refinement', True)]
+    assert report['uncertainty']['worst_direction_sigma_m'] == .0015
+    assert updates[-1]['max_training_samples'] == 34
+    # Never beyond auto_max_training_samples main views.
+    sampled.clear()
+    s.fit = lambda full=False: {'uncertainty': {'worst_direction_sigma_m': .005}}
+    report = s.add_views_for_sigma({'uncertainty': {'worst_direction_sigma_m': .005}})
+    assert sum(count for count, *_ in sampled) == 6
+    # Already within the limit: nothing is added.
+    sampled.clear()
+    s.add_views_for_sigma({'uncertainty': {'worst_direction_sigma_m': .001}})
+    assert sampled == []

@@ -13,9 +13,14 @@ weakest singular value 3.41 -> 6.37 for 26 views, median relative rotation
 
 Kinematics only: MoveIt still plans and collision-checks each chosen view.
 Needs a 6R ortho-parallel chain to the effector (PiPER link6); otherwise
-``ClosedFormViews.create`` returns None and the caller keeps its sampler.
+``ClosedFormViews.create`` returns None. ``NumericIKViews`` then builds the same
+pool with a damped least-squares IK on the URDF chain (CRX: y/x joint axes have
+no closed form here). Without it the local sampler mostly rolled the CRX camera
+about its optical axis = J6 (21.10.: rotation RMS about flange x/y/z 15/4/10 deg,
+camera translation along J6 the weakest direction in every run).
 """
 import numpy as np
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 
 JOINT_LIMIT_MARGIN_RAD = 0.10
@@ -26,6 +31,12 @@ AIM_JITTER_M = 0.03
 BATCH = 5000
 MAX_CANDIDATES = 60000
 POOL_PER_VIEW = 3                    # feasible candidates wanted per requested view
+# Numeric pool: shell radius relative to the reference view (a large arm starts
+# farther than the PiPER range above), smaller batches as each IK costs ~ms.
+NUMERIC_DISTANCE_SCALE = (0.8, 1.15)
+NUMERIC_BATCH = 250
+NUMERIC_MAX_CANDIDATES = 5000
+NUMERIC_IK_TOLERANCE = (0.001, np.deg2rad(0.5))   # position m, rotation rad
 
 
 def translation_gain(rotations, candidate):
@@ -55,7 +66,7 @@ def look_at(position, aim, roll):
     return pose
 
 
-def shell_camera_poses(board, center, rng, count):
+def shell_camera_poses(board, center, rng, count, distance_range=DISTANCE_RANGE_M):
     """Camera poses (base frame) around ``center``, looking at it from above the board."""
     normal = board[:3, 2] if board[2, 2] >= 0 else -board[:3, 2]
     e1 = np.cross(normal, [1.0, 0.0, 0.0])
@@ -63,7 +74,7 @@ def shell_camera_poses(board, center, rng, count):
         e1 = np.cross(normal, [0.0, 1.0, 0.0])
     e1 /= np.linalg.norm(e1)
     e2 = np.cross(normal, e1)
-    distance = rng.uniform(*DISTANCE_RANGE_M, count)
+    distance = rng.uniform(*distance_range, count)
     elevation = np.deg2rad(rng.uniform(*ELEVATION_RANGE_DEG, count))
     azimuth = rng.uniform(0.0, 2 * np.pi, count)
     roll = np.deg2rad(rng.uniform(-ROLL_RANGE_DEG, ROLL_RANGE_DEG, count))
@@ -77,6 +88,14 @@ class ClosedFormViews:
     """Feasible view pool for one acquisition phase plus greedy selection."""
 
     label = 'closed-form IK'
+    batch = BATCH
+    max_candidates = MAX_CANDIDATES
+
+    def distance_range(self, reference, center):
+        return DISTANCE_RANGE_M
+
+    def solutions(self, effector, initial):
+        return self.ik.ik(effector)
 
     def __init__(self, ik, lower, upper, margin=JOINT_LIMIT_MARGIN_RAD):
         self.ik = ik
@@ -107,19 +126,20 @@ class ClosedFormViews:
         joint-limit margin; the branch nearest ``initial`` (the return pose)."""
         mount = np.linalg.inv(estimate)
         found, sampled = [], 0
-        while len(found) < wanted and sampled < MAX_CANDIDATES:
-            for camera in shell_camera_poses(board, center, rng, BATCH):
+        distance_range = self.distance_range(reference, center)
+        while len(found) < wanted and sampled < self.max_candidates:
+            for camera in shell_camera_poses(board, center, rng, self.batch, distance_range):
                 if np.linalg.norm(camera[:3, 3] - reference[:3, 3]) > max_excursion:
                     continue
                 if not framing.contains(np.linalg.inv(camera) @ board, margin=.13):
                     continue
                 effector = camera @ mount
-                solutions = [q for q in self.ik.ik(effector)
+                solutions = [q for q in self.solutions(effector, initial)
                              if np.all(q >= self.lower) and np.all(q <= self.upper)]
                 if solutions:
                     q = min(solutions, key=lambda q: np.max(np.abs(q - initial)))
                     found.append((q, effector))
-            sampled += BATCH
+            sampled += self.batch
             check()
         return found, sampled
 
@@ -134,3 +154,45 @@ class ClosedFormViews:
         scores = [weakest_observability(gram + translation_gain(rotations, effector[:3, :3]))
                   for _, effector in pool]
         return int(np.argmax(scores)) if scores else None
+
+
+class NumericIK:
+    """Damped least-squares IK on the URDF chain, seeded at ``seed`` (the return pose)."""
+
+    def __init__(self, fk, lower, upper):
+        self.fk = fk
+        self.lower = np.asarray(lower, float)
+        self.upper = np.asarray(upper, float)
+
+    def ik(self, pose, seed):
+        def residual(q):
+            actual = self.fk(q)
+            return np.r_[(actual[:3, 3] - pose[:3, 3]) / NUMERIC_IK_TOLERANCE[0],
+                         R.from_matrix(pose[:3, :3].T @ actual[:3, :3]).as_rotvec() / NUMERIC_IK_TOLERANCE[1]]
+        start = np.clip(seed, self.lower + 1e-8, self.upper - 1e-8)
+        fit = least_squares(residual, start, bounds=(self.lower, self.upper), max_nfev=60)
+        error = residual(fit.x)
+        return [fit.x] if np.linalg.norm(error[:3]) <= 1 and np.linalg.norm(error[3:]) <= 1 else []
+
+
+class NumericIKViews(ClosedFormViews):
+    """The closed-form pool and greedy selection for chains without a closed form.
+
+    One IK branch only: the solution nearest the seed (the return pose), so a
+    view never needs a wrist flip. The joint-limit margin bounds the solver.
+    """
+
+    label = 'numeric IK'
+    batch = NUMERIC_BATCH
+    max_candidates = NUMERIC_MAX_CANDIDATES
+
+    def __init__(self, effector_fk, lower, upper, margin=JOINT_LIMIT_MARGIN_RAD):
+        super().__init__(None, lower, upper, margin)
+        self.ik = NumericIK(effector_fk, self.lower, self.upper)
+
+    def distance_range(self, reference, center):
+        distance = float(np.linalg.norm(reference[:3, 3] - center))
+        return tuple(distance * scale for scale in NUMERIC_DISTANCE_SCALE)
+
+    def solutions(self, effector, initial):
+        return self.ik.ik(effector, initial)

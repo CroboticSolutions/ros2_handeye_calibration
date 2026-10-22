@@ -11,11 +11,13 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from .visibility import BoardFraming, CameraKinematics
-from .closed_form_views import ClosedFormViews, POOL_PER_VIEW
+from .closed_form_views import ClosedFormViews, NumericIKViews, POOL_PER_VIEW
 from .joint_space_views import JointSpaceViews
 from .bootstrap_calibration import _clear_samples, sample_pose
 from .motion_planning import SAMPLER_JOINT_MARGIN_RAD
 from . import intrinsic_solver as solver
+
+EXTRA_VIEW_BATCH = 2   # views per refit while position sigma is above its limit
 
 
 def pre_calibration_poses(initial, distance=.02, angle_degrees=12.):
@@ -57,19 +59,26 @@ class IntrinsicSession:
         # arbitrary 6-D targets are unreachable; views come from sampled joints instead.
         self.underactuated=sum(kind!='fixed' for _,_,kind,_ in getattr(self.fk,'chain',[(0,0,'revolute',0)]*6))<6
         # Main/validation views from a wide pool: closed-form IK for a 6-joint camera chain
-        # (closed_form_views), sampled joints + FK for a camera before the last joint
-        # (joint_space_views). None keeps the local random sampler (no closed form, no URDF).
+        # (closed_form_views), numeric IK on the URDF chain when it has no closed form (CRX),
+        # sampled joints + FK for a camera before the last joint (joint_space_views).
+        # None keeps the local random sampler (no URDF chain).
         self.closed_form=None
         if self.underactuated and hasattr(self.fk,'chain'):
             self.closed_form=JointSpaceViews(self.fk,runner.names,runner.lower,runner.upper)
-        elif not self.underactuated and getattr(runner,'robot_description',None):
-            self.closed_form=ClosedFormViews.create(
-                runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
-                runner.names,runner.lower,runner.upper,self.fk.camera)
+        elif not self.underactuated:
+            if getattr(runner,'robot_description',None):
+                self.closed_form=ClosedFormViews.create(
+                    runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
+                    runner.names,runner.lower,runner.upper,self.fk.camera)
+            if self.closed_form is None and hasattr(self.fk,'chain'):
+                self.closed_form=NumericIKViews(self.fk.camera,runner.lower,runner.upper)
+        self.pool_left={}
         self.initial=self.r.joint_positions().copy()
         self.views=[];self.validation=[];self.estimate=None;self.board=None
         self.attempts=0;self.rejections={}
         self.main_count=runner.min_training_samples
+        # Views added after the main set while position sigma is above its limit.
+        self.max_main_count=max(self.main_count,int(getattr(runner,'max_training_samples',self.main_count)))
         self.total=8+self.main_count+runner.validation_views
         self.rng=np.random.default_rng()
 
@@ -203,17 +212,22 @@ class IntrinsicSession:
         self.rejections['path_or_capture']=self.rejections.get('path_or_capture',0)+1
         return False,failures
 
-    def sample_closed_form(self, count, phase, reference, center):
-        """Greedy views from the closed-form pool; returns how many were captured."""
+    def sample_closed_form(self, count, phase, reference, center, reuse=False):
+        """Greedy views from the closed-form pool; returns how many were captured.
+
+        ``reuse`` continues the phase's remaining pool (views added for sigma)."""
         label=getattr(self.closed_form,'label','closed-form IK')
-        self.r.update('planning',f'Sampling {phase} views around the board with {label}.')
-        pool,sampled=self.closed_form.pool(self.board,center,self.estimate,self.r.framing,reference,
-                                           self.r.max_camera_excursion,self.initial,self.rng,
-                                           POOL_PER_VIEW*count,check=self.r.check)
-        message=f'{label[0].upper()+label[1:]}: {len(pool)} reachable, framed {phase} views of {sampled} sampled.'
-        self.r.update('planning',message,closed_form_pool=len(pool),closed_form_sampled=sampled)
-        if hasattr(self.n,'get_logger'):
-            self.n.get_logger().info(message)
+        pool=self.pool_left.get(phase) if reuse else None
+        if not pool:
+            self.r.update('planning',f'Sampling {phase} views around the board with {label}.',view_sampler=label)
+            pool,sampled=self.closed_form.pool(self.board,center,self.estimate,self.r.framing,reference,
+                                               self.r.max_camera_excursion,self.initial,self.rng,
+                                               POOL_PER_VIEW*count,check=self.r.check)
+            message=f'{label[0].upper()+label[1:]}: {len(pool)} reachable, framed {phase} views of {sampled} sampled.'
+            self.r.update('planning',message,closed_form_pool=len(pool),closed_form_sampled=sampled)
+            if hasattr(self.n,'get_logger'):
+                self.n.get_logger().info(message)
+        self.pool_left[phase]=pool
         collected=0;failures=0
         while collected<count and pool:
             self.r.check()
@@ -225,16 +239,25 @@ class IntrinsicSession:
                           planner_rejections=self.rejections)
         return collected
 
-    def sample_main(self, count, phase):
+    def local_sampler_warning(self, reason):
+        """Shown in the GUI: local views barely tilt the camera (weak hand-eye translation)."""
+        warning=(f'{reason}; using local random views (+-6 cm, tilt +-15 deg, roll +-35 deg). '
+                 'Expect a weakly observable camera translation (position sigma).')
+        self.r.update('planning',warning,view_sampler='local random',view_sampler_warning=warning)
+        if hasattr(self.n,'get_logger'):
+            self.n.get_logger().warning(warning)
+
+    def sample_main(self, count, phase, reuse=False):
         # Freeze the planning reference for the entire collection phase.
         reference=self.fk.camera(self.initial)@self.estimate
         center=(self.board@np.r_[self.r.framing.center,1])[:3]
         collected=0;tries=0;failures=0
         if self.closed_form is not None:
-            collected=self.sample_closed_form(count,phase,reference,center)
+            collected=self.sample_closed_form(count,phase,reference,center,reuse)
             if collected<count:
-                self.r.update('planning',f'View pool exhausted at {collected}/{count} {phase} views; '
-                              'continuing with local random views.')
+                self.local_sampler_warning(f'View pool exhausted at {collected}/{count} {phase} views')
+        else:
+            self.local_sampler_warning('No wide view pool for this robot chain')
         while collected<count and tries<count*20:
             self.r.check();tries+=1
             desired=random_camera_pose(reference,center,self.rng,np.array([.06,.06,.04]))
@@ -255,6 +278,33 @@ class IntrinsicSession:
         if collected<count:
             raise RuntimeError(f'Only {collected}/{count} {phase} views were collected; no calibration saved')
 
+    def add_views_for_sigma(self, report):
+        """Add refinement views (same frozen estimate) while position sigma exceeds its limit.
+
+        Pool views are picked for the weakest translation direction; at most
+        ``auto_max_training_samples`` main views. Returns the latest full fit."""
+        def sigma(report):
+            return (report.get('uncertainty') or {}).get('worst_direction_sigma_m')
+        added=0
+        while True:
+            value=sigma(report)
+            if value is None or value<=self.r.max_position_sigma:
+                return report
+            room=self.max_main_count-self.main_count-added
+            if room<=0:
+                return report
+            batch=min(EXTRA_VIEW_BATCH,room)
+            self.r.update('planning',f'Position sigma {value*1000:.2f} mm > {self.r.max_position_sigma*1000:.2f} mm; '
+                          f'adding {batch} views for the weakest direction '
+                          f'({self.main_count+added}/{self.max_main_count} main views).',
+                          position_sigma_m=value,
+                          target_samples=self.initial_count+self.main_count+added+batch,
+                          max_training_samples=self.initial_count+self.max_main_count,
+                          total=self.initial_count+self.main_count+added+batch+self.r.validation_views)
+            self.sample_main(batch,'refinement',reuse=True)
+            added+=batch
+            report=self.fit(full=True)
+
     def run(self):
         if self.n.solver_name!='intrinsic_pose':
             raise ValueError('Intrinsic acquisition requires solver:=intrinsic_pose')
@@ -262,13 +312,14 @@ class IntrinsicSession:
             raise ValueError('Center the board with 10% image margin before starting; no motion sent')
         _clear_samples(self.n)
         self.r.update('planning','Collecting diverse initial views with replacement candidates (up to 24).',strategy='intrinsic_staged',
-                      phase='bootstrap',target_samples=8+self.main_count,max_training_samples=8+self.main_count,
-                      total=self.total,required_validation_views=self.r.validation_views,validation_views=0,accepted=0)
+                      phase='bootstrap',target_samples=8+self.main_count,max_training_samples=8+self.max_main_count,
+                      total=self.total,required_validation_views=self.r.validation_views,validation_views=0,accepted=0,
+                      view_sampler=getattr(self.closed_form,'label','local random'),view_sampler_warning=None)
         self.sample_initial()
         self.initial_count=len(self.views)
         self.r.update('assessing','Solving the initial pose batch.',
                       target_samples=self.initial_count+self.main_count,
-                      max_training_samples=self.initial_count+self.main_count,
+                      max_training_samples=self.initial_count+self.max_main_count,
                       total=self.initial_count+self.main_count+self.r.validation_views)
         if self.initial_count<6:raise RuntimeError('Fewer than six pre-calibration poses captured; no calibration saved')
         report=self.fit()
@@ -279,6 +330,7 @@ class IntrinsicSession:
         self.r.update('planning','Initial joint estimate ready; collecting the main dataset without refitting or discarding views.',phase='refinement')
         self.sample_main(self.main_count,'refinement')
         report=self.fit(full=True)
+        report=self.add_views_for_sigma(report)
         quality=solver.evaluate(report,sigma_limit=self.r.max_position_sigma,min_samples=self.main_count)
         self.r.update('assessing',quality['summary'],validation=quality,
                       position_sigma_m=(report.get('uncertainty') or {}).get('worst_direction_sigma_m'))
