@@ -82,13 +82,13 @@ whether the robot's kinematic model, not the camera, limits accuracy.
   rotation and 10° span on a second principal rotation axis. Local candidate
   scoring rewards progress toward missing coverage. The initial fit must also
   pass consistency, bootstrap uncertainty and successive-estimate stability checks.
-- Training uses `auto_min_training_samples=20` through
+- Training uses `auto_min_training_samples=12` through
   `auto_max_training_samples=30`. Full quality is assessed every two additional
   training views; final acceptance thresholds are unchanged. An invalid maximum
   below the minimum fails at startup rather than silently changing it.
 - The common board pose comes from the joint pixel fit (or all-view consensus),
   never from the most recent single observation.
-- After training passes, freeze the estimate and collect `auto_validation_views=5`
+- After training passes, freeze the estimate and collect `auto_validation_views=3`
   independent held-out poses (minimum three). They never update the training fit.
   Frozen-prediction validation requires maximum board-centre error ≤4 mm and
   rotation error ≤3°, followed by the existing save acceptance gate.

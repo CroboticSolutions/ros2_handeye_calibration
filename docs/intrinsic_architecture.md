@@ -24,10 +24,14 @@ are not used. See `THIRD_PARTY_NOTICES.md` and `LICENSE.intrinsic`.
 4. With at least six successful initial captures and non-degenerate rotation
    information, compute the initial joint pose estimate. Reject it for planning
    if maximum pose error exceeds 10 mm or 6°.
-5. Freeze that planning estimate. Collect 20 main poses (`auto_min_training_samples`)
-   in a box of half-size 60/60/40 mm around the reference camera, looking at the
-   board centre plus uniform local XYZ tilts ±15°/±15°/±35°. Check image margin,
-   configured camera excursion, numerical IK, and the actual planned path.
+5. Freeze that planning estimate. Collect 12 main poses (`auto_min_training_samples`)
+   from the wide view pool (closed-form or numeric IK; the local box of half-size
+   60/60/40 mm with tilts ±15°/±15°/±35° only as a fallback). While bootstrap
+   position sigma exceeds its limit, add two views at a time up to
+   `auto_max_training_samples` (30). Offline on the 21.10. CRX scene (wide views,
+   noise at the measured 2.0 mm / 0.41° pose RMS): sigma 1.9 mm with 8 main views,
+   1.45 mm with 12, 1.1 mm with 20. Check image margin, configured camera
+   excursion, IK, and the actual planned path.
    Do not refit or discard views while collecting this batch.
 6. Solve all accepted initial and main pose pairs together. Shah initializes X/Y;
    SciPy least-squares optimizes their pose residual with squared loss and the
@@ -37,12 +41,12 @@ are not used. See `THIRD_PARTY_NOTICES.md` and `LICENSE.intrinsic`.
    pose RMS ≤3 mm / 1°, bootstrap position sigma ≤2 mm (configurable existing
    `auto_max_position_sigma_m` for automatic acquisition). These are our defaults,
    not claimed to be upstream universal thresholds.
-8. Freeze training and collect five additional independent views (minimum three).
+8. Freeze training and collect three additional independent views (the minimum).
    Their maximum prediction error must be ≤4 mm / 3°. They cannot affect training,
    initial values, weighting, bootstrap or model selection. Save reuses the cached
    training fit and evaluates the held-out views.
 
-Typically 28 training + 5 validation samples. Failed path candidates are resampled
+Typically 20 training + 3 validation samples (more training views only when sigma requires them). Failed path candidates are resampled
 within a finite candidate budget; three unsuccessful captures in succession stop
 collection. A failed run keeps raw evidence and does not replace the active file.
 Old calibration/TCP files are not applied or overwritten by installing this change.
