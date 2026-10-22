@@ -86,7 +86,7 @@ class AutomaticCalibration:
                        'accepted': 0, 'message': 'Position the camera to see the board, then Calibrate.'}
         for key, value in {'auto_enabled': False, 'auto_check_collisions': True, 'auto_group': '',
                            'auto_max_position_sigma_m': .002, 'auto_min_training_samples': 20, 'auto_max_training_samples': 30,
-                           'auto_controller': '', 'auto_validation_views': 5, 'intrinsic_return_to_base': True,
+                           'auto_controller': '', 'auto_validation_views': 5, 'intrinsic_return_to_base': False,
                            'auto_heartbeat_timeout_s': 0.0, 'auto_max_camera_excursion_m': 0.30}.items():
             node.declare_parameter(key, value)
         # Held-out views collected after the training set; never used in the fit.

@@ -53,6 +53,35 @@ def weakest_observability(gram):
     return float(np.sqrt(max(np.linalg.eigvalsh(gram)[0], 0.0)))
 
 
+def shortest_route(start, entries):
+    """``entries`` ([(joints, effector_pose)]) ordered as an open path from ``start``.
+
+    Nearest neighbour, then 2-opt, on the largest joint change (the joint that
+    sets the move duration). Views are picked for information first, so the
+    order changes only travel, not which views are measured."""
+    if len(entries) < 2:
+        return list(entries)
+    points = [np.asarray(start, float)] + [np.asarray(q, float) for q, _ in entries]
+    cost = lambda a, b: float(np.max(np.abs(points[a] - points[b])))
+    route, left = [0], set(range(1, len(points)))
+    while left:
+        nearest = min(left, key=lambda j: cost(route[-1], j))
+        route.append(nearest)
+        left.remove(nearest)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, len(route) - 1):
+            for k in range(i + 1, len(route)):
+                after = route[k + 1] if k + 1 < len(route) else None
+                old = cost(route[i - 1], route[i]) + (cost(route[k], after) if after is not None else 0.)
+                new = cost(route[i - 1], route[k]) + (cost(route[i], after) if after is not None else 0.)
+                if new < old - 1e-9:
+                    route[i:k + 1] = route[i:k + 1][::-1]
+                    improved = True
+    return [entries[j - 1] for j in route[1:]]
+
+
 def look_at(position, aim, roll):
     z = aim - position
     z /= np.linalg.norm(z)

@@ -178,7 +178,7 @@ def generate_launch_description():
             DeclareLaunchArgument('depth_topic', default_value='', description='Depth image for the depth calibration sweep (colour-aligned, or native with depth_info_topic)'),
             DeclareLaunchArgument('depth_info_topic', default_value='', description='CameraInfo of a native (not colour-aligned) depth_topic'),
             DeclareLaunchArgument('auto_max_position_sigma_m', default_value='0.002', description='Maximum bootstrap position uncertainty (1 sigma, metres) for automatic saving'),
-            DeclareLaunchArgument('intrinsic_return_to_base', default_value='true', description='Return along a planned path to the reference pose between captures'),
+            DeclareLaunchArgument('intrinsic_return_to_base', default_value='false', description='Return along a planned path to the reference pose between captures (Intrinsic dress-pack option; doubles motion)'),
             DeclareLaunchArgument('auto_validation_views', default_value='5', description='Held-out poses collected after training; never used in the solve'),
             DeclareLaunchArgument('auto_heartbeat_timeout_s', default_value='0.0', description='>0: stop automatic motion when the GUI heartbeat is silent this long (GUI passes 3)'),
             DeclareLaunchArgument('auto_max_camera_excursion_m', default_value='0.30', description='Maximum camera displacement of targeted views from the starting view'),

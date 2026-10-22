@@ -14,9 +14,13 @@ are not used. See `THIRD_PARTY_NOTICES.md` and `LICENSE.intrinsic`.
 2. Sample eight systematic flange poses: ±XYZ and two diagonal axes, with 20 mm
    translation and 12° rotation relative to the initial reference. Every move
    requires a timed, collision-checked MoveIt trajectory, including pre-calibration.
-3. After feedback settles, wait an additional interruptible second, then capture
-   a stationary time-synchronized burst. Default: return by a checked path to the
-   reference pose between captures (`intrinsic_return_to_base:=true`).
+3. After feedback settles (once, in the trajectory executor), capture a stationary
+   time-synchronized burst; no fixed extra wait (frames must start >= 50 ms after
+   the measured stop and pass `stationary_window_s` and the burst spread gate).
+   Views go straight from one to the next; selected views are visited along the
+   shortest joint route. Intrinsic's dress-pack option to return to the reference
+   pose between captures is off by default (`intrinsic_return_to_base:=false`);
+   one planned return follows the last view.
 4. With at least six successful initial captures and non-degenerate rotation
    information, compute the initial joint pose estimate. Reject it for planning
    if maximum pose error exceeds 10 mm or 6°.

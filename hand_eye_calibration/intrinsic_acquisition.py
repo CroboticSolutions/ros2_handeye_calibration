@@ -6,12 +6,11 @@ Adapted from Intrinsic sample_calibration_poses and collect_calibration_data.
 All physical moves use the existing guarded MoveIt/CAN executor. No unplanned
 pre-calibration moves, no previous camera TF, and no online outlier rejection.
 """
-import time
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from .visibility import BoardFraming, CameraKinematics
-from .closed_form_views import ClosedFormViews, NumericIKViews, POOL_PER_VIEW
+from .closed_form_views import ClosedFormViews, NumericIKViews, POOL_PER_VIEW, shortest_route
 from .joint_space_views import JointSpaceViews
 from .bootstrap_calibration import _clear_samples, sample_pose
 from .motion_planning import SAMPLER_JOINT_MARGIN_RAD
@@ -82,12 +81,6 @@ class IntrinsicSession:
         self.total=8+self.main_count+runner.validation_views
         self.rng=np.random.default_rng()
 
-    def pause(self):
-        end=time.monotonic()+1.
-        while time.monotonic()<end:
-            self.r.check();self.r.stop_event.wait(min(.1,max(0,end-time.monotonic())))
-        self.r.check()
-
     def ik(self, pose, nearest=False):
         current=self.r.joint_positions()
         def residual(q):
@@ -115,8 +108,9 @@ class IntrinsicSession:
         trajectory=self.r.planned_trajectory
         if trajectory is None:raise RuntimeError('A timed MoveIt trajectory is required; no motion sent')
         self.r.planned_trajectory=None
+        # move_planned settles at the trajectory end and stamps the stationary
+        # time that capture() requires; a second settle only added >= 0.8 s.
         self.r.move_planned(trajectory)
-        self.r.settle(np.asarray(trajectory.points[-1].positions,float))
         return True
 
     def collect(self, target, phase):
@@ -126,7 +120,9 @@ class IntrinsicSession:
         if not self.move(target):
             self.last_failure='planning'
             return False
-        self.pause()
+        # No fixed extra wait: capture() takes only frames >= 50 ms after the
+        # measured stop, checks stationary_window_s and the burst spread
+        # (mount-settling test 30.9.: no repeatable damping after 1-3 s).
         self.r.capture_role='validation' if phase=='validation' else 'training'
         try:
             captured=self.r.capture()
@@ -140,7 +136,9 @@ class IntrinsicSession:
                           initial_samples=min(len(self.views),self.initial_count if hasattr(self,'initial_count') else 8),
                           targeted_samples=max(0,len(self.views)-getattr(self,'initial_count',8)),
                           validation_views=len(self.validation),pose=len(self.views)+len(self.validation))
-        if getattr(self.r,'intrinsic_return_to_base',True):
+        # Intrinsic's dress-pack option; off by default: joint-space goals on the
+        # branch nearest the reference keep cable state per pose, and it doubled motion.
+        if getattr(self.r,'intrinsic_return_to_base',False):
             if not self.move(self.initial):
                 raise RuntimeError('No checked return path to the reference pose; robot stopped')
         return captured
@@ -230,13 +228,22 @@ class IntrinsicSession:
         self.pool_left[phase]=pool
         collected=0;failures=0
         while collected<count and pool:
-            self.r.check()
-            target,actual=pool.pop(ClosedFormViews.best(pool,[p[:3,:3] for p in self.views+self.validation]))
-            if self.duplicate(actual):continue
-            captured,failures=self.collected_or_failed(target,phase,failures)
-            collected+=int(captured)
-            self.r.update('planning',f'Collected {collected}/{count} {phase} views ({label}).',
-                          planner_rejections=self.rejections)
+            # Pick the missing views for information (greedy, as if all succeed),
+            # then visit them along the shortest joint route; failed views are
+            # replaced in the next round from the remaining pool.
+            rotations=[p[:3,:3] for p in self.views+self.validation]
+            batch=[]
+            while len(batch)<count-collected and pool:
+                self.r.check()
+                batch.append(pool.pop(ClosedFormViews.best(pool,rotations+[e[1][:3,:3] for e in batch])))
+            for target,actual in shortest_route(self.r.joint_positions(),batch):
+                self.r.check()
+                if collected>=count:break
+                if self.duplicate(actual):continue
+                captured,failures=self.collected_or_failed(target,phase,failures)
+                collected+=int(captured)
+                self.r.update('planning',f'Collected {collected}/{count} {phase} views ({label}).',
+                              planner_rejections=self.rejections)
         return collected
 
     def local_sampler_warning(self, reason):
@@ -305,6 +312,18 @@ class IntrinsicSession:
             added+=batch
             report=self.fit(full=True)
 
+    def return_to_reference(self):
+        """One planned return after the last view (no per-view returns by default)."""
+        if np.max(np.abs(self.r.joint_positions()-self.initial))<.003:
+            return
+        self.r.update('moving','All views collected; returning to the reference pose.')
+        if not self.move(self.initial):
+            # The data is complete; a missing path must not discard the calibration.
+            warning='No checked return path to the reference pose; the robot stays at the last view.'
+            self.r.update('planning',warning,return_warning=warning)
+            if hasattr(self.n,'get_logger'):
+                self.n.get_logger().warning(warning)
+
     def run(self):
         if self.n.solver_name!='intrinsic_pose':
             raise ValueError('Intrinsic acquisition requires solver:=intrinsic_pose')
@@ -338,6 +357,7 @@ class IntrinsicSession:
         self.estimate=solver.matrix(report['transform']);self.board=solver.matrix(report['board_in_base'])
         self.r.update('planning','Training frozen; collecting independent validation views.',phase='validation')
         self.sample_main(self.r.validation_views,'validation')
+        self.return_to_reference()
         ids=self.n.validation_indices()
         val=solver.metrics(np.array([solver.matrix(self.n.robot_samples[i]) for i in ids]),
                            np.array([solver.matrix(self.n.tracking_samples[i]) for i in ids]),self.estimate,self.board)

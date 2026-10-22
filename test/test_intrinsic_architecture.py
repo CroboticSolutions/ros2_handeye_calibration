@@ -63,7 +63,8 @@ def test_bootstrap_and_validation_use_same_pose_model():
     assert not solver.evaluate(report,require_validation=True)['passed']
 
 
-def test_staged_acquisition_collects_main_batch_without_online_refits(monkeypatch):
+@pytest.mark.parametrize('return_to_base', [False, True])
+def test_staged_acquisition_collects_main_batch_without_online_refits(monkeypatch, return_to_base):
     from types import SimpleNamespace
     from test_automatic_calibration import synthetic_sequence
     from hand_eye_calibration import intrinsic_acquisition as acquisition
@@ -74,7 +75,7 @@ def test_staged_acquisition_collects_main_batch_without_online_refits(monkeypatc
     monkeypatch.setattr(acquisition,'CameraKinematics',bootstrap_calibration.CameraKinematics)
     r.names=n.get_parameter('auto_joint_names').value
     r.lower=np.full(6,-3.);r.upper=np.full(6,3.)
-    r.max_camera_excursion=.3;r.max_position_sigma=.002;r.intrinsic_return_to_base=True
+    r.max_camera_excursion=.3;r.max_position_sigma=.002;r.intrinsic_return_to_base=return_to_base
     counts=[]
     def calibrate(full=False):
         ids=n.training_indices();counts.append(len(ids))
@@ -86,7 +87,6 @@ def test_staged_acquisition_collects_main_batch_without_online_refits(monkeypatc
     # The fixture's capture expects the current acquisition session.
     r.session=s
     s.rng=np.random.default_rng(1)
-    s.pause=lambda:None
     s.view_planner=None  # legacy virtual camera fixture metadata
     def simulated_move(target):
         start=r.joint_positions()
@@ -96,6 +96,7 @@ def test_staged_acquisition_collects_main_batch_without_online_refits(monkeypatc
     s.move=simulated_move
     s.run()
     assert counts==[8,28]  # no solve on each new targeted view, none on held-out views
+    np.testing.assert_allclose(r.joint_positions(),s.initial,atol=1e-9)  # back at the reference
     assert n.training_count()==28
     assert len(n.validation_indices())==5
     assert n._last_reprojection['rejected_views']==[]
@@ -212,3 +213,42 @@ def test_sampler_ik_keeps_targets_inside_joint_limits():
     target=np.eye(4);target[:3,3]=[.13,0,0]  # needs q0 = 1.3, past the limit
     q=s.ik(target,nearest=True)
     assert q[0]<=1.22-SAMPLER_JOINT_MARGIN_RAD+1e-9
+
+
+def test_move_settles_once_and_capture_has_no_fixed_pause_or_return():
+    """move_planned already settles; per-view returns are off by default."""
+    from unittest.mock import Mock
+    from types import SimpleNamespace
+    from hand_eye_calibration.intrinsic_acquisition import IntrinsicSession
+    s=IntrinsicSession.__new__(IntrinsicSession)
+    trajectory=SimpleNamespace(points=[SimpleNamespace(positions=[1.]*6)])
+    def plan(start,target):
+        s.r.planned_trajectory=trajectory
+        return [start,target]
+    s.r=SimpleNamespace(check=lambda:None,joint_positions=lambda:np.zeros(6),planned_trajectory=None,
+                        plan_joint_path=Mock(side_effect=plan),move_planned=Mock(),settle=Mock(),
+                        update=lambda *a,**kw:None,capture=lambda:False,stop_event=Mock())
+    s.views,s.validation,s.attempts=[],[],0
+    assert s.move(np.ones(6))
+    s.r.move_planned.assert_called_once_with(trajectory)
+    s.r.settle.assert_not_called()
+    s.r.plan_joint_path.reset_mock()
+    s.collect(np.ones(6),'refinement')
+    assert s.r.plan_joint_path.call_count==1      # no return to the reference
+    s.r.stop_event.wait.assert_not_called()      # no fixed wait before capture
+
+
+def test_return_to_reference_once_and_tolerates_a_missing_path():
+    from types import SimpleNamespace
+    from hand_eye_calibration.intrinsic_acquisition import IntrinsicSession
+    s=IntrinsicSession.__new__(IntrinsicSession)
+    s.initial=np.zeros(6);s.n=SimpleNamespace()
+    fields={}
+    s.r=SimpleNamespace(joint_positions=lambda:np.full(6,.5),update=lambda *a,**kw:fields.update(kw))
+    moves=[]
+    s.move=lambda target:moves.append(target) or False
+    s.return_to_reference()
+    assert len(moves)==1 and 'No checked return path' in fields['return_warning']
+    s.r.joint_positions=lambda:np.zeros(6)
+    s.return_to_reference()
+    assert len(moves)==1   # already at the reference

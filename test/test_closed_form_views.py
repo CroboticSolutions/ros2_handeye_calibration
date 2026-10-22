@@ -10,7 +10,8 @@ from scipy.spatial.transform import Rotation
 
 pytest.importorskip('hand_teleop.closed_form_ik')
 from hand_eye_calibration.closed_form_views import (  # noqa: E402
-    JOINT_LIMIT_MARGIN_RAD, NUMERIC_DISTANCE_SCALE, ClosedFormViews, NumericIKViews, weakest_observability)
+    JOINT_LIMIT_MARGIN_RAD, NUMERIC_DISTANCE_SCALE, ClosedFormViews, NumericIKViews, shortest_route,
+    weakest_observability)
 from hand_eye_calibration.visibility import BoardFraming, CameraKinematics  # noqa: E402
 
 URDF = (Path(__file__).resolve().parents[3] / 'robots/piper_ros/src/robot_description/'
@@ -99,7 +100,7 @@ def test_sample_main_uses_pool_then_falls_back(monkeypatch):
     s.underactuated, s.n = False, NS()
     s.fk = NS(camera=lambda q: np.eye(4))
     updates, fields = [], {}
-    s.r = NS(check=lambda: None,
+    s.r = NS(check=lambda: None, joint_positions=lambda: np.zeros(6),
              update=lambda *a, **kw: updates.append(a[1] if len(a) > 1 else '') or fields.update(kw),
              framing=NS(center=np.zeros(3), contains=lambda *a, **kw: True), max_camera_excursion=.3)
     poses = [np.eye(4) for _ in range(2)]
@@ -193,3 +194,43 @@ def test_views_are_added_while_sigma_is_above_its_limit():
     sampled.clear()
     s.add_views_for_sigma({'uncertainty': {'worst_direction_sigma_m': .001}})
     assert sampled == []
+
+
+def test_shortest_route_keeps_views_and_shortens_travel():
+    rng = np.random.default_rng(4)
+    entries = [(rng.uniform(-1, 1, 6), np.eye(4)) for _ in range(20)]
+    start = np.zeros(6)
+    route = shortest_route(start, entries)
+    assert sorted(id(e) for e in route) == sorted(id(e) for e in entries)   # same views, reordered
+
+    def travel(order):
+        points = [start] + [q for q, _ in order]
+        return sum(np.max(np.abs(b - a)) for a, b in zip(points, points[1:]))
+    assert travel(route) < 0.8 * travel(entries)   # random 6-D views: ~29 % shorter
+    # A line of views is visited in order from the nearer end.
+    line = [(np.full(6, x), np.eye(4)) for x in (.3, .1, .4, .2)]
+    assert [q[0] for q, _ in shortest_route(np.zeros(6), line)] == [.1, .2, .3, .4]
+    assert shortest_route(start, entries[:1]) == entries[:1]
+
+
+def test_selected_views_are_visited_along_the_shortest_route():
+    from hand_eye_calibration import intrinsic_acquisition as acquisition
+    s = acquisition.IntrinsicSession.__new__(acquisition.IntrinsicSession)
+    s.views, s.validation, s.rejections, s.pool_left = [], [], {}, {}
+    s.initial, s.estimate, s.board, s.rng = np.zeros(6), np.eye(4), np.eye(4), np.random.default_rng(0)
+    s.n = NS()
+    s.r = NS(check=lambda: None, joint_positions=lambda: np.zeros(6), update=lambda *a, **kw: None,
+             framing=NS(center=np.zeros(3)), max_camera_excursion=.3)
+    poses = []
+    for axis, angle in (('x', 40), ('y', 35), ('z', 30)):
+        p = np.eye(4)
+        p[:3, :3] = Rotation.from_euler(axis, angle, degrees=True).as_matrix()
+        poses.append(p)
+    # Joint distance from zero grows with the index; information order differs.
+    pool = [(np.full(6, .1 * (i + 1)), p) for i, p in enumerate(poses)]
+    s.closed_form = NS(pool=lambda *a, **kw: (list(pool), 100))
+    visited = []
+    s.duplicate = lambda actual: False
+    s.collected_or_failed = lambda target, phase, failures: (visited.append(target[0]) or True, 0)
+    assert s.sample_closed_form(3, 'refinement', np.eye(4), np.zeros(3)) == 3
+    assert visited == pytest.approx([.1, .2, .3])
