@@ -11,7 +11,7 @@ from scipy.spatial.transform import Rotation
 pytest.importorskip('hand_teleop.closed_form_ik')
 from hand_eye_calibration.closed_form_views import (  # noqa: E402
     JOINT_LIMIT_MARGIN_RAD, NUMERIC_DISTANCE_SCALE, NUMERIC_JOINT_WINDOW_RAD, WRIST_CLEAR_RAD,
-    ClosedFormViews, NumericIKViews, shortest_route, weakest_observability)
+    AnalyticIKViews, ClosedFormViews, NumericIKViews, shortest_route, weakest_observability)
 from hand_eye_calibration.visibility import BoardFraming, CameraKinematics  # noqa: E402
 
 URDF = (Path(__file__).resolve().parents[3] / 'robots/piper_ros/src/robot_description/'
@@ -259,3 +259,50 @@ def test_window_bounds_keep_the_wrist_side_and_the_limit_margin():
     assert lo[4] < 0 < hi[4]                                    # near 0: no side imposed
     lo, hi = views.window_bounds(np.array([0., 0., 0., 0., 0.8, 0.]))
     assert lo[4] == pytest.approx(WRIST_CLEAR_RAD)
+
+
+CRX_URDF = Path(__file__).resolve().parents[3] / 'perception/hand_teleop/tests/data/crx10ia_l.urdf'
+CRX_NAMES = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6']
+
+
+def test_analytic_views_on_the_crx_give_exact_in_window_solutions():
+    pytest.importorskip('ssik')
+    urdf = CRX_URDF.read_text()
+    root = ET.fromstring(urdf)
+    fk = CameraKinematics(root, 'base_link', 'flange', CRX_NAMES, np.eye(4))
+    limits = [root.find(f"joint[@name='{n}']/limit") for n in CRX_NAMES]
+    lower = np.array([float(x.get('lower')) for x in limits])
+    upper = np.array([float(x.get('upper')) for x in limits])
+    assert ClosedFormViews.create(urdf, 'base_link', 'flange', CRX_NAMES, lower, upper, fk.camera) is None
+    views = AnalyticIKViews.create(urdf, 'base_link', 'flange', CRX_NAMES, lower, upper, fk.camera)
+    assert views is not None
+    q0 = np.array([0., .3, -.4, 0., -.9, 0.])
+    views.lower, views.upper = views.window_bounds(q0)
+    target = fk.camera(q0 + np.r_[.2, -.1, .1, .3, .2, -.4])
+    solutions = views.solutions(target, q0)
+    assert solutions
+    for q in solutions:
+        np.testing.assert_allclose(fk.camera(q), target, atol=1e-6)
+    inside = [q for q in solutions if np.all(q >= views.lower) and np.all(q <= views.upper)]
+    assert len(inside) == 1                              # the window holds one branch here
+    np.testing.assert_allclose(inside[0], q0 + np.r_[.2, -.1, .1, .3, .2, -.4], atol=1e-6)
+    # Another chain (or a different effector FK) is refused.
+    assert AnalyticIKViews.create(urdf, 'base_link', 'flange', CRX_NAMES, lower, upper,
+                                  lambda q: np.eye(4)) is None
+
+
+def test_session_prefers_analytic_views_over_numeric(monkeypatch):
+    from hand_eye_calibration import intrinsic_acquisition as acquisition
+    from test_automatic_calibration import synthetic_sequence
+    from hand_eye_calibration import bootstrap_calibration
+    r, n, _ = synthetic_sequence(monkeypatch)
+    r.names = n.get_parameter('auto_joint_names').value
+    chain = [(np.eye(4), np.array([0., 1., 0.]), 'revolute', name) for name in r.names]
+    monkeypatch.setattr(acquisition, 'CameraKinematics',
+                        lambda *a: NS(chain=chain, camera=bootstrap_calibration.CameraKinematics(*a).camera))
+    monkeypatch.setattr(ClosedFormViews, 'create', classmethod(lambda cls, *a, **kw: None))
+    sentinel = object()
+    monkeypatch.setattr(AnalyticIKViews, 'create', classmethod(lambda cls, *a, **kw: sentinel))
+    r.lower, r.upper = np.full(6, -3.), np.full(6, 3.)
+    r.robot_description = '<robot/>'
+    assert acquisition.IntrinsicSession(r, None).closed_form is sentinel

@@ -262,3 +262,38 @@ class NumericIKViews(ClosedFormViews):
 
     def solutions(self, effector, initial):
         return self.ik.ik(effector, initial)
+
+
+class AnalyticIKViews(NumericIKViews):
+    """NumericIKViews pool and joint window with every IK branch from ssik
+    (hand_teleop.analytic_ik.AnalyticIK) instead of one bounded numeric solve.
+
+    Offline on the 21.10. CRX scenes the selected views equal the numeric ones
+    (the window holds one branch); the pool builds in 0.3-0.5 s instead of 1.7-3.2 s.
+    """
+
+    label = 'analytic IK (ssik)'
+
+    def __init__(self, analytic, effector_fk, lower, upper, margin=JOINT_LIMIT_MARGIN_RAD):
+        super().__init__(effector_fk, lower, upper, margin)
+        self.analytic = analytic
+
+    @classmethod
+    def create(cls, urdf, base, effector, names, lower, upper, effector_fk):
+        """Planner, or None without ssik or when the chain disagrees with ``effector_fk``."""
+        if not urdf:
+            return None
+        try:
+            from hand_teleop.analytic_ik import AnalyticIK
+        except ImportError:
+            return None
+        analytic = AnalyticIK.from_urdf(urdf, base, effector)
+        if analytic is None or list(analytic.joint_names) != list(names):
+            return None
+        probe = (np.asarray(lower, float) + np.asarray(upper, float)) / 2
+        if not np.allclose(analytic.fk(probe), effector_fk(probe), atol=1e-6):
+            return None
+        return cls(analytic, effector_fk, lower, upper)
+
+    def solutions(self, effector, initial):
+        return self.analytic.ik(effector)

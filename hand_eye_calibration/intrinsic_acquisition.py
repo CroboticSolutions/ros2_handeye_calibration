@@ -10,7 +10,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from .visibility import BoardFraming, CameraKinematics
-from .closed_form_views import ClosedFormViews, NumericIKViews, POOL_PER_VIEW, shortest_route
+from .closed_form_views import AnalyticIKViews, ClosedFormViews, NumericIKViews, POOL_PER_VIEW, shortest_route
 from .joint_space_views import JointSpaceViews
 from .bootstrap_calibration import _clear_samples, sample_pose
 from .motion_planning import SAMPLER_JOINT_MARGIN_RAD
@@ -58,17 +58,21 @@ class IntrinsicSession:
         # arbitrary 6-D targets are unreachable; views come from sampled joints instead.
         self.underactuated=sum(kind!='fixed' for _,_,kind,_ in getattr(self.fk,'chain',[(0,0,'revolute',0)]*6))<6
         # Main/validation views from a wide pool: closed-form IK for a 6-joint camera chain
-        # (closed_form_views), numeric IK on the URDF chain when it has no closed form (CRX),
-        # sampled joints + FK for a camera before the last joint (joint_space_views).
+        # (closed_form_views), every ssik branch when it has no closed form (CRX), numeric
+        # IK on the URDF chain without ssik, sampled joints + FK for a camera before the
+        # last joint (joint_space_views).
         # None keeps the local random sampler (no URDF chain).
         self.closed_form=None
         if self.underactuated and hasattr(self.fk,'chain'):
             self.closed_form=JointSpaceViews(self.fk,runner.names,runner.lower,runner.upper)
         elif not self.underactuated:
             if getattr(runner,'robot_description',None):
-                self.closed_form=ClosedFormViews.create(
-                    runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
-                    runner.names,runner.lower,runner.upper,self.fk.camera)
+                for views in (ClosedFormViews,AnalyticIKViews):
+                    self.closed_form=views.create(
+                        runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
+                        runner.names,runner.lower,runner.upper,self.fk.camera)
+                    if self.closed_form is not None:
+                        break
             if self.closed_form is None and hasattr(self.fk,'chain'):
                 self.closed_form=NumericIKViews(self.fk.camera,runner.lower,runner.upper)
         self.pool_left={}
