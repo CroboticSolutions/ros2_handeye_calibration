@@ -38,7 +38,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from rclpy.time import Duration
 from geometry_msgs.msg import Transform
-from std_msgs.msg import Float64, String
+from std_msgs.msg import Bool, Float64, String
 from std_srvs.srv import Trigger
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -202,6 +202,11 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         self.status_pub = self.create_publisher(String, mname + "/status", status_qos)
         self.create_subscription(Float64, mname + '/from_gui/nominal_neck_angle',
                                  self._nominal_neck_cb, 10, callback_group=self._callback_group)
+        # Orientation only: tool axis from the alignment round without a tip round;
+        # the position is chosen at Apply (manual entry or the active TCP).
+        self.orientation_only = False
+        self.create_subscription(Bool, mname + '/from_gui/orientation_only',
+                                 self._orientation_only_cb, 10, callback_group=self._callback_group)
 
         self.tf_buffer = Buffer()
         self._listener = TransformListener(self.tf_buffer, self)
@@ -245,7 +250,10 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
 
     def _current_mode(self):
         """Derive the mode from state: 'axis' once the operator engages the
-        alignment round in any way, otherwise 'position'."""
+        alignment round in any way, otherwise 'position'. The GUI's orientation-only
+        switch makes it 'orientation'."""
+        if self.orientation_only:
+            return "orientation"
         if (
             self.samples[ALIGN_ROUND]
             or self.active_round == ALIGN_ROUND
@@ -285,6 +293,7 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         status['reorientation'] = {**self.motion.state, 'next_index': self.reorient_index,
                                    'targets': 6}
         status['charuco'] = self._charuco_status()
+        status['orientation_only'] = self.orientation_only
         status['rotation_check'] = self._rotation_check_status()
         # Save stays possible with a fit: the node then writes the active file
         # only if acceptance passes, otherwise a .rejected.yaml candidate + dataset.
@@ -292,6 +301,12 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         msg.data = status_to_json(status)
         self.status_pub.publish(msg)
         return tip_pivot, status
+
+    def _orientation_only_cb(self, msg):
+        if bool(msg.data) != self.orientation_only:
+            self.orientation_only = bool(msg.data)
+            self.axis_result = None
+        self._publish_status()
 
     def _nominal_neck_cb(self, msg):
         value = float(msg.data)
@@ -320,7 +335,8 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         return tcp_quality.evaluate(
             tip_pivot, tcp_quality.rotation_spans_deg(self.samples[TIP_ROUND]), validation_result,
             axis=self.axis_result, axis_mode=self._current_mode() == 'axis',
-            cad_deviation=self._cad_deviation(), limits=self.acceptance_limits)
+            cad_deviation=self._cad_deviation(), limits=self.acceptance_limits,
+            orientation_only=self.orientation_only)
 
     def _current_joints(self):
         joints = self.motion.joints
@@ -544,7 +560,7 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
     def compute_axis_cb(self, req: Trigger.Request, resp: Trigger.Response):
         tip_pivot = self._compute_round(TIP_ROUND)
         align_samples = self.samples[ALIGN_ROUND]
-        if tip_pivot is None:
+        if tip_pivot is None and not self.orientation_only:
             self.axis_result = None
             self._publish_status()
             resp.success = False
@@ -566,7 +582,8 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             self.axis_result = PivotCalibrationBackend.compute_axis_from_alignment(
                 alignment_samples=align_samples,
                 spike_axis_base=self.spike_axis_base,
-                tip_translation=tip_pivot["tcp_translation"],
+                tip_translation=None if tip_pivot is None else tip_pivot["tcp_translation"],
+                tool_toward_spike=True,
             )
         except ValueError as ex:
             self.axis_result = None
@@ -647,6 +664,8 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
     def save_calibration_cb(self, req: Trigger.Request, resp: Trigger.Response):
         if self.active_round == CHARUCO_ROUND:
             return self.cto_save_cb(req, resp)
+        if self.orientation_only:
+            return self._save_orientation_only(resp)
         tip_pivot, status = self._publish_status()
         if tip_pivot is None:
             resp.success = False
@@ -703,6 +722,8 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
                 'flange_axis': [float(v) for v in self.flange_axis],
                 'robot_firmware_version': self.robot_firmware_version,
                 'calibration_mode': mode,
+                # What this file measured; Apply takes the rest from the active TCP.
+                'tcp_components': ['position'] if mode == 'position' else ['position', 'orientation'],
                 'sample_count': len(self.samples[TIP_ROUND]),
                 'condition_number': tip_pivot['condition_number'],
                 'rms_residual_m': tip_pivot['rms_residual_m'],
@@ -812,6 +833,72 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             )
         except Exception as e:
             self.get_logger().error(f"Failed to save TCP calibration: {e}")
+            resp.success = False
+            resp.message = str(e)
+        return resp
+
+    def _save_orientation_only(self, resp):
+        """Tool axis without a tip round: tcp_components [orientation]; the translation
+        in `transform` is zero and unused (Apply takes the position from a manual entry
+        or the active TCP)."""
+        _tip, status = self._publish_status()
+        if self.axis_result is None:
+            resp.success = False
+            resp.message = ('Orientation only: capture alignment pose(s) and press "Compute axis" '
+                            'before saving.')
+            return resp
+        acceptance = status['acceptance']
+        a = self.axis_result
+        q = a['quaternion']
+        cal_file = os.path.expanduser(str(self.get_parameter('calibration_file').value))
+        try:
+            data = {
+                'parent_frame': self.robot_flange_frame,
+                'tcp_name': self.tcp_name,
+                'robot_base_frame': self.robot_base_frame,
+                'robot_flange_frame': self.robot_flange_frame,
+                'flange_axis': [float(v) for v in self.flange_axis],
+                'robot_firmware_version': self.robot_firmware_version,
+                'calibration_mode': 'orientation',
+                'tcp_components': ['orientation'],
+                'sample_count': 0,
+                'axis_calibration': {
+                    'method': 'align_to_spike',
+                    'axis_dir_flange_frame': a['axis_dir'],
+                    'spike_axis_base_frame': a.get('spike_axis_base'),
+                    'alignment_spread_deg': a.get('alignment_spread_deg'),
+                    'alignment_sample_count': a.get('sample_count'),
+                    'sign': 'tool points at the spike (+Z = -spike axis)',
+                    'roll_convention': a.get('roll_convention', 'legacy_flange_x'),
+                    'cad_axis_angle_deg': self.cad_axis_angle_deg,
+                    'cad_axis_deviation_deg': self._cad_deviation(),
+                },
+                'raw_samples': {
+                    'axis_alignment': self.samples[ALIGN_ROUND],
+                    'axis_alignment_capture_metadata': self.sample_metadata[ALIGN_ROUND],
+                    'joint_names': list(self.motion.names or []),
+                },
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'transform': {'tx': 0.0, 'ty': 0.0, 'tz': 0.0,
+                              'qx': q[0], 'qy': q[1], 'qz': q[2], 'qw': q[3]},
+                'acceptance': acceptance,
+            }
+            run_dir = self._write_dataset(data)
+            data['dataset_path'] = run_dir
+            accepted = acceptance['passed'] or self.acceptance_mode == 'warn'
+            target = cal_file if accepted else cal_file + '.rejected.yaml'
+            self._write_yaml_atomic(target, data, keep_previous=accepted)
+            if not accepted:
+                resp.success = False
+                resp.message = (f"Acceptance failed; active TCP unchanged. {acceptance['summary']} "
+                                f"Candidate: {target}; dataset: {run_dir}")
+                return resp
+            warning = '' if acceptance['passed'] else f" WARNING (acceptance_mode=warn): {acceptance['summary']}"
+            resp.success = True
+            resp.message = (f"Saved tool orientation (no position) to {cal_file}.{warning} "
+                            "Apply takes the position from the manual entry or the active TCP.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save TCP orientation: {e}")
             resp.success = False
             resp.message = str(e)
         return resp

@@ -71,8 +71,7 @@ def test_staged_acquisition_collects_main_batch_without_online_refits(monkeypatc
     r,n,_=synthetic_sequence(monkeypatch)
     n.solver_name='intrinsic_pose'
     n.validation_indices=lambda:[i for i,role in enumerate(n.sample_roles) if role=='validation']
-    from hand_eye_calibration import bootstrap_calibration
-    monkeypatch.setattr(acquisition,'CameraKinematics',bootstrap_calibration.CameraKinematics)
+    monkeypatch.setattr(acquisition,'CameraKinematics',r.fake_kinematics)
     r.names=n.get_parameter('auto_joint_names').value
     r.lower=np.full(6,-3.);r.upper=np.full(6,3.)
     r.max_camera_excursion=.3;r.max_position_sigma=.002;r.intrinsic_return_to_base=return_to_base
@@ -121,10 +120,9 @@ def test_initial_visibility_uses_real_runner_observation_path(monkeypatch):
     from builtin_interfaces.msg import Time
     from hand_eye_calibration.automatic_calibration import AutomaticCalibration
     from hand_eye_calibration import intrinsic_acquisition as acquisition
-    from hand_eye_calibration import bootstrap_calibration
     from test_automatic_calibration import synthetic_sequence
     r,n,_=synthetic_sequence(monkeypatch)
-    monkeypatch.setattr(acquisition,'CameraKinematics',bootstrap_calibration.CameraKinematics)
+    monkeypatch.setattr(acquisition,'CameraKinematics',r.fake_kinematics)
     r.names=n.get_parameter('auto_joint_names').value
     board=r.observed_board(recovering=True)
     n.tracking_marker_frame='board'

@@ -87,7 +87,10 @@ class AutomaticCalibration:
         for key, value in {'auto_enabled': False, 'auto_check_collisions': True, 'auto_group': '',
                            'auto_max_position_sigma_m': .002, 'auto_min_training_samples': 12, 'auto_max_training_samples': 30,
                            'auto_controller': '', 'auto_validation_views': 3, 'intrinsic_return_to_base': False,
-                           'auto_heartbeat_timeout_s': 0.0, 'auto_max_camera_excursion_m': 0.30}.items():
+                           'auto_heartbeat_timeout_s': 0.0, 'auto_max_camera_excursion_m': 0.30,
+                           'auto_max_view_tilt_deg': 35.0, 'auto_max_view_roll_deg': 45.0,
+                           'auto_max_arm_joint_change_deg': 45.0, 'auto_max_wrist_joint_change_deg': 60.0,
+                           'auto_view_motion_tolerance': 0.0}.items():
             node.declare_parameter(key, value)
         # Held-out views collected after the training set; never used in the fit.
         self.intrinsic_return_to_base = bool(node.get_parameter('intrinsic_return_to_base').value)
@@ -251,6 +254,20 @@ class AutomaticCalibration:
                              'rebuild the calibration package and restart the collector to update launch defaults.')
         if not np.isfinite(max_position_sigma) or max_position_sigma <= 0:
             raise ValueError('Invalid automatic calibration quality limits.')
+        # Main-view limits relative to the start view, the same on every robot (view_pool).
+        from .view_pool import ViewLimits
+        view_limits = ViewLimits(
+            max_tilt_deg=float(node.get_parameter('auto_max_view_tilt_deg').value),
+            max_roll_deg=float(node.get_parameter('auto_max_view_roll_deg').value),
+            max_arm_joint_change_deg=float(node.get_parameter('auto_max_arm_joint_change_deg').value),
+            max_wrist_joint_change_deg=float(node.get_parameter('auto_max_wrist_joint_change_deg').value),
+            selection_tolerance=float(node.get_parameter('auto_view_motion_tolerance').value))
+        if (not all(np.isfinite(v) and v > 0 for v in (view_limits.max_tilt_deg, view_limits.max_roll_deg,
+                                                     view_limits.max_arm_joint_change_deg,
+                                                     view_limits.max_wrist_joint_change_deg))
+                or not 0 <= view_limits.selection_tolerance < 1):
+            raise ValueError('Invalid automatic calibration view limits.')
+        self.view_limits = view_limits
         self.validation_views, self.max_camera_excursion = validation_views, max_camera_excursion
         self.max_position_sigma = max_position_sigma
         self.min_training_samples, self.max_training_samples = min_training_samples, max_training_samples
@@ -650,12 +667,8 @@ class AutomaticCalibration:
             if not self.collision_free_path(initial, initial):
                 raise RuntimeError('Current robot pose is in collision in the MoveIt scene; no motion was sent.')
             self.settle(initial)
-            if n.solver_name == 'intrinsic_pose':
-                from .intrinsic_acquisition import IntrinsicSession
-                self.session = IntrinsicSession(self, root)
-            else:
-                from .bootstrap_calibration import BootstrapSession
-                self.session = BootstrapSession(self, root)
+            from .intrinsic_acquisition import IntrinsicSession
+            self.session = IntrinsicSession(self, root)
             self.session.run()
             self.check()
             self.update('saving', 'Uncertainty passed; checking held-out views and saving.')

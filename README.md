@@ -1,7 +1,8 @@
 > **Default calibration architecture (2026-10-01):** Intrinsic-style staged acquisition
 > and Shah + joint pose optimization. See [architecture and operation](docs/intrinsic_architecture.md)
-> and [upstream attribution](THIRD_PARTY_NOTICES.md). Older reprojection/AX=XB
-> documentation below describes explicitly selectable legacy modes.
+> and [upstream attribution](THIRD_PARTY_NOTICES.md). The older online reprojection/AX=XB
+> modes described below were removed (2026-11-05); the reprojection solve remains offline
+> (`handeye_offline_solve`).
 
 # ROS2 hand-eye calibration
 This is a minimal ROS2 port of the functionality in the easy_handeye calibration package. The original README can be found below.

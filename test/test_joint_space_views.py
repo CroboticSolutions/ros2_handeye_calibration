@@ -8,9 +8,10 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from hand_eye_calibration.closed_form_views import DISTANCE_RANGE_M, ClosedFormViews, weakest_observability
 from hand_eye_calibration.joint_space_views import JointSpaceViews
 from hand_eye_calibration.motion_planning import SAMPLER_JOINT_MARGIN_RAD
+from hand_eye_calibration.view_pool import (DISTANCE_SCALE, ViewLimits, select_view, tilt_and_roll,
+                                            weakest_observability)
 from hand_eye_calibration.visibility import BoardFraming, CameraKinematics
 
 URDF = (Path(__file__).resolve().parents[3] / 'robots/piper_ros/src/robot_description/'
@@ -69,7 +70,15 @@ def test_pool_views_are_framed_and_clear_of_limits(scene):
         camera = effector @ MOUNT
         assert scene.framing.contains(np.linalg.inv(camera) @ BOARD, margin=.13)
         assert np.linalg.norm(camera[:3, 3] - scene.reference[:3, 3]) <= 0.30
-        assert DISTANCE_RANGE_M[0] <= np.linalg.norm(camera[:3, 3] - scene.center) <= DISTANCE_RANGE_M[1]
+        distance = np.linalg.norm(scene.reference[:3, 3] - scene.center)
+        r = np.linalg.norm(camera[:3, 3] - scene.center)
+        assert DISTANCE_SCALE[0] * distance - 1e-9 <= r <= DISTANCE_SCALE[1] * distance + 1e-9
+        limits = ViewLimits()
+        assert np.all(np.abs(q - INITIAL)[:3] <= np.deg2rad(limits.max_arm_joint_change_deg) + 1e-9)
+        assert np.all(np.abs(q - INITIAL)[3:] <= np.deg2rad(limits.max_wrist_joint_change_deg) + 1e-9)
+        tilt, roll = tilt_and_roll(scene.reference, camera[None])
+        assert tilt[0] <= np.deg2rad(limits.max_tilt_deg) + 1e-9
+        assert abs(roll[0]) <= np.deg2rad(limits.max_roll_deg) + 1e-9
 
 
 def test_greedy_views_are_more_diverse_than_the_captured_run(scene):
@@ -77,7 +86,7 @@ def test_greedy_views_are_more_diverse_than_the_captured_run(scene):
     pool = list(scene.pool)
     chosen = [scene.fk.camera(INITIAL)[:3, :3]]
     for _ in range(19):
-        chosen.append(pool.pop(ClosedFormViews.best(pool, chosen))[1][:3, :3])
+        chosen.append(pool.pop(select_view(pool, chosen))[1][:3, :3])
     assert weakest_observability(gram(chosen)) > 3.
     relative = [np.degrees(Rotation.from_matrix(a.T @ b).magnitude()) for a, b in itertools.combinations(chosen, 2)]
     assert np.median(relative) > 20
@@ -93,4 +102,4 @@ def test_link5_session_uses_the_joint_space_pool(scene):
                 min_training_samples=20, validation_views=5)
     session = IntrinsicSession(runner, scene.root)
     assert session.underactuated
-    assert isinstance(session.closed_form, JointSpaceViews)
+    assert isinstance(session.view_pool, JointSpaceViews)

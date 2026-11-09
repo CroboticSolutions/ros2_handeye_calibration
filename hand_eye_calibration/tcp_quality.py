@@ -128,10 +128,14 @@ def _check(name, value, limit, ok, detail):
     return {'name': name, 'value': value, 'limit': limit, 'passed': bool(ok), 'detail': detail}
 
 
-def evaluate(pivot, spans, validation, axis=None, axis_mode=False, cad_deviation=None, limits=None):
+def evaluate(pivot, spans, validation, axis=None, axis_mode=False, cad_deviation=None, limits=None,
+             orientation_only=False):
     # cad_deviation is accepted for callers but never gates: it is reported only.
+    # orientation_only: only the alignment checks (no tip round, no validation touches).
     limits = {**DEFAULT_LIMITS, **(limits or {})}
     checks = []
+    if orientation_only:
+        return _verdict(_align_checks(axis, limits), limits)
     n = 0 if pivot is None else len(pivot.get('per_sample_residuals_m') or [])
     checks.append(_check('sample_count', n, limits['min_samples'], n >= limits['min_samples'], 'tip touches'))
     second = spans[1] if spans else 0.0
@@ -153,14 +157,24 @@ def evaluate(pivot, spans, validation, axis=None, axis_mode=False, cad_deviation
         checks.append(_check('validation_max_m', worst, limits['max_validation_m'],
                              worst is not None and worst <= limits['max_validation_m'], 'tip stays on the spike'))
     if axis_mode:
-        k = 0 if axis is None else int(axis.get('sample_count') or 0)
-        checks.append(_check('align_samples', k, limits['min_align_samples'], k >= limits['min_align_samples'],
-                             'alignments to the spike direction'))
-        if axis is not None:
-            spread = axis.get('alignment_spread_deg')
-            checks.append(_check('align_spread_deg', spread, limits['max_align_spread_deg'],
-                                 spread is not None and spread <= limits['max_align_spread_deg'],
-                                 'agreement between alignments'))
+        checks += _align_checks(axis, limits)
+    return _verdict(checks, limits)
+
+
+def _align_checks(axis, limits):
+    checks = []
+    k = 0 if axis is None else int(axis.get('sample_count') or 0)
+    checks.append(_check('align_samples', k, limits['min_align_samples'], k >= limits['min_align_samples'],
+                         'alignments to the spike direction'))
+    if axis is not None:
+        spread = axis.get('alignment_spread_deg')
+        checks.append(_check('align_spread_deg', spread, limits['max_align_spread_deg'],
+                             spread is not None and spread <= limits['max_align_spread_deg'],
+                             'agreement between alignments'))
+    return checks
+
+
+def _verdict(checks, limits):
     failed = [c for c in checks if not c['passed']]
     summary = 'All TCP acceptance checks passed.' if not failed else 'Failed: ' + ', '.join(
         f"{c['name']}={_fmt(c['value'])} (limit {_fmt(c['limit'])})" for c in failed)

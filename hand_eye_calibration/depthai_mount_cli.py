@@ -41,6 +41,7 @@ import sys
 import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation as Rot
+from .apply_gate import require_acceptance
 
 # socket y-offsets from oak-d_frame, per model (depthai_macro.urdf.xacro).
 CAMERA_MODELS: dict[str, dict[str, float]] = {
@@ -170,9 +171,16 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_XACRO_JOINT,
         help=f"Mount joint name inside the xacro (default: {DEFAULT_XACRO_JOINT})",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Bake even though the YAML's acceptance failed or is missing",
+    )
     args = p.parse_args(argv)
 
     data = _load_yaml(args.calibration_yaml)
+    if args.update_xacro:   # writing: only a calibration that passed its own acceptance
+        require_acceptance(data, args.calibration_yaml, args.force)
     ctype = data.get("calibration_type", "")
     if ctype != "eye-in-hand":
         print(

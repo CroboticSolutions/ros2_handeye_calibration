@@ -32,6 +32,7 @@ CAL_YAML = {
         "tx": 0.012, "ty": -0.006, "tz": 0.148,
         "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0,
     },
+    "acceptance": {"passed": True, "summary": "ok", "checks": []},
 }
 
 
@@ -111,3 +112,25 @@ class ToolTcpCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplyGateTest(unittest.TestCase):
+    """Writing the xacro needs a passing verdict (apply_gate); printing does not."""
+
+    def _yaml(self, tmp, **changes):
+        data = {**CAL_YAML, **changes}
+        path = Path(tmp) / "tcp.yaml"
+        path.write_text(yaml.safe_dump(data))
+        return path
+
+    def test_missing_or_failed_verdict_is_refused_without_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            xacro_path = Path(tmp) / "tcp.xacro"
+            for acceptance in (None, {"passed": False, "summary": "rms"}):
+                path = self._yaml(tmp, acceptance=acceptance)
+                with self.assertRaises(SystemExit):
+                    cli_main([str(path), "--update-xacro", str(xacro_path)])
+                self.assertFalse(xacro_path.exists())
+                self.assertEqual(cli_main([str(path)]), 0)   # print only: no gate
+            self.assertEqual(cli_main([str(path), "--update-xacro", str(xacro_path), "--force"]), 0)
+            self.assertTrue(xacro_path.exists())

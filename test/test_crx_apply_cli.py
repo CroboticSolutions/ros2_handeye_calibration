@@ -26,8 +26,9 @@ def _transform(T):
 
 
 def write(tmp_path, name, data):
+    """Calibration YAML; a passing verdict unless ``data`` sets 'acceptance' (None = missing)."""
     path = tmp_path / name
-    path.write_text(yaml.safe_dump(data))
+    path.write_text(yaml.safe_dump({'acceptance': {'passed': True, 'summary': 'ok', 'checks': []}, **data}))
     return str(path)
 
 
@@ -184,14 +185,105 @@ def test_tcp_torch_dimensions_are_validated(store, torch):
         cli.apply_tcp('crx10ia_l', path, 'real', torch=torch)
 
 
-@pytest.mark.parametrize('mode', ['position', 'nominal'])
-def test_tcp_orientation_from_a_non_crx_flange_axis_is_refused(store, mode):
+def test_tcp_orientation_from_a_non_crx_flange_axis_is_refused(store):
     T = _transform(_tool([1, 0, 0], [0.4, 0, 0]))
-    old = write(store, 'old.yaml', {'transform': T, 'calibration_mode': mode})
-    piper = write(store, 'piper.yaml', {'transform': T, 'calibration_mode': mode, 'flange_axis': [0, 0, 1]})
+    old = write(store, 'old.yaml', {'transform': T, 'calibration_mode': 'nominal'})
+    piper = write(store, 'piper.yaml', {'transform': T, 'calibration_mode': 'nominal', 'flange_axis': [0, 0, 1]})
     for path in (old, piper):
         with pytest.raises(SystemExit, match='flange_axis'):
             cli.apply_tcp('crx10ia_l', path, 'real')
-    cli.apply_tcp('crx10ia_l', write(store, 'crx.yaml', {'transform': T, 'calibration_mode': mode,
+    cli.apply_tcp('crx10ia_l', write(store, 'crx.yaml', {'transform': T, 'calibration_mode': 'nominal',
                                                         'flange_axis': [1.0, 0.0, 0.0]}), 'real')
     cli.apply_tcp('crx10ia_l', old, 'real', force=True)
+
+
+def test_position_only_pivot_keeps_the_active_orientation(store):
+    """A pivot without an axis measures no orientation: Apply keeps the active one
+    (it used to replace it with the flange axis)."""
+    T = _transform(_tool([0, 0, 1], [0.41, 0.01, 0.02]))
+    active = cli._tcp_base('crx10ia_l')['real']
+    _, record = cli.apply_tcp('crx10ia_l', write(store, 'pos.yaml', {
+        'transform': T, 'calibration_mode': 'position', 'flange_axis': [0, 0, 1]}), 'real')
+    assert record['real']['rpy'] == active['rpy']
+    np.testing.assert_allclose(np.fromstring(record['real']['xyz'], sep=' '), [0.41, 0.01, 0.02])
+    assert record['composition'] == {'position': 'calibration', 'orientation': 'active',
+                                     'active_from_id': record['previous_id']}
+
+
+def test_manual_position_with_measured_axis_only(store):
+    """Typed-in position + orientation from an axis-only (spike alignment) YAML."""
+    wire = np.array([0.7, 0.05, 0.7])
+    wire /= np.linalg.norm(wire)
+    axis_only = write(store, 'axis.yaml', {
+        'transform': _transform(_tool(wire, [0, 0, 0])), 'calibration_mode': 'orientation',
+        'tcp_components': ['orientation'], 'parent_frame': 'flange'})
+    _, record = cli.apply_tcp('crx10ia_l', axis_only, 'real', position_mm=[376.8, -3.5, 8.1])
+    np.testing.assert_allclose(np.fromstring(record['real']['xyz'], sep=' '), [0.3768, -0.0035, 0.0081])
+    R = Rotation.from_euler('xyz', np.fromstring(record['real']['rpy'], sep=' ')).as_matrix()
+    w = np.asarray(record['real']['wire_axis_tcp'], float)
+    np.testing.assert_allclose(R @ (w / np.linalg.norm(w)), wire, atol=1e-9)
+    assert record['composition']['position'] == 'manual'
+    assert record['composition']['orientation'] == 'calibration'
+    # The axis-only YAML has no position to take.
+    with pytest.raises(SystemExit, match='no measured position'):
+        cli.apply_tcp('crx10ia_l', axis_only, 'real', position='calibration')
+
+
+def test_manual_position_with_default_orientation_needs_no_yaml(store, tmp_path):
+    default = yaml.safe_load(open(cli.tcp_default('crx10ia_l')))['real']
+    _, record = cli.apply_tcp('crx10ia_l', str(tmp_path / 'missing.yaml'), 'real',
+                              position_mm=[1.0, 2.0, 300.0], orientation='default')
+    assert record['real']['rpy'] == default['rpy']
+    assert list(record['real']['wire_axis_tcp']) == list(default['wire_axis_tcp'])
+    assert 'source' not in record
+    with pytest.raises(SystemExit, match='nothing to apply'):
+        cli.apply_tcp('crx10ia_l', str(tmp_path / 'missing.yaml'), 'real', position='active')
+
+
+def test_failed_acceptance_blocks_only_when_the_yaml_is_used(store):
+    T = _transform(_tool([1, 0, 0], [0.4, 0, 0]))
+    bad = write(store, 'bad.yaml', {'transform': T, 'acceptance': {'passed': False, 'summary': 'x'}})
+    with pytest.raises(SystemExit, match='acceptance'):
+        cli.apply_tcp('crx10ia_l', bad, 'real', position_mm=[400, 0, 0])
+    cli.apply_tcp('crx10ia_l', bad, 'real', position_mm=[400, 0, 0], orientation='default')
+
+
+def _ur10_urdf(cal='', tcp=''):
+    return _xacro(f'{_share("ur_weld_bringup")}/urdf/ur10_weld_gz.urdf.xacro', 'wrist_camera:=femto_bolt',
+                  f'camera_calibration:={cal}', f'tcp_calibration:={tcp}')
+
+
+@pytest.mark.skipif(subprocess.run(['ros2', 'pkg', 'prefix', 'ur_weld_bringup'],
+                                   capture_output=True).returncode != 0, reason='needs ur_weld_bringup')
+def test_ur10_versions_reproduce_the_calibration_in_its_urdf(store):
+    _, record = cli.apply_camera('ur10', 'femto_bolt', handeye(store), target='nominal')
+    assert record['real'] == yaml.safe_load(open(cli.camera_default('femto_bolt', 'ur10')))['real']
+    tool = _tool([0.9, 0.05, 0.4], [0.41, 0.0, 0.03])
+    cli.apply_tcp('ur10', write(store, 'tcp.yaml', {'transform': _transform(tool), 'parent_frame': 'flange'}),
+                  target='sim')
+    camera = cli.calibration_store.current_path(cli.calibration_store.CRX_FEMTO_HANDEYE, 'ur10')
+    tcp = cli.calibration_store.current_path(cli.calibration_store.CRX_WELDING_TCP, 'ur10')
+    assert '/ur10/' in camera and cli.calibration_store.active(cli.calibration_store.CRX_FEMTO_HANDEYE,
+                                                              robot='crx10ia_l') is None
+    urdf = _ur10_urdf(cal=camera, tcp=tcp)
+    np.testing.assert_allclose(chain_from_urdf(urdf, 'camera_color_optical_frame', 'flange'), OPTICAL, atol=1e-9)
+    np.testing.assert_allclose(chain_from_urdf(urdf, 'welding_tcp', 'flange')[:3, 3], tool[:3, 3], atol=1e-9)
+
+
+@pytest.mark.skipif(subprocess.run(['ros2', 'pkg', 'prefix', 'ur_weld_bringup'],
+                                   capture_output=True).returncode != 0, reason='needs ur_weld_bringup')
+def test_ur10_alternative_torch_has_its_own_tcp_store(store):
+    assert cli.tcp_mount('ur10', 'a360_22_400') == 'welding_tcp_a360_22_400'
+    with pytest.raises(SystemExit):
+        cli.tcp_mount('crx10ia_l', 'a360_22_400')
+    tool = _tool([0.7, -0.05, 0.7], [0.40, 0.0, 0.002])
+    cli.apply_tcp('ur10', write(store, 'tcp.yaml', {'transform': _transform(tool), 'parent_frame': 'flange'}),
+                  target='sim', tool='a360_22_400')
+    assert cli.calibration_store.active(cli.calibration_store.CRX_WELDING_TCP, robot='ur10') is None
+    tcp = cli.calibration_store.current_path('welding_tcp_a360_22_400', 'ur10')
+    urdf = _xacro(f'{_share("ur_weld_bringup")}/urdf/ur10_weld_gz.urdf.xacro', 'wrist_camera:=femto_bolt',
+                  'torch:=a360_22_400', f'tcp_calibration:={tcp}')
+    T = chain_from_urdf(urdf, 'welding_tcp', 'flange')
+    np.testing.assert_allclose(T[:3, 3], tool[:3, 3], atol=1e-9)
+    wire = np.asarray(cli.calibration_store.active('welding_tcp_a360_22_400', robot='ur10')['sim']['wire_axis_tcp'])
+    np.testing.assert_allclose(T[:3, :3] @ wire / np.linalg.norm(wire), tool[:3, 2], atol=1e-6)

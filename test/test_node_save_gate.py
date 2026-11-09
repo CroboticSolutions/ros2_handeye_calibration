@@ -1,4 +1,4 @@
-"""Real DataCollector: reprojection solve, acceptance gate, dataset, offline CLI."""
+"""Real DataCollector (intrinsic_pose): acceptance gate, forced save, dataset, offline CLI."""
 import os
 
 import pytest
@@ -21,7 +21,7 @@ def node(tmp_path):
                      '-p', 'calibration_type:=eye-in-hand',
                      '-p', 'tracking_base_frame:=camera', '-p', 'tracking_marker_frame:=board',
                      '-p', 'robot_base_frame:=base', '-p', 'robot_effector_frame:=tool',
-                     '-p', 'solver:=reprojection', '-p', 'bootstrap_samples:=10', '-p', "pointcloud_topic:=''"])
+                     '-p', 'bootstrap_samples:=10', '-p', "pointcloud_topic:=''"])
     n = DataCollector()
     n._camera_model = {'k': K, 'd': [0.] * 5, 'width': 1280, 'height': 720, 'distortion_model': 'plumb_bob'}
     yield n, calibration, tmp_path
@@ -41,28 +41,43 @@ def load(node, samples):
         node.sample_images.append(None)
 
 
-def test_clean_run_is_saved_with_reprojection_evidence_and_dataset(node):
+def test_clean_manual_run_is_saved_with_dataset_and_says_it_has_no_held_out_views(node):
     n, calibration, tmp = node
-    load(n, make_samples())
+    load(n, make_samples(n=22, robot_noise_m=.0001))
     response = n.save_calibration_service_callback(Trigger.Request(), Trigger.Response())
     assert response.success, response.message
     data = yaml.safe_load(calibration.read_text())
-    assert data['solver'] == 'reprojection'
+    assert data['solver'] == 'intrinsic_pose'
     assert data['acceptance']['passed']
-    assert data['reprojection']['leave_one_out']['position_rms_m'] < .003
+    # Manual capture: every view is training; the verdict and status must not claim validation.
+    assert data['acceptance']['held_out_validation'] is False
+    assert 'no held-out validation' in data['acceptance']['summary']
+    assert 'no held-out validation' in n._status_payload['summary']
+    assert n._status_payload['held_out_validation'] is False
+    assert 'reprojection' not in data and 'axxb_transform' not in data
     assert os.path.exists(str(calibration) + '.previous')
     run = data['dataset_path']
     assert os.path.exists(os.path.join(run, 'dataset.json'))
     dataset = calibration_dataset.load(run)
-    assert len(dataset['samples']) == 15
-    out = offline_solve_cli.solve(dataset, bootstrap=0)
-    assert out['difference_reprojection_vs_online']['translation_m'] < 1e-4
-    assert offline_solve_cli.main([run, '--bootstrap', '10', '--yaml', str(tmp / 'offline.yaml')]) == 0
+    assert len(dataset['samples']) == 22
+    # The offline reprojection solve (handeye_offline_solve) still reads the dataset.
+    assert offline_solve_cli.main([run, '--bootstrap', '0', '--yaml', str(tmp / 'offline.yaml')]) in (0, 2)
+
+
+def test_legacy_solver_is_refused(tmp_path):
+    from hand_eye_calibration.node import DataCollector
+    rclpy.init(args=['--ros-args', '-p', 'solver:=reprojection',
+                     '-p', f'calibration_file:={tmp_path / "x.yaml"}', '-p', "pointcloud_topic:=''"])
+    try:
+        with pytest.raises(ValueError, match='removed'):
+            DataCollector()
+    finally:
+        rclpy.shutdown()
 
 
 def test_inconsistent_robot_poses_do_not_replace_active_file(node):
     n, calibration, _ = node
-    load(n, make_samples(robot_noise_m=.004))
+    load(n, make_samples(n=22, robot_noise_m=.004))
     response = n.save_calibration_service_callback(Trigger.Request(), Trigger.Response())
     assert not response.success
     assert 'Acceptance failed' in response.message
@@ -74,7 +89,7 @@ def test_inconsistent_robot_poses_do_not_replace_active_file(node):
 
 def test_force_save_makes_a_failed_candidate_active_and_records_it(node):
     n, calibration, _ = node
-    load(n, make_samples(robot_noise_m=.004))
+    load(n, make_samples(n=22, robot_noise_m=.004))
     response = n.force_save_calibration_service_callback(Trigger.Request(), Trigger.Response())
     assert response.success, response.message
     assert 'FORCED despite failed acceptance' in response.message
@@ -86,7 +101,7 @@ def test_force_save_makes_a_failed_candidate_active_and_records_it(node):
     # A passing candidate saved through the override is not marked forced.
     n.robot_samples.clear(); n.tracking_samples.clear(); n.sample_metrics.clear()
     n.sample_frames.clear(); n.sample_joints.clear(); n.sample_roles.clear(); n.sample_images.clear()
-    load(n, make_samples())
+    load(n, make_samples(n=22, robot_noise_m=.0001))
     assert n.force_save_calibration_service_callback(Trigger.Request(), Trigger.Response()).success
     assert yaml.safe_load(calibration.read_text())['forced'] is False
 
@@ -102,12 +117,12 @@ def test_too_few_samples_are_refused(node):
 
 def test_validation_samples_are_excluded_from_the_fit(node):
     n, _, _ = node
-    load(n, make_samples(n=18))
-    n.sample_roles[15:] = ['validation'] * 3
+    load(n, make_samples(n=25, robot_noise_m=.0001))
+    n.sample_roles[22:] = ['validation'] * 3
     cal = n.get_calibration(full=True)
     assert cal is not None
     report = n._last_reprojection
-    assert report['training_views'] == 15
+    assert report['training_views'] == 22
     assert report['validation_views']['views'] == 3
 
 

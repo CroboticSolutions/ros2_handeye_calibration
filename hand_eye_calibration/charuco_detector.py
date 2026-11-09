@@ -226,7 +226,7 @@ class CharucoBoardDetector(Node):
         # pass missed, which mostly helps exactly when detection is degraded.
         charuco_params.tryRefineMarkers = self.try_refine_markers
 
-        # Modern (OpenCV >= 4.7) detector. Falls back handled by exception in callback.
+        # OpenCV >= 4.7 detector (the only detection path).
         self.charuco_detector = cv2.aruco.CharucoDetector(self.board, charuco_params, detector_params)
         self.dictionary = dictionary
         self.min_corners = self.effective_min_corners(
@@ -398,25 +398,13 @@ class CharucoBoardDetector(Node):
             self.annotated_pub.publish(out)
 
     def _detect(self, gray):
-        """Return (charuco_corners, charuco_ids) using whichever OpenCV API exists."""
-        try:
-            charuco_corners, charuco_ids, _, _ = self.charuco_detector.detectBoard(gray)
-            return charuco_corners, charuco_ids
-        except AttributeError:
-            # Legacy OpenCV (< 4.7) fallback.
-            marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, self.dictionary)
-            if marker_ids is None or len(marker_ids) == 0:
-                return None, None
-            _, charuco_corners, charuco_ids = cv2.aruco.interpolateCornersCharuco(
-                marker_corners, marker_ids, gray, self.board
-            )
-            return charuco_corners, charuco_ids
+        """Return (charuco_corners, charuco_ids) from cv2.aruco.CharucoDetector (OpenCV >= 4.7,
+        constructed in __init__; an older OpenCV fails there, not silently here)."""
+        charuco_corners, charuco_ids, _, _ = self.charuco_detector.detectBoard(gray)
+        return charuco_corners, charuco_ids
 
     def _estimate_and_publish(self, charuco_corners, charuco_ids, header_frame, annotated, stamp):
-        try:
-            obj_points, img_points = self.board.matchImagePoints(charuco_corners, charuco_ids)
-        except AttributeError:
-            obj_points, img_points = None, None
+        obj_points, img_points = self.board.matchImagePoints(charuco_corners, charuco_ids)
         if obj_points is None or len(obj_points) < 4:
             self._note_rejection("could not match enough board points to image points")
             return False

@@ -13,8 +13,9 @@ TCP_V1_RPY = [-0.027929237913, -0.909524738174, 0.022044250167]
 
 
 def write(tmp_path, name, data):
+    """Calibration YAML; a passing verdict unless ``data`` sets 'acceptance' (None = missing)."""
     path = tmp_path / name
-    path.write_text(yaml.safe_dump(data))
+    path.write_text(yaml.safe_dump({'acceptance': {'passed': True, 'summary': 'ok', 'checks': []}, **data}))
     return str(path)
 
 
@@ -124,10 +125,32 @@ def test_versions_are_immutable_and_rollback_repoints_current(store):
         cli.calibration_store.activate(mount, '../../etc')
 
 
-def test_camera_from_other_parent_is_refused(store):
-    path = write(store, 'x.yaml', CAM | {'robot_effector_frame': 'link6', 'transform': TCP_V1})
+def test_camera_on_unknown_link_is_refused(store):
+    path = write(store, 'x.yaml', CAM | {'robot_effector_frame': 'link4', 'transform': TCP_V1})
     with pytest.raises(SystemExit):
         cli.apply_camera(path, 'real', np.eye(4))
+
+
+def test_camera_moved_to_link6_recomputes_both_origins(store, monkeypatch):
+    nominal_inner = cli._matrix([.02, 0, 0], [0, 0, .1])
+    monkeypatch.setattr(cli, 'nominal_inner_chain', lambda _optical: nominal_inner)
+    T = cli._matrix([.0, -.05, .04], [.2, .1, -1.2])
+    inner = cli._matrix([.01, .02, .03], [-1.57, 0, -1.57])
+    path = write(store, 'l6.yaml', yaml.safe_load(open(_cam_yaml(store, T))) | {'robot_effector_frame': 'link6'})
+    _id, record = cli.apply_camera(path, 'real', inner)
+    assert record['parent_link'] == 'link6' and record['previous_parent_link'] == 'link5'
+    assert sorted(record['updated']) == ['nominal', 'real']
+    np.testing.assert_allclose(cli._origin_matrix(record['real']) @ inner, T, atol=1e-9)
+    np.testing.assert_allclose(cli._origin_matrix(record['nominal']) @ nominal_inner, T, atol=1e-9)
+    assert cli.calibration_store.active(cli.calibration_store.FEMTO_HANDEYE)['parent_link'] == 'link6'
+
+
+def test_sim_calibration_cannot_move_the_camera(store, monkeypatch):
+    monkeypatch.setattr(cli, 'nominal_inner_chain', lambda _optical: np.eye(4))
+    path = write(store, 'l6.yaml', CAM | {'robot_effector_frame': 'link6', 'transform': TCP_V1})
+    with pytest.raises(SystemExit, match='real robot'):
+        cli.apply_camera(path, 'nominal')
+    assert cli.calibration_store.active(cli.calibration_store.FEMTO_HANDEYE)['parent_link'] == 'link5'
 
 
 def test_failed_acceptance_is_refused(tmp_path):
@@ -135,3 +158,45 @@ def test_failed_acceptance_is_refused(tmp_path):
     with pytest.raises(SystemExit):
         cli.load_calibration(path)
     cli.load_calibration(path, force=True)
+
+
+def test_missing_acceptance_is_refused_unless_forced_or_manual(tmp_path):
+    """No verdict (hand-edited / offline YAML) used to be applied silently."""
+    path = write(tmp_path, 'cal.yaml', {'transform': TCP_V1, 'acceptance': None})
+    with pytest.raises(SystemExit, match='no acceptance verdict'):
+        cli.load_calibration(path)
+    cli.load_calibration(path, force=True)
+    # Operator-typed values (UR pendant TCP): nothing measured to judge.
+    manual = write(tmp_path, 'manual.yaml', {'transform': TCP_V1, 'acceptance': None, 'calibration_mode': 'manual'})
+    cli.load_calibration(manual)
+
+
+def test_tcp_position_and_orientation_sources_are_independent(tcp_store):
+    path = write(tcp_store, 'tcp.yaml', {'transform': TCP_V1, 'parent_frame': 'link6'})
+    _, measured = cli.apply_tcp(path)
+    # Manual position, orientation still measured.
+    _, record = cli.apply_tcp(path, position_mm=[34.0, -0.3, 105.8])
+    np.testing.assert_allclose(np.fromstring(record['real']['xyz'], sep=' '), [0.034, -0.0003, 0.1058])
+    assert record['real']['rpy'] == measured['real']['rpy']
+    # Measured position, repo-default orientation.
+    _, record = cli.apply_tcp(path, orientation='default')
+    assert record['real']['rpy'] == TCP_BASE['real']['rpy']
+    assert record['real']['xyz'] == measured['real']['xyz']
+    assert record['composition'] == {'position': 'calibration', 'orientation': 'default',
+                                     'default_yaml': cli.TCP_DEFAULT_YAML}
+
+
+def test_position_only_yaml_keeps_the_active_orientation(tcp_store):
+    path = write(tcp_store, 'tcp.yaml', {'transform': TCP_V1, 'calibration_mode': 'position'})
+    _, record = cli.apply_tcp(path)
+    assert record['real']['rpy'] == TCP_BASE['real']['rpy']
+    np.testing.assert_allclose(np.fromstring(record['real']['xyz'], sep=' '),
+                               [TCP_V1['tx'], TCP_V1['ty'], TCP_V1['tz']])
+
+
+def test_tcp_cli_position_mm_flag(tcp_store, capsys):
+    assert cli.main(['tcp', str(tcp_store / 'missing.yaml'), '--position-mm', '30', '0', '110',
+                     '--orientation', 'active']) == 0
+    record = cli.calibration_store.active(cli.calibration_store.WELDING_GUN_TCP)
+    np.testing.assert_allclose(np.fromstring(record['real']['xyz'], sep=' '), [0.03, 0, 0.11])
+    assert record['composition']['position'] == 'manual'

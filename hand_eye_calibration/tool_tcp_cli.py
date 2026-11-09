@@ -29,6 +29,7 @@ import yaml
 from scipy.spatial.transform import Rotation as Rot
 
 from .depthai_mount_cli import _rotation_to_urdf_rpy, update_xacro_origin
+from .apply_gate import require_acceptance
 
 DEFAULT_JOINT_NAME = "piper_tool_tcp_mount"
 DEFAULT_MACRO_NAME = "piper_mount_tool_tcp"
@@ -94,9 +95,16 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MACRO_NAME,
         help=f"xacro:macro name to create if the file doesn't exist yet (default: {DEFAULT_MACRO_NAME})",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Bake even though the YAML's acceptance failed or is missing",
+    )
     args = p.parse_args(argv)
 
     data = _load_yaml(args.calibration_yaml)
+    if args.update_xacro:   # writing: only a calibration that passed its own acceptance
+        require_acceptance(data, args.calibration_yaml, args.force)
     t = data["transform"]
     flange = data.get("robot_flange_frame", data.get("parent_frame", "link6"))
     tcp_link = data.get("tcp_name", "tool_tcp")

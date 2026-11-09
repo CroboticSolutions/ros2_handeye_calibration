@@ -25,8 +25,17 @@ are not used. See `THIRD_PARTY_NOTICES.md` and `LICENSE.intrinsic`.
    information, compute the initial joint pose estimate. Reject it for planning
    if maximum pose error exceeds 10 mm or 6°.
 5. Freeze that planning estimate. Collect 12 main poses (`auto_min_training_samples`)
-   from the wide view pool (closed-form or numeric IK; the local box of half-size
-   60/60/40 mm with tilts ±15°/±15°/±35° only as a fallback). While bootstrap
+   from the view pool (`view_pool.py`: ssik for a six-joint camera chain, sampled
+   joints + FK for a camera before the last joint; no ssik → error before motion;
+   the local box of half-size 60/60/40 mm with tilts ±15°/±15°/±35° only when the
+   pool runs out). Limits, the same on every robot and relative to the start view:
+   optical-axis tilt ≤ `auto_max_view_tilt_deg` (35°), roll about it ≤
+   `auto_max_view_roll_deg` (45°), distance 0.8–1.15×, board normal ≤ 50° off,
+   camera within `auto_max_camera_excursion_m`; joints within
+   `auto_max_arm_joint_change_deg` (45°, first three) / `auto_max_wrist_joint_change_deg`
+   (60°) of the start, no J5 flip. Optional `auto_view_motion_tolerance` (default 0): among views
+   within that fraction of the best observability gain the smallest joint move wins
+   (0.10 offline: sigma +40-80 %). While bootstrap
    position sigma exceeds its limit, add two views at a time up to
    `auto_max_training_samples` (30). Offline on the 21.10. CRX scene (wide views,
    noise at the measured 2.0 mm / 0.41° pose RMS): sigma 1.9 mm with 8 main views,
@@ -52,10 +61,14 @@ within a finite candidate budget; three unsuccessful captures in succession stop
 collection. A failed run keeps raw evidence and does not replace the active file.
 Old calibration/TCP files are not applied or overwritten by installing this change.
 
-The original `reprojection` and `axxb` solvers remain explicitly selectable for
-comparison/rollback; their legacy acquisition path is not the new default.
-`auto_max_training_samples` belongs to that legacy path; the Intrinsic-style path
-uses a fixed main batch plus the initial and validation phases.
+The online `reprojection` and `axxb` solvers and their acquisition path
+(`BootstrapSession`, informative views) were removed on 2026-11-05: the GUI never
+selected them. `solver` accepts only `intrinsic_pose`. The reprojection solve stays
+available offline on a saved dataset (`handeye_offline_solve`).
+
+Acceptance in manual mode: every manual capture is a training view, so there are no
+held-out validation views. The verdict carries `held_out_validation: false` and its
+summary and the status say so; only automatic runs add validation views.
 
 ## Use
 

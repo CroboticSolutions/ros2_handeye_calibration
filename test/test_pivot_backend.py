@@ -220,6 +220,14 @@ class AlignAxisTest(unittest.TestCase):
         np.testing.assert_allclose(pos["axis_dir"], self.a_true, atol=1e-9)
         np.testing.assert_allclose(neg["axis_dir"], -self.a_true, atol=1e-9)
 
+    def test_without_a_tip_the_tool_points_at_the_spike(self) -> None:
+        # The tool sits on the spike tip, so its +Z is -spike: -a_true here.
+        samples = list(_alignment_poses(self.a_true, [0, 45]))
+        result = PivotCalibrationBackend.compute_axis_from_alignment(
+            samples, spike_axis_base=SPIKE, tool_toward_spike=True
+        )
+        np.testing.assert_allclose(result["axis_dir"], -self.a_true, atol=1e-9)
+
     def test_spread_reflects_misalignment(self) -> None:
         good = list(_alignment_poses(self.a_true, [0, 30, 60]))
         # Perturb one pose by ~2° about a spike-orthogonal axis so its recovered

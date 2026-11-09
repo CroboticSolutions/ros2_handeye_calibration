@@ -142,3 +142,39 @@ class XacroUpdateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplyGateTest(unittest.TestCase):
+    """--update-xacro bakes only a calibration whose own verdict passed (apply_gate)."""
+
+    def _run(self, tmp, acceptance, *extra):
+        import yaml
+        from hand_eye_calibration.depthai_mount_cli import main
+        from hand_eye_calibration.realsense_mount_cli import main as realsense_main
+        cal = Path(tmp) / "cal.yaml"
+        data = {"calibration_type": "eye-in-hand", "tracking_base_frame": "oak_rgb_camera_optical_frame",
+                "robot_effector_frame": "link6",
+                "transform": {"tx": -0.0916, "ty": -0.0015, "tz": 0.0632,
+                              "qx": 0.1157, "qy": -0.1322, "qz": 0.7206, "qw": -0.6708}}
+        if acceptance is not None:
+            data["acceptance"] = acceptance
+        cal.write_text(yaml.safe_dump(data))
+        xacro = Path(tmp) / "mount.xacro"
+        xacro.write_text(XACRO_SNIPPET, encoding="utf-8")
+        main([str(cal), "--camera-model", "OAK-D-PRO-W", "--update-xacro", str(xacro), *extra])
+        realsense_main([str(cal), "--update-xacro", str(xacro), "--joint-name",
+                        "piper_hand_eye_link6_mount", *extra])
+        return xacro.read_text(encoding="utf-8")
+
+    def test_missing_or_failed_verdict_is_refused(self) -> None:
+        for acceptance in (None, {"passed": False, "summary": "sigma"}):
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(SystemExit):
+                    self._run(tmp, acceptance)
+                self.assertIn("-0.088848448438", (Path(tmp) / "mount.xacro").read_text())   # untouched
+
+    def test_passing_or_forced_is_baked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run(tmp, {"passed": True, "summary": "ok"})
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run(tmp, None, "--force")

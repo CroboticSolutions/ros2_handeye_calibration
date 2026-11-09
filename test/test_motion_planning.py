@@ -5,7 +5,6 @@ import pytest
 from moveit_msgs.srv import GetMotionPlan
 from trajectory_msgs.msg import JointTrajectoryPoint
 from hand_eye_calibration.motion_planning import decode_path, plan_joint_path
-from hand_eye_calibration import informative_views
 from test_automatic_calibration import synthetic_sequence
 
 
@@ -34,27 +33,6 @@ def test_planner_failure_returns_no_path():
     assert decode_path(r,['a'],np.zeros(1),np.array([.1]),-np.ones(1),np.ones(1)) is None
 
 
-def test_actual_route_is_followed_instead_of_straight_line(monkeypatch):
-    monkeypatch.setattr(informative_views,'ViewInformation',lambda *a:NS(gain=lambda _:1.))
-    monkeypatch.setattr(informative_views,'informative_view',lambda *a:True)
-    robot=lambda q:np.eye(4)
-    path=[np.array(q) for q in [[0,0],[0,.1],[.1,.1],[.1,0]]]
-    runner=NS(check=lambda:None,plan_joint_path=Mock(return_value=path),framing=NS(contains=lambda *a,**k:True))
-    planner=informative_views.InformativeViews.__new__(informative_views.InformativeViews)
-    planner.s=NS(r=runner,estimate=np.eye(4),views=[],fk=NS(camera=robot),MAX_STEP=.05)
-    planner.camera=robot;planner.goal=None;planner.route=[];planner.targets=[path[-1]]
-    # The goal is the planned endpoint and the route keeps MoveIt's corners, so
-    # execution follows the planned path, not a straight joint-space line.
-    goal=planner.next_step(path[0],np.eye(4))
-    np.testing.assert_allclose(goal,[.1,0])
-    np.testing.assert_allclose(np.array(planner.route),np.array(path[1:]))
-    # Progress along the route keeps the same goal without re-planning.
-    for q in path[1:3]:
-        np.testing.assert_allclose(planner.next_step(q,np.eye(4)),[.1,0])
-    assert len(planner.route)==1
-    runner.plan_joint_path.assert_called_once()
-
-
 def test_missing_planner_stops_before_any_motion(monkeypatch):
     r,n,_=synthetic_sequence(monkeypatch)
     r.planning.wait_for_service=lambda **_:False
@@ -80,22 +58,6 @@ def test_request_keeps_attached_state_and_never_executes_trajectory():
     # Not the group default: crx10ia_l's RRTstar spends the full planning time.
     assert seen[0].motion_plan_request.planner_id=='RRTConnect'
     runner.action.send_goal_async.assert_not_called()
-
-
-def test_failed_top_candidates_do_not_starve_later_reachable_target(monkeypatch):
-    monkeypatch.setattr(informative_views,'ViewInformation',lambda *a:NS(gain=lambda _:1.))
-    monkeypatch.setattr(informative_views,'informative_view',lambda *a:True)
-    robot=lambda q:np.eye(4)
-    goals=[np.array([x]) for x in np.linspace(.1,.7,7)]
-    def plan(start,goal):return [start,goal] if goal[0]>.65 else None
-    runner=NS(check=lambda:None,plan_joint_path=Mock(side_effect=plan),framing=NS(contains=lambda *a,**k:True))
-    planner=informative_views.InformativeViews.__new__(informative_views.InformativeViews)
-    planner.s=NS(r=runner,estimate=np.eye(4),views=[],fk=NS(camera=robot),MAX_STEP=.05)
-    planner.camera=robot;planner.goal=None;planner.route=[];planner.targets=goals
-    assert planner.next_step(np.zeros(1),np.eye(4)) is None
-    assert planner.pending_candidates
-    assert planner.next_step(np.zeros(1),np.eye(4)) is not None
-    assert runner.plan_joint_path.call_count==7
 
 
 def planning_runner(start, seen, points):

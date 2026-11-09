@@ -40,11 +40,13 @@ def test_unknown_group_and_wrong_robot_chain_are_rejected():
     with pytest.raises(ValueError,match='does not match'):matching_group(root,'<robot/>',p['names'],'arm')
 
 
-def test_seven_axis_sequence_without_initial_mount(monkeypatch):
+def test_seven_axis_chain_is_refused_before_any_motion(monkeypatch):
+    """ssik solves 6R chains only. The removed bootstrap/numeric samplers used to drive a
+    seven-axis chain; now the run stops with an explicit error and sends no motion."""
     p=profile(True);r,n,mount=synthetic_sequence(monkeypatch,robot_profile=p)
     r.run()
-    assert r.status['state']=='completed',r.status
+    assert r.status['state']=='failed',r.status
+    assert 'ssik' in r.status['message'] and 'no motion sent' in r.status['message']
     assert len(r.names)==7
-    assert all(len(c.args[0])==7 for c in r.move.call_args_list)
-    r.tf.assert_not_called()
-    np.testing.assert_allclose(sample_matrix(n.get_calibration()),mount,atol=1e-5)
+    r.move.assert_not_called()
+    n.save_calibration_service_callback.assert_not_called()

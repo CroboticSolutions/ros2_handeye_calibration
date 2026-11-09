@@ -1,5 +1,8 @@
-> This page documents the legacy `reprojection` pipeline. The default is now
-> `intrinsic_pose`; see [Intrinsic-style architecture](intrinsic_architecture.md).
+> Historical: the online `reprojection` / `axxb` solvers and their automatic mode
+> (below) were removed on 2026-11-05; the node runs only `intrinsic_pose`, see
+> [Intrinsic-style architecture](intrinsic_architecture.md). Still current on this
+> page: the offline re-solve (`handeye_offline_solve`), touch-off, welding-gun Apply
+> and the whole Tool TCP part.
 
 # Hand-eye: reprojection solve, held-out validation, datasets
 
@@ -115,6 +118,18 @@ Measures hand-eye + TCP + robot error together, which is what a seam sees.
    `<dataset_dir>/touchoff/touchoff_log.yaml` and shown in the GUI.
 
 Repeat on 3–5 corners across the board.
+
+## Apply gate (all bake paths)
+
+Every Apply/bake CLI (`handeye_crx_apply`, `handeye_welding_gun_apply`,
+`depthai_mount_cli`/`realsense_mount_cli --update-xacro`, `tool_tcp_cli
+--update-xacro`, and the GUI's in-process Humble-remote bakes) uses
+`apply_gate.py`: a YAML is baked only when its own acceptance verdict passed. A
+missing verdict (hand-edited or offline YAML) is refused like a failed one;
+`--force` (GUI: Force save & apply, or `force: true` in the Apply request) bakes it
+anyway. `calibration_mode: manual` (UR pendant TCP typed in by the operator) needs no
+verdict. Only the calibration's own quality is checked, never its change from the
+active value.
 
 ## Apply on the welding-gun stack
 

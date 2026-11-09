@@ -216,3 +216,47 @@ def test_node_uses_the_flange_axis_parameter(node, neck):
     q = [saved['transform'][k] for k in ('qx', 'qy', 'qz', 'qw')]
     z = Rotation.from_quat(q).as_matrix()[:, 2]
     assert math.degrees(math.acos(z[0])) == pytest.approx(max(neck, 0.0), abs=0.01)
+
+
+def _aligned_poses(axis_flange, spins_deg, spike=(0.0, 0.0, 1.0)):
+    """Flange poses with the tool pointing down at a vertical spike (+Z = -spike)."""
+    a = np.asarray(axis_flange, float) / np.linalg.norm(axis_flange)
+    base = Rotation.align_vectors([-np.asarray(spike, float)], [a])[0]
+    return [[0.3, 0.0, 0.2, *(Rotation.from_rotvec(np.asarray(spike) * math.radians(s)) * base).as_quat()]
+            for s in spins_deg]
+
+
+def test_node_saves_orientation_only_without_a_tip_round(node):
+    n, cal = node
+    wire = np.array([0.7, 0.0, 0.7]) / math.sqrt(0.98)
+    n.orientation_only = True
+    n.samples['axis_ref'] = _aligned_poses(wire, [0, 40, -70])
+    n.sample_metadata['axis_ref'] = [{}] * 3
+    response = n.save_calibration_cb(Trigger.Request(), Trigger.Response())
+    assert not response.success and 'Compute axis' in response.message
+    assert n.compute_axis_cb(Trigger.Request(), Trigger.Response()).success
+    response = n.save_calibration_cb(Trigger.Request(), Trigger.Response())
+    assert response.success, response.message
+    saved = yaml.safe_load(cal.read_text())
+    assert saved['calibration_mode'] == 'orientation' and saved['tcp_components'] == ['orientation']
+    assert [c['name'] for c in saved['acceptance']['checks']] == ['align_samples', 'align_spread_deg']
+    q = [saved['transform'][k] for k in ('qx', 'qy', 'qz', 'qw')]
+    np.testing.assert_allclose(Rotation.from_quat(q).as_matrix()[:, 2], wire, atol=1e-9)
+
+
+def test_orientation_only_gate_needs_enough_consistent_alignments():
+    axis = {'sample_count': 1, 'alignment_spread_deg': 0.0}
+    verdict = tcp_quality.evaluate(None, [], None, axis=axis, orientation_only=True)
+    assert not verdict['passed'] and 'align_samples' in verdict['summary']
+    axis = {'sample_count': 3, 'alignment_spread_deg': 0.4}
+    assert tcp_quality.evaluate(None, [], None, axis=axis, orientation_only=True)['passed']
+
+
+def test_position_only_save_lists_its_component(node):
+    n, cal = node
+    n.samples['tip'] = touches(10, noise=0.0002)
+    n.sample_metadata['tip'] = [{}] * 10
+    n.samples['validation'] = touches(3, seed=7, noise=0.0002)
+    n.sample_metadata['validation'] = [{}] * 3
+    assert n.save_calibration_cb(Trigger.Request(), Trigger.Response()).success
+    assert yaml.safe_load(cal.read_text())['tcp_components'] == ['position']

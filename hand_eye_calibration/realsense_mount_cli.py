@@ -36,6 +36,7 @@ from .depthai_mount_cli import (
     _rotation_to_urdf_rpy,
     update_xacro_origin,
 )
+from .apply_gate import require_acceptance
 
 # From realsense2_description urdf/_d435.urdf.xacro (sensor_d435).
 _D435_MESH_X = 0.0149 - 0.1e-3 - 4.2e-3  # mount_from_center - glass - zero_depth
@@ -83,9 +84,16 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_JOINT_NAME,
         help=f"Mount joint name (default: {DEFAULT_JOINT_NAME})",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Bake even though the YAML's acceptance failed or is missing",
+    )
     args = p.parse_args(argv)
 
     data = _load_yaml(args.calibration_yaml)
+    if args.update_xacro:   # writing: only a calibration that passed its own acceptance
+        require_acceptance(data, args.calibration_yaml, args.force)
     ctype = data.get("calibration_type", "")
     if ctype and ctype != "eye-in-hand":
         print(

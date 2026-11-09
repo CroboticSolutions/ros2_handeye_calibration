@@ -10,13 +10,28 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from .visibility import BoardFraming, CameraKinematics
-from .closed_form_views import AnalyticIKViews, ClosedFormViews, NumericIKViews, POOL_PER_VIEW, shortest_route
+from .view_pool import AnalyticIKViews, POOL_PER_VIEW, ViewLimits, joint_window_bounds, select_view, shortest_route
 from .joint_space_views import JointSpaceViews
-from .bootstrap_calibration import _clear_samples, sample_pose
 from .motion_planning import SAMPLER_JOINT_MARGIN_RAD
 from . import intrinsic_solver as solver
 
 EXTRA_VIEW_BATCH = 2   # views per refit while position sigma is above its limit
+
+
+def sample_pose(sample):
+    """4x4 pose of a stored [x, y, z, qx, qy, qz, qw] sample."""
+    pose=np.eye(4)
+    pose[:3,:3]=R.from_quat(sample[3:]).as_matrix()
+    pose[:3,3]=sample[:3]
+    return pose
+
+
+def _clear_samples(node):
+    if hasattr(node,'clear_samples'):
+        node.clear_samples()
+        return
+    node.robot_samples.clear();node.tracking_samples.clear();node.sample_metrics.clear()
+    node._last_uncertainty=node._last_calibration_detail=None
 
 
 def pre_calibration_poses(initial, distance=.02, angle_degrees=12.):
@@ -57,24 +72,21 @@ class IntrinsicSession:
         # Camera before the last joint (Piper on link5): fewer than six joints move it, so
         # arbitrary 6-D targets are unreachable; views come from sampled joints instead.
         self.underactuated=sum(kind!='fixed' for _,_,kind,_ in getattr(self.fk,'chain',[(0,0,'revolute',0)]*6))<6
-        # Main/validation views from a wide pool: closed-form IK for a 6-joint camera chain
-        # (closed_form_views), every ssik branch when it has no closed form (CRX), numeric
-        # IK on the URDF chain without ssik, sampled joints + FK for a camera before the
-        # last joint (joint_space_views).
-        # None keeps the local random sampler (no URDF chain).
-        self.closed_form=None
+        # Main/validation views (view_pool): every ssik branch for a six-joint camera chain,
+        # sampled joints + FK for a camera before the last joint (joint_space_views); both
+        # under the same ViewLimits. Without a chain (no URDF), the local random sampler.
+        self.limits=getattr(runner,'view_limits',None) or ViewLimits()
+        self.view_pool=None
         if self.underactuated and hasattr(self.fk,'chain'):
-            self.closed_form=JointSpaceViews(self.fk,runner.names,runner.lower,runner.upper)
-        elif not self.underactuated:
-            if getattr(runner,'robot_description',None):
-                for views in (ClosedFormViews,AnalyticIKViews):
-                    self.closed_form=views.create(
-                        runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
-                        runner.names,runner.lower,runner.upper,self.fk.camera)
-                    if self.closed_form is not None:
-                        break
-            if self.closed_form is None and hasattr(self.fk,'chain'):
-                self.closed_form=NumericIKViews(self.fk.camera,runner.lower,runner.upper)
+            self.view_pool=JointSpaceViews(self.fk,runner.names,runner.lower,runner.upper,self.limits)
+        elif not self.underactuated and getattr(runner,'robot_description',None):
+            self.view_pool=AnalyticIKViews.create(
+                runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
+                runner.names,runner.lower,runner.upper,self.fk.camera,self.limits)
+            if self.view_pool is None:
+                raise ValueError(f'Analytic IK (ssik) is unavailable for {self.n.robot_base_frame} -> '
+                                 f'{self.n.robot_effector_frame} (pip install ssik==8.2.0, or the URDF chain '
+                                 'disagrees with the joint names); no motion sent')
         self.pool_left={}
         self.initial=self.r.joint_positions().copy()
         self.views=[];self.validation=[];self.estimate=None;self.board=None
@@ -97,11 +109,15 @@ class IntrinsicSession:
         e=residual(fit.x)
         if np.linalg.norm(e[:3])<=.2 and np.linalg.norm(e[3:])<=.2:return fit.x
         # Nearest reachable pose; callers re-check framing and duplicates on the actual pose.
-        # Bounds: 15 mm, ~4 deg (scaled residuals).
-        if self.underactuated and np.linalg.norm(e[:3])<=1.5 and np.linalg.norm(e[3:])<=1.4:return fit.x
-        # Main/validation sampling: random 6-D targets (roll up to 35 deg) are mostly unreachable
-        # with five camera joints; the caller accepts the reachable pose only if framed and new.
-        if self.underactuated and nearest:return fit.x
+        # Bounds: 15 mm, ~4 deg (scaled residuals). Counted in planner_rejections
+        # ('nearest_ik_used') so the status shows views that are not the planned ones.
+        if self.underactuated and (nearest or (np.linalg.norm(e[:3])<=1.5 and np.linalg.norm(e[3:])<=1.4)):
+            # Main/validation sampling: random 6-D targets (roll up to 35 deg) are mostly unreachable
+            # with five camera joints; the caller accepts the reachable pose only if framed and new.
+            rejections=getattr(self,'rejections',None)
+            if rejections is not None:
+                rejections['nearest_ik_used']=rejections.get('nearest_ik_used',0)+1
+            return fit.x
         return None
 
     def move(self, target):
@@ -214,19 +230,19 @@ class IntrinsicSession:
         self.rejections['path_or_capture']=self.rejections.get('path_or_capture',0)+1
         return False,failures
 
-    def sample_closed_form(self, count, phase, reference, center, reuse=False):
-        """Greedy views from the closed-form pool; returns how many were captured.
+    def sample_pool(self, count, phase, reference, center, reuse=False):
+        """Greedy views from the view pool; returns how many were captured.
 
         ``reuse`` continues the phase's remaining pool (views added for sigma)."""
-        label=getattr(self.closed_form,'label','closed-form IK')
+        label=getattr(self.view_pool,'label','view pool')
         pool=self.pool_left.get(phase) if reuse else None
         if not pool:
             self.r.update('planning',f'Sampling {phase} views around the board with {label}.',view_sampler=label)
-            pool,sampled=self.closed_form.pool(self.board,center,self.estimate,self.r.framing,reference,
+            pool,sampled=self.view_pool.pool(self.board,center,self.estimate,self.r.framing,reference,
                                                self.r.max_camera_excursion,self.initial,self.rng,
                                                POOL_PER_VIEW*count,check=self.r.check)
             message=f'{label[0].upper()+label[1:]}: {len(pool)} reachable, framed {phase} views of {sampled} sampled.'
-            self.r.update('planning',message,closed_form_pool=len(pool),closed_form_sampled=sampled)
+            self.r.update('planning',message,view_pool_size=len(pool),view_pool_sampled=sampled)
             if hasattr(self.n,'get_logger'):
                 self.n.get_logger().info(message)
         self.pool_left[phase]=pool
@@ -239,7 +255,8 @@ class IntrinsicSession:
             batch=[]
             while len(batch)<count-collected and pool:
                 self.r.check()
-                batch.append(pool.pop(ClosedFormViews.best(pool,rotations+[e[1][:3,:3] for e in batch])))
+                batch.append(pool.pop(select_view(pool,rotations+[e[1][:3,:3] for e in batch],
+                                                  self.initial,self.limits.selection_tolerance)))
             for target,actual in shortest_route(self.r.joint_positions(),batch):
                 self.r.check()
                 if collected>=count:break
@@ -263,8 +280,8 @@ class IntrinsicSession:
         reference=self.fk.camera(self.initial)@self.estimate
         center=(self.board@np.r_[self.r.framing.center,1])[:3]
         collected=0;tries=0;failures=0
-        if self.closed_form is not None:
-            collected=self.sample_closed_form(count,phase,reference,center,reuse)
+        if self.view_pool is not None:
+            collected=self.sample_pool(count,phase,reference,center,reuse)
             if collected<count:
                 self.local_sampler_warning(f'View pool exhausted at {collected}/{count} {phase} views')
         else:
@@ -276,6 +293,10 @@ class IntrinsicSession:
             if not self.r.framing.contains(np.linalg.inv(desired)@self.board,margin=.13):continue
             target=self.ik(desired@np.linalg.inv(self.estimate),nearest=True)
             if target is None:continue
+            # Same joint window as the pool (no wrist flip, bounded joint change).
+            lo,hi=joint_window_bounds(self.initial,np.asarray(self.r.lower,float),np.asarray(self.r.upper,float),self.limits)
+            if np.any(target<lo-1e-6) or np.any(target>hi+1e-6):
+                self.rejections['joint_window']=self.rejections.get('joint_window',0)+1;continue
             actual=self.fk.camera(target)
             if self.underactuated:
                 camera=actual@self.estimate
@@ -337,7 +358,7 @@ class IntrinsicSession:
         self.r.update('planning','Collecting diverse initial views with replacement candidates (up to 24).',strategy='intrinsic_staged',
                       phase='bootstrap',target_samples=8+self.main_count,max_training_samples=8+self.max_main_count,
                       total=self.total,required_validation_views=self.r.validation_views,validation_views=0,accepted=0,
-                      view_sampler=getattr(self.closed_form,'label','local random'),view_sampler_warning=None)
+                      view_sampler=getattr(self.view_pool,'label','local random'),view_sampler_warning=None)
         self.sample_initial()
         self.initial_count=len(self.views)
         self.r.update('assessing','Solving the initial pose batch.',

@@ -31,7 +31,8 @@ def test_save_uses_new_solver_and_preserves_all_views(node):
     assert data['algorithm_used']=='SHAH+NONLINEAR'
     assert data['rejected_sample_indices']==[]
     assert data['pose_calibration']['training_views']==24
-    assert data['reprojection'] is None
+    assert 'reprojection' not in data
+    assert data['acceptance']['held_out_validation'] is False   # manual: no validation views
     assert path.with_name('active.yaml.previous').read_text()=='previous: true\n'
 
 

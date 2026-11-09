@@ -1,4 +1,5 @@
-"""Store hand-eye and welding-TCP results for a FANUC CRX (crx10ia_l / crx10ia).
+"""Store hand-eye and welding-TCP results for a FANUC CRX (crx10ia_l / crx10ia) or the
+UR10 welding cell (ur10, ur_weld_bringup: same `flange` convention, Femto and torch).
 
 Same scheme as welding_gun_apply_cli (PiPER): nothing is baked into a xacro. Each
 Apply writes an immutable version in the robot's calibration store
@@ -15,7 +16,8 @@ camera  femto_bolt:     flange -> camera_base_link (mount femto_bolt_handeye)
         from the running driver's TF (publish_tf:=true); everything else (sim, and the
         D435, whose driver runs with publish_tf:=false) from the nominal xacro chain.
         --target real | nominal | both; the other origin is carried over.
-tcp     flange -> TCP link (mount welding_tcp). real: crx_description `tcp`
+tcp     flange -> TCP link (mount welding_tcp; UR10 --tool a360_22_400: welding_tcp_a360_22_400).
+        real: crx_description `tcp`
         (fanuc_control MoveIt tip), sim: seam_ros2_pkg `welding_tcp`. Each target
         keeps its own axis convention (`wire_axis_tcp`): the new orientation is the
         smallest rotation of the active one that puts that axis on the calibrated
@@ -41,7 +43,7 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation
 
-from hand_eye_calibration import calibration_store
+from hand_eye_calibration import calibration_store, tcp_compose
 from hand_eye_calibration.welding_gun_apply_cli import (
     _delta,
     _fmt,
@@ -52,7 +54,9 @@ from hand_eye_calibration.welding_gun_apply_cli import (
     load_calibration,
 )
 
-ROBOTS = ('crx10ia_l', 'crx10ia')
+ROBOTS = ('crx10ia_l', 'crx10ia', 'ur10')
+# Package whose config/calibration/*_default.yaml seeds each robot's store.
+DEFAULTS_PACKAGE = {'ur10': 'ur_weld_bringup'}
 EFFECTOR = 'flange'
 CAMERAS = {
     'femto_bolt': {'mount': calibration_store.CRX_FEMTO_HANDEYE, 'root': 'camera_base_link'},
@@ -61,27 +65,55 @@ CAMERAS = {
 # Gazebo keeps the old FANUC sim optical frame name as an identity alias.
 OPTICAL_ALIASES = {'oak_rgb_camera_optical_frame': 'camera_color_optical_frame'}
 TCP_TARGETS = ('real', 'sim')
+# Alternative UR10 torches (ur_weld_bringup ur_weld_calibration.TORCHES): own TCP mount
+# welding_tcp_<tool> and default welding_tcp_<tool>_default.yaml. None = welding_tcp.
+TOOLS = {'ur10': ('a360_22_400',)}
+
+
+def _package_share(package):
+    """Installed share directory of ``package``. No source-tree fallback: a store seeded
+    from src/ while the launch files read install/ would bake a different model."""
+    try:
+        from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
+    except ImportError as exc:
+        raise SystemExit('ament_index_python is unavailable: source the ROS overlay '
+                         '(/root/arms_ws/install/setup.bash) before applying.') from exc
+    try:
+        return get_package_share_directory(package)
+    except PackageNotFoundError as exc:
+        raise SystemExit(f'Package {package!r} is not installed in the sourced overlay '
+                         '(build it, then source /root/arms_ws/install/setup.bash).') from exc
 
 
 def crx_share():
-    try:
-        from ament_index_python.packages import get_package_share_directory
-        return get_package_share_directory('crx_description')
-    except Exception:  # noqa: BLE001 - source tree fallback (tests without an overlay)
-        return '/root/arms_ws/src/robots/ros2_fanuc_interface/crx_description'
+    return _package_share('crx_description')
 
 
-def camera_default(camera):
-    return f'{crx_share()}/config/calibration/{camera}_handeye_default.yaml'
+def robot_share(robot='crx10ia_l'):
+    if robot not in DEFAULTS_PACKAGE:
+        return crx_share()
+    return _package_share(DEFAULTS_PACKAGE[robot])
 
 
-def tcp_default():
-    return f'{crx_share()}/config/calibration/welding_tcp_default.yaml'
+def camera_default(camera, robot='crx10ia_l'):
+    return f'{robot_share(robot)}/config/calibration/{camera}_handeye_default.yaml'
+
+
+def tcp_mount(robot='crx10ia_l', tool=None):
+    if tool is None:
+        return calibration_store.CRX_WELDING_TCP
+    if tool not in TOOLS.get(robot, ()):
+        raise SystemExit(f'Unknown tool {tool!r} for {robot}; expected one of {TOOLS.get(robot, ())}.')
+    return f'{calibration_store.CRX_WELDING_TCP}_{tool}'
+
+
+def tcp_default(robot='crx10ia_l', tool=None):
+    return f'{robot_share(robot)}/config/calibration/{tcp_mount(robot, tool)}_default.yaml'
 
 
 def _check_robot(robot):
     if robot not in ROBOTS:
-        raise SystemExit(f'Unknown CRX robot {robot!r}; expected one of {ROBOTS}.')
+        raise SystemExit(f'Unknown robot {robot!r}; expected one of {ROBOTS}.')
 
 
 def nominal_inner_chain(camera, optical_frame):
@@ -135,10 +167,10 @@ def live_inner_chain(root, optical_frame, timeout_s=5.0):
 
 def _camera_base(robot, camera):
     mount = CAMERAS[camera]['mount']
-    calibration_store.ensure_seeded(mount, camera_default(camera), robot)
-    base = calibration_store.active(mount, camera_default(camera), robot)
+    calibration_store.ensure_seeded(mount, camera_default(camera, robot), robot)
+    base = calibration_store.active(mount, camera_default(camera, robot), robot)
     if base is None:
-        raise SystemExit(f'No active {camera} calibration and no default at {camera_default(camera)}.')
+        raise SystemExit(f'No active {camera} calibration and no default at {camera_default(camera, robot)}.')
     return base
 
 
@@ -147,7 +179,7 @@ def apply_camera(robot, camera, calibration_yaml, target='real', inner_real=None
     """Write (and by default activate) a camera mount version. Returns (calibration_id, record)."""
     _check_robot(robot)
     if camera not in CAMERAS:
-        raise SystemExit(f'Unsupported CRX wrist camera {camera!r}; expected one of {tuple(CAMERAS)}.')
+        raise SystemExit(f'Unsupported wrist camera {camera!r}; expected one of {tuple(CAMERAS)}.')
     data, T = load_calibration(calibration_yaml, force)
     if data.get('robot_effector_frame') != EFFECTOR or data.get('calibration_type') != 'eye-in-hand':
         raise SystemExit(f'Expected an eye-in-hand calibration relative to {EFFECTOR!r} (CRX mounts '
@@ -201,12 +233,12 @@ def apply_camera(robot, camera, calibration_yaml, target='real', inner_real=None
     return calibration_id, record
 
 
-def _tcp_base(robot):
-    mount = calibration_store.CRX_WELDING_TCP
-    calibration_store.ensure_seeded(mount, tcp_default(), robot)
-    base = calibration_store.active(mount, tcp_default(), robot)
+def _tcp_base(robot, tool=None):
+    mount = tcp_mount(robot, tool)
+    calibration_store.ensure_seeded(mount, tcp_default(robot, tool), robot)
+    base = calibration_store.active(mount, tcp_default(robot, tool), robot)
     if base is None:
-        raise SystemExit(f'No active TCP calibration and no default at {tcp_default()}.')
+        raise SystemExit(f'No active TCP calibration and no default at {tcp_default(robot, tool)}.')
     return base
 
 
@@ -256,7 +288,7 @@ def parse_torch(value):
     return torch
 
 
-def _tcp_version(robot, base, target, origin, label, extra):
+def _tcp_version(robot, base, target, origin, label, extra, tool=None):
     record = {
         'label': label,
         'kind': 'tool_tcp',
@@ -276,32 +308,56 @@ def _tcp_version(robot, base, target, origin, label, extra):
         'translation_mm': round(float(np.linalg.norm(b[:3, 3] - a[:3, 3]) * 1000.0), 3),
         'wire_axis_deg': round(float(np.degrees(np.arccos(cos))), 4)}}
     record.update(extra)
-    mount = calibration_store.CRX_WELDING_TCP
-    return calibration_store.save_version(mount, record, robot=robot)
+    return calibration_store.save_version(tcp_mount(robot, tool), record, robot=robot)
 
 
 def apply_tcp(robot, calibration_yaml, target='real', force=False, label=None, activate=True,
-              torch=None):
-    """Pivot/touch-off result (flange -> tool, +Z = wire) -> new TCP store version."""
+              torch=None, tool=None, position=None, orientation=None, position_mm=None):
+    """New TCP store version whose position and orientation each come from the saved
+    YAML (pivot/touch-off, flange -> tool, +Z = wire), the active version, a manual
+    entry (position, mm in `flange`) or the tool model default (orientation); see
+    tcp_compose. Unset sources: what the YAML measured, the active TCP for the rest."""
     _check_robot(robot)
-    data, T = load_calibration(calibration_yaml, force)
-    parent = data.get('parent_frame') or data.get('robot_flange_frame')
-    if parent not in (None, EFFECTOR):
-        raise SystemExit(f'Expected a TCP relative to {EFFECTOR!r}, got {parent!r}.')
-    # Position-only / neck-angle orientations are built around the flange axis given to
-    # the collector; on the CRX `flange` that is +X (link6 Z would put the wire sideways).
-    axis = data.get('flange_axis')
-    if data.get('calibration_mode') in ('position', 'nominal') and not force and (
+    position, orientation = tcp_compose.resolve_sources(
+        position, orientation, position_mm, tcp_compose.peek_components(calibration_yaml))
+    base = _tcp_base(robot, tool)
+    current = base[target]
+    data = T = None
+    parent = None
+    if tcp_compose.needs_yaml(position, orientation):
+        tcp_compose.require_yaml(calibration_yaml, position, orientation)
+        data, T = load_calibration(calibration_yaml, force)
+        tcp_compose.resolve_sources(position, orientation, position_mm,
+                                    tcp_compose.yaml_components(data))
+        parent = data.get('parent_frame') or data.get('robot_flange_frame')
+        if parent not in (None, EFFECTOR):
+            raise SystemExit(f'Expected a TCP relative to {EFFECTOR!r}, got {parent!r}.')
+    # Neck-angle orientations are built around the flange axis given to the collector;
+    # on the CRX `flange` that is +X (link6 Z would put the wire sideways).
+    axis = (data or {}).get('flange_axis')
+    if orientation == 'calibration' and data.get('calibration_mode') == 'nominal' and not force and (
             axis is None or not np.allclose(np.asarray(axis, float) / np.linalg.norm(axis), FLANGE_AXIS)):
         raise SystemExit(f'{data.get("calibration_mode")!r} TCP was saved with flange_axis {axis}; the CRX '
                          f'flange axis is {list(FLANGE_AXIS)} (tool_tcp_calibration flange_axis:=1,0,0). '
                          'Recalibrate, or --force.')
-    base = _tcp_base(robot)
-    rotation = tcp_rotation(np.fromstring(base[target]['rpy'], sep=' '),
-                            base[target]['wire_axis_tcp'], T[:3, 2])
-    origin = {'xyz': _fmt(T[:3, 3]), 'rpy': _fmt(_rpy(rotation))}
-    extra = {
-        'source': {
+    origin = {}
+    if position == 'calibration':
+        origin['xyz'] = _fmt(T[:3, 3])
+    elif position == 'manual':
+        origin['xyz'] = _fmt(np.asarray(position_mm, float) / 1000.0)
+    if orientation == 'calibration':
+        rotation = tcp_rotation(np.fromstring(current['rpy'], sep=' '), current['wire_axis_tcp'], T[:3, 2])
+        origin['rpy'] = _fmt(_rpy(rotation))
+    elif orientation == 'default':
+        default_path = tcp_default(robot, tool)
+        default = calibration_store.load(default_path)[target]
+        origin['rpy'] = default['rpy']
+        origin['wire_axis_tcp'] = list(default['wire_axis_tcp'])
+    extra = {'composition': tcp_compose.composition_record(
+        position, orientation, position_mm, base.get('calibration_id'),
+        tcp_default(robot, tool) if orientation == 'default' else None)}
+    if data is not None:
+        extra['source'] = {
             'calibration_yaml': os.path.realpath(os.path.expanduser(calibration_yaml)),
             'sha256': calibration_store.sha256(calibration_yaml),
             'timestamp': data.get('timestamp'),
@@ -309,27 +365,27 @@ def apply_tcp(robot, calibration_yaml, target='real', force=False, label=None, a
             'parent_frame': parent,
             'transform': data.get('transform'),
             'source_note': data.get('source'),
-        },
-        'metrics': {
+        }
+        extra['metrics'] = {
             'acceptance_passed': (data.get('acceptance') or {}).get('passed'),
             'acceptance_summary': (data.get('acceptance') or {}).get('summary'),
             'sample_count': data.get('sample_count'),
             'validation_status': data.get('validation_status'),
             'rms_m': data.get('rms_m') or (data.get('quality') or {}).get('rms_m'),
-        },
-    }
+        }
     if torch:
         extra['torch'] = {**(base.get('torch') or {}), **parse_torch(torch)}
-    calibration_id, _path, record = _tcp_version(robot, base, target, origin, label, extra)
+    label = label or f'position {position}, orientation {orientation}'
+    calibration_id, _path, record = _tcp_version(robot, base, target, origin, label, extra, tool)
     if activate:
-        calibration_store.activate(calibration_store.CRX_WELDING_TCP, calibration_id, robot)
+        calibration_store.activate(tcp_mount(robot, tool), calibration_id, robot)
     return calibration_id, record
 
 
-def offset_tcp(robot, along_wire_mm, target='real', label=None, activate=True):
+def offset_tcp(robot, along_wire_mm, target='real', label=None, activate=True, tool=None):
     """Manual shift of the active TCP along its wire axis as a new version."""
     _check_robot(robot)
-    base = _tcp_base(robot)
+    base = _tcp_base(robot, tool)
     T = _origin_matrix(base[target])
     w = np.asarray(base[target]['wire_axis_tcp'], float)
     T[:3, 3] += T[:3, :3] @ (w / np.linalg.norm(w)) * (along_wire_mm / 1000.0)
@@ -337,15 +393,16 @@ def offset_tcp(robot, along_wire_mm, target='real', label=None, activate=True):
     label = label or f'{along_wire_mm:+.2f} mm along the wire from {base.get("calibration_id")}'
     calibration_id, _path, record = _tcp_version(
         robot, base, target, origin, label,
-        {'manual_offset': {'along_wire_mm': along_wire_mm, 'from_id': base.get('calibration_id')}})
+        {'manual_offset': {'along_wire_mm': along_wire_mm, 'from_id': base.get('calibration_id')}},
+        tool)
     if activate:
-        calibration_store.activate(calibration_store.CRX_WELDING_TCP, calibration_id, robot)
+        calibration_store.activate(tcp_mount(robot, tool), calibration_id, robot)
     return calibration_id, record
 
 
-def mount_name(kind, camera=None):
+def mount_name(kind, camera=None, robot='crx10ia_l', tool=None):
     if kind == 'tcp':
-        return calibration_store.CRX_WELDING_TCP
+        return tcp_mount(robot, tool)
     if camera not in CAMERAS:
         raise SystemExit(f'--camera is required for camera mounts ({"|".join(CAMERAS)}).')
     return CAMERAS[camera]['mount']
@@ -372,6 +429,8 @@ def _parse_inner(text):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--robot', choices=ROBOTS, default='crx10ia_l')
+    parser.add_argument('--tool', choices=sorted({t for v in TOOLS.values() for t in v}),
+                        help='alternative torch (TCP mount welding_tcp_<tool>); default: welding_tcp')
     sub = parser.add_subparsers(dest='kind', required=True)
     cam = sub.add_parser('camera')
     cam.add_argument('calibration_yaml', nargs='?', default='~/.ros/hand_eye_calibration.yaml')
@@ -385,6 +444,7 @@ def main(argv=None):
     tcp.add_argument('--target', choices=TCP_TARGETS, default='real')
     tcp.add_argument('--torch', help='torch dimensions JSON in metres (keys: ' + ', '.join(TORCH_KEYS) +
                      '); default: carried over from the active version')
+    tcp_compose.add_arguments(tcp)
     off = sub.add_parser('tcp-offset', help='shift the active TCP along the wire (new version)')
     off.add_argument('--along-wire-mm', type=float, required=True)
     off.add_argument('--target', choices=TCP_TARGETS, default='real')
@@ -410,15 +470,16 @@ def main(argv=None):
         return 0
     if args.kind == 'tcp':
         calibration_id, record = apply_tcp(robot, args.calibration_yaml, args.target, args.force,
-                                           args.label, not args.no_activate, args.torch)
-        _print_version(robot, calibration_id, record, calibration_store.CRX_WELDING_TCP, not args.no_activate)
+                                           args.label, not args.no_activate, args.torch, args.tool,
+                                           args.position, args.orientation, args.position_mm)
+        _print_version(robot, calibration_id, record, tcp_mount(robot, args.tool), not args.no_activate)
         return 0
     if args.kind == 'tcp-offset':
         calibration_id, record = offset_tcp(robot, args.along_wire_mm, args.target, args.label,
-                                            not args.no_activate)
-        _print_version(robot, calibration_id, record, calibration_store.CRX_WELDING_TCP, not args.no_activate)
+                                            not args.no_activate, args.tool)
+        _print_version(robot, calibration_id, record, tcp_mount(robot, args.tool), not args.no_activate)
         return 0
-    mount = mount_name(args.mount, args.camera)
+    mount = mount_name(args.mount, args.camera, robot, args.tool)
     if args.kind == 'list':
         for v in calibration_store.versions(mount, robot):
             print(f'{"*" if v["active"] else " "} {v["calibrationId"]}  {v["createdUtc"]}  '

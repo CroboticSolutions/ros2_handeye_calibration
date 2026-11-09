@@ -361,6 +361,7 @@ class PivotCalibrationBackend:
         alignment_samples,
         spike_axis_base=(0.0, 0.0, 1.0),
         tip_translation=None,
+        tool_toward_spike=False,
     ):
         """
         Recover the tool axis by physically aligning the tool's straight tip
@@ -386,6 +387,9 @@ class PivotCalibrationBackend:
         tip_translation: flange -> tip vector (from the tip pivot round). Used
         only to fix the axis SIGN so +Z points outward through the tip; without
         it the sign is taken from the first pose and may be flipped.
+        tool_toward_spike: without a tip translation, take the sign from the
+        alignment itself: the tool sits on the spike tip and points at it, so
+        +Z is -spike_axis_base (orientation-only calibration).
 
         Returns frame_from_axis(...) plus:
           alignment_spread_deg: max angle of any pose's axis from the mean
@@ -421,6 +425,8 @@ class PivotCalibrationBackend:
             t = np.asarray(tip_translation, dtype=float)
             nt = float(np.linalg.norm(t))
             ref = t / nt if nt > 1e-9 else dirs[0]
+        elif tool_toward_spike:
+            ref = -dirs[0]
         else:
             ref = dirs[0]
         signed = [d if float(np.dot(d, ref)) >= 0.0 else -d for d in dirs]

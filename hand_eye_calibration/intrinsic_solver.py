@@ -143,10 +143,16 @@ def evaluate(report, sigma_limit=.002, min_samples=20, translation_limit=POSITIO
         sig=(report.get('uncertainty') or {}).get('worst_direction_sigma_m')
         add('position_sigma_m',sig,sigma_limit,sig is not None and np.isfinite(sig) and sig<=sigma_limit)
         validation=report.get('validation_views')
-        if require_validation or validation:
+        held_out=bool(require_validation or validation)
+        if held_out:
             add('validation_views',(validation or {}).get('views',0),3,(validation or {}).get('views',0)>=3)
             for name,limit in [('position_max_m',VALIDATION_POSITION_MAX_LIMIT_M),('rotation_max_deg',3.)]:
                 value=(validation or {}).get(name)
                 add('validation_'+name,value,limit,value is not None and np.isfinite(value) and value<=limit)
     failed=[c['name'] for c in checks if not c['passed']]
-    return {'passed':not failed,'checks':checks,'summary':'All pose acceptance checks passed.' if not failed else 'Failed: '+', '.join(failed)}
+    held_out=bool(report) and held_out
+    # Manual capture: every view is training, so nothing was checked on unseen poses.
+    note='' if held_out else ' (no held-out validation views)'
+    summary=('All pose acceptance checks passed' if not failed else 'Failed: '+', '.join(failed))+note
+    return {'passed':not failed,'checks':checks,'summary':summary+('.' if not failed else ''),
+            'held_out_validation':held_out}

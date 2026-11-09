@@ -3,8 +3,8 @@
 The production stack (piper_orbbec_femto_bolt_welding_gun) does not use the
 generic mount joints the other Apply paths rewrite:
 
-camera  The Femto origin (femto_parent_link -> camera_base_link, link5 for the
-        real mount since 2026-10-05) is not in any xacro: it is a new immutable
+camera  The Femto origin (parent link -> camera_base_link) is not in any
+        xacro: it is a new immutable
         version in the robot's calibration store
         (~/.ros/calibration/<robot_id>/femto_bolt_handeye/, calibration_store.py)
         and current.yaml is repointed at it; the xacro loads that file. Each
@@ -15,6 +15,11 @@ camera  The Femto origin (femto_parent_link -> camera_base_link, link5 for the
         --target picks which origin is recomputed (real by default; a sim stack
         uses nominal); the other one is carried over from the active version.
         `list` and `activate <id>` show and roll back versions.
+        The parent link is the calibration's robot_effector_frame (link5 or
+        link6, picked in the GUI) and is stored as the version's parent_link,
+        which the xacro mounts the camera on. Moving the camera to the other
+        link recomputes both origins and is only allowed for the real target
+        (sim and real share the store).
 
 tcp     arm_tcp_joint (piper_welding_gun -> arm_tcp, identity mount on link6)
         is not in the xacro either: a version in the store's welding_gun_tcp
@@ -27,7 +32,8 @@ tcp     arm_tcp_joint (piper_welding_gun -> arm_tcp, identity mount on link6)
         change anything. `tcp-offset --along-wire-mm` stores a manual shift
         along the wire as its own version.
 
-Both refuse a YAML whose acceptance check failed. The caller pushes the new
+Both refuse a YAML whose acceptance check failed or is missing (apply_gate.py)
+unless --force. The caller pushes the new
 robot_description and restarts MoveIt (GUI Apply does both).
 """
 import argparse
@@ -42,17 +48,20 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation
 
-from hand_eye_calibration import calibration_store
+from hand_eye_calibration import calibration_store, tcp_compose
+from hand_eye_calibration.apply_gate import require_acceptance
 
 PIPER_URDF = '/root/arms_ws/src/robots/piper_ros/src/robot_description/piper_description/urdf'
 FEMTO_DEFAULT_YAML = f'{os.path.dirname(PIPER_URDF)}/config/calibration/femto_bolt_handeye_default.yaml'
 TCP_DEFAULT_YAML = f'{os.path.dirname(PIPER_URDF)}/config/calibration/welding_gun_tcp_default.yaml'
 GUN_XACRO = f'{PIPER_URDF}/piper_welding_gun.urdf.xacro'
 CAMERA_BASE = 'camera_base_link'
+# Links the Femto can be mounted on (GUI hand-eye "Camera mounted on").
+CAMERA_PARENTS = ('link5', 'link6')
 
 
 def femto_parent_link(gun_xacro=GUN_XACRO):
-    """Real-robot Femto parent link declared in the welding-gun xacro (link6 before 2026-10-05)."""
+    """Fallback Femto parent declared in the welding-gun xacro, for store versions without parent_link."""
     with open(gun_xacro) as f:
         match = re.search(r'<xacro:arg name="femto_parent_link" default="([^"]+)"', f.read())
     return match.group(1) if match else 'link6'
@@ -72,10 +81,7 @@ def _fmt(values):
 def load_calibration(path, force=False):
     with open(os.path.expanduser(path)) as f:
         data = yaml.safe_load(f)
-    acceptance = data.get('acceptance')
-    if acceptance is not None and not acceptance.get('passed') and not force:
-        raise SystemExit(f'{path}: acceptance failed ({acceptance.get("summary")}); refusing to apply. '
-                         'Use --force only if you know why.')
+    require_acceptance(data, path, force)
     t = data['transform']
     m = np.eye(4)
     m[:3, :3] = Rotation.from_quat([t['qx'], t['qy'], t['qz'], t['qw']]).as_matrix()
@@ -196,9 +202,13 @@ def camera_record(data, T_cal, calibration_yaml, base, inner_real=None, inner_no
         mm, deg = _delta(base[name], record[name])
         record['delta_from_previous'][name] = {'translation_mm': round(mm, 3), 'rotation_deg': round(deg, 4)}
         record[f'inner_chain_{name}'] = {'xyz': _fmt(inner[:3, 3]), 'quat_xyzw': _fmt(Rotation.from_matrix(inner[:3, :3]).as_quat())}
-    if base.get('parent_link') not in (None, parent):
-        raise SystemExit(f'Calibration parent {parent!r} differs from the active mount parent '
-                         f'{base.get("parent_link")!r}; recalibrate both origins or change the mount.')
+    previous_parent = base.get('parent_link') or femto_parent_link()
+    if previous_parent != parent:
+        # The carried-over origin would be relative to the old link.
+        if sorted(record['updated']) != ['nominal', 'real']:
+            raise SystemExit(f'Camera moved from {previous_parent} to {parent}: both the real and the '
+                             f'nominal origin must be recomputed (got {record["updated"]}).')
+        record['previous_parent_link'] = previous_parent
     record['source'] = {
         'calibration_yaml': os.path.realpath(os.path.expanduser(calibration_yaml)),
         'sha256': calibration_store.sha256(calibration_yaml),
@@ -216,20 +226,25 @@ def camera_record(data, T_cal, calibration_yaml, base, inner_real=None, inner_no
 def apply_camera(calibration_yaml, target='real', inner_real=None, force=False, label=None, activate=True):
     """Write (and by default activate) a store version. Returns (calibration_id, record)."""
     data, T = load_calibration(calibration_yaml, force)
-    parent = femto_parent_link()
-    if data.get('robot_effector_frame') != parent or data.get('calibration_type') != 'eye-in-hand':
-        raise SystemExit(f'Expected an eye-in-hand calibration relative to {parent} (the Femto '
-                         f'parent in {GUN_XACRO}), got {data.get("robot_effector_frame")!r}.')
+    parent = data.get('robot_effector_frame')
+    if parent not in CAMERA_PARENTS or data.get('calibration_type') != 'eye-in-hand':
+        raise SystemExit(f'Expected an eye-in-hand calibration relative to one of {CAMERA_PARENTS} '
+                         f'(the Femto mount links), got {parent!r}.')
     optical = data['tracking_base_frame']
-    real = nominal = None
-    if target in ('real', 'both'):
-        real = inner_real if inner_real is not None else live_inner_chain(optical)
-    if target in ('nominal', 'both'):
-        nominal = nominal_inner_chain(optical)
     calibration_store.ensure_seeded(calibration_store.FEMTO_HANDEYE, FEMTO_DEFAULT_YAML)
     base = calibration_store.active(calibration_store.FEMTO_HANDEYE, FEMTO_DEFAULT_YAML)
     if base is None:
         raise SystemExit(f'No active Femto calibration and no default at {FEMTO_DEFAULT_YAML}.')
+    moved = (base.get('parent_link') or femto_parent_link()) != parent
+    real = nominal = None
+    if target in ('real', 'both'):
+        real = inner_real if inner_real is not None else live_inner_chain(optical)
+    elif moved:
+        # Sim and real share the store: a sim calibration must not move the real camera.
+        raise SystemExit(f'The active calibration mounts the camera on {base.get("parent_link")}, this one '
+                         f'is on {parent}. Changing the mount link needs a calibration on the real robot.')
+    if target in ('nominal', 'both') or moved:
+        nominal = nominal_inner_chain(optical)
     record = camera_record(data, T, calibration_yaml, base, real, nominal, label)
     calibration_id, _path, record = calibration_store.save_version(calibration_store.FEMTO_HANDEYE, record)
     if activate:
@@ -281,16 +296,39 @@ def _tcp_base():
     return base
 
 
-def apply_tcp(calibration_yaml, target='real', force=False, label=None, activate=True):
-    """Pivot/touch-off result -> new TCP store version (activated by default)."""
-    data, T = load_calibration(calibration_yaml, force)
-    parent = data.get('parent_frame') or data.get('robot_flange_frame')
-    if parent not in (None, 'link6'):
-        raise SystemExit(f'Expected a TCP relative to link6, got {parent!r}.')
+def apply_tcp(calibration_yaml, target='real', force=False, label=None, activate=True,
+              position=None, orientation=None, position_mm=None):
+    """New TCP store version (activated by default). Position and orientation each come
+    from the saved pivot/touch-off YAML, the active version, a manual entry (position,
+    mm in link6 = piper_welding_gun) or the repo default (orientation); see tcp_compose.
+    Unset sources: what the YAML measured, the active TCP for the rest."""
+    position, orientation = tcp_compose.resolve_sources(
+        position, orientation, position_mm, tcp_compose.peek_components(calibration_yaml))
     base = _tcp_base()
-    xyz, rpy = tcp_origin(T, np.fromstring(base[target]['rpy'], sep=' '))
-    extra = {
-        'source': {
+    current = base[target]
+    data = T = None
+    parent = None
+    if tcp_compose.needs_yaml(position, orientation):
+        tcp_compose.require_yaml(calibration_yaml, position, orientation)
+        data, T = load_calibration(calibration_yaml, force)
+        tcp_compose.resolve_sources(position, orientation, position_mm,
+                                    tcp_compose.yaml_components(data))
+        parent = data.get('parent_frame') or data.get('robot_flange_frame')
+        if parent not in (None, 'link6'):
+            raise SystemExit(f'Expected a TCP relative to link6, got {parent!r}.')
+    measured_xyz, measured_rpy = (tcp_origin(T, np.fromstring(current['rpy'], sep=' '))
+                                  if T is not None else (None, None))
+    xyz = {'calibration': lambda: _fmt(measured_xyz),
+           'manual': lambda: _fmt(np.asarray(position_mm, float) / 1000.0),
+           'active': lambda: current['xyz']}[position]()
+    rpy = {'calibration': lambda: _fmt(measured_rpy),
+           'default': lambda: calibration_store.load(TCP_DEFAULT_YAML)[target]['rpy'],
+           'active': lambda: current['rpy']}[orientation]()
+    extra = {'composition': tcp_compose.composition_record(
+        position, orientation, position_mm, base.get('calibration_id'),
+        TCP_DEFAULT_YAML if orientation == 'default' else None)}
+    if data is not None:
+        extra['source'] = {
             'calibration_yaml': os.path.realpath(os.path.expanduser(calibration_yaml)),
             'sha256': calibration_store.sha256(calibration_yaml),
             'timestamp': data.get('timestamp'),
@@ -298,16 +336,16 @@ def apply_tcp(calibration_yaml, target='real', force=False, label=None, activate
             'parent_frame': parent,
             'transform': data.get('transform'),
             'source_note': data.get('source'),
-        },
-        'metrics': {
+        }
+        extra['metrics'] = {
             'acceptance_passed': (data.get('acceptance') or {}).get('passed'),
             'acceptance_summary': (data.get('acceptance') or {}).get('summary'),
             'sample_count': data.get('sample_count'),
             'validation_status': data.get('validation_status'),
             'rms_m': data.get('rms_m') or (data.get('quality') or {}).get('rms_m'),
-        },
-    }
-    calibration_id, record = _tcp_version(base, target, {'xyz': _fmt(xyz), 'rpy': _fmt(rpy)}, label, extra)
+        }
+    label = label or f'position {position}, orientation {orientation}'
+    calibration_id, record = _tcp_version(base, target, {'xyz': xyz, 'rpy': rpy}, label, extra)
     if activate:
         calibration_store.activate(calibration_store.WELDING_GUN_TCP, calibration_id)
     return calibration_id, record
@@ -351,6 +389,7 @@ def main(argv=None):
     tcp = sub.add_parser('tcp')
     tcp.add_argument('calibration_yaml', nargs='?', default='~/.ros/tool_tcp_calibration.yaml')
     tcp.add_argument('--target', choices=('real', 'sim'), default='real')
+    tcp_compose.add_arguments(tcp)
     off = sub.add_parser('tcp-offset', help='shift the active TCP along the wire (new version)')
     off.add_argument('--along-wire-mm', type=float, required=True)
     off.add_argument('--target', choices=('real', 'sim'), default='real')
@@ -380,7 +419,8 @@ def main(argv=None):
     if args.kind in ('tcp', 'tcp-offset'):
         if args.kind == 'tcp':
             calibration_id, record = apply_tcp(args.calibration_yaml, args.target, args.force,
-                                               args.label, not args.no_activate)
+                                               args.label, not args.no_activate, args.position,
+                                               args.orientation, args.position_mm)
         else:
             calibration_id, record = offset_tcp(args.along_wire_mm, args.target, args.label,
                                                 not args.no_activate)

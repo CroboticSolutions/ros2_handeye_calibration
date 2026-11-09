@@ -31,9 +31,12 @@ from tf2_ros.transform_listener import TransformListener
 from .calibration_backend import CalibrationBackend
 from .calibration_status import build_calibration_status, status_to_json
 from .capture_timing import LatencyModel, ObservationBuffer, frame_record, parse_observation
-from . import acceptance as acceptance_gate
 from . import calibration_dataset
 from . import board_check
+
+# Node-level save limits (accept_* parameters); the pose checks themselves are in
+# intrinsic_solver.evaluate. min_samples: manual runs need max(20, this) training poses.
+ACCEPTANCE_DEFAULTS = {'min_samples': 12, 'max_position_sigma_m': 0.002}
 
 
 def get_transform(tf_message: Transform):
@@ -122,9 +125,10 @@ class DataCollector(Node):
         # A frame is used only if the robot was already at the same pose this
         # long before the frame's stamp (exposure after the robot stopped).
         self.declare_parameter('stationary_window_s', 0.3)
-        # 'reprojection' (default) or 'axxb' (closed form + AX=XB refinement only).
+        # Only 'intrinsic_pose' (Shah + joint pose fit, intrinsic_solver.py). The online
+        # 'reprojection' and 'axxb' modes were removed 2026-11-05 (the GUI never used them);
+        # handeye_offline_solve still runs the reprojection solve on a saved dataset.
         self.declare_parameter('solver', 'intrinsic_pose')
-        self.declare_parameter('estimate_intrinsics', False)
         # Every save writes the raw dataset (corners, poses, joints, images)
         # here, so the result can be re-solved and compared offline.
         self.declare_parameter('dataset_dir', os.path.expanduser('~/.ros/hand_eye_calibration_runs'))
@@ -138,7 +142,7 @@ class DataCollector(Node):
         # 'enforce': a result that fails acceptance is written only as
         # <calibration_file>.rejected.yaml. 'warn': written anyway, flagged.
         self.declare_parameter('acceptance_mode', 'enforce')
-        for key, value in acceptance_gate.DEFAULT_LIMITS.items():
+        for key, value in ACCEPTANCE_DEFAULTS.items():
             self.declare_parameter('accept_' + key, value)
         # Touch-off validation: TCP frame that is brought onto a board corner.
         self.declare_parameter('touchoff_tcp_frame', 'arm_tcp')
@@ -159,15 +163,15 @@ class DataCollector(Node):
         self.capture_burst_samples = int(self.get_parameter('capture_burst_samples').value)
         self.bootstrap_samples = int(self.get_parameter('bootstrap_samples').value)
         self.solver_name = str(self.get_parameter('solver').value)
-        if self.solver_name not in ('intrinsic_pose', 'reprojection', 'axxb'):
-            raise ValueError("solver must be 'intrinsic_pose', 'reprojection' or 'axxb'")
-        self.estimate_intrinsics = bool(self.get_parameter('estimate_intrinsics').value)
+        if self.solver_name != 'intrinsic_pose':
+            raise ValueError(f"solver {self.solver_name!r} was removed; only 'intrinsic_pose' is supported "
+                             "(offline reprojection solve: handeye_offline_solve)")
         self.stationary_window_s = float(self.get_parameter('stationary_window_s').value)
         self.acceptance_mode = str(self.get_parameter('acceptance_mode').value)
         if self.acceptance_mode not in ('enforce', 'warn'):
             raise ValueError("acceptance_mode must be 'enforce' or 'warn'")
         self.acceptance_limits = {key: type(value)(self.get_parameter('accept_' + key).value)
-                                  for key, value in acceptance_gate.DEFAULT_LIMITS.items()}
+                                  for key, value in ACCEPTANCE_DEFAULTS.items()}
         self.latency = LatencyModel(margin_s=float(self.get_parameter('latency_margin_s').value),
                                     configured_s=float(self.get_parameter('camera_latency_s').value))
         self.observations = ObservationBuffer()
@@ -236,7 +240,6 @@ class DataCollector(Node):
         self.sample_images = list()
         self._last_reprojection = None
         self._last_acceptance = None
-        self._reprojection_state = None
         self.touchoff_references = {}
         self.touchoff_results = []
         self.board_check_views = {}
@@ -286,14 +289,22 @@ class DataCollector(Node):
             touchoff=self.touchoff_results[-5:],
             board_check=self.board_check_summary,
         )
-        if self.solver_name == 'intrinsic_pose':
-            report = self._last_reprojection
-            passed = bool(self._last_acceptance and self._last_acceptance['passed'])
-            status.update(solver='intrinsic_pose', pose_calibration=self._reprojection_summary(),
-                          reprojection=None, ready_to_save=passed,
-                          readiness='excellent' if passed else 'collecting',
-                          summary='Pose calibration accepted.' if passed else
-                          'Collect diverse poses; joint solve and independent validation determine acceptance.')
+        passed = bool(self._last_acceptance and self._last_acceptance['passed'])
+        held_out = bool(self._last_acceptance and self._last_acceptance.get('held_out_validation'))
+        automatic = bool(getattr(getattr(self, 'automatic', None), 'active', False))
+        if passed:
+            summary = ('Pose calibration accepted.' if held_out else
+                       'Pose calibration accepted (manual: no held-out validation).')
+        elif automatic:
+            summary = 'Collect diverse poses; the joint solve, bootstrap sigma and held-out validation views decide.'
+        else:
+            # Manual captures are all training views: nothing checks them on unseen poses.
+            summary = ('Collect diverse poses; the joint solve and bootstrap sigma decide. '
+                       'Manual: no held-out validation (automatic mode adds validation views).')
+        status.update(solver='intrinsic_pose', pose_calibration=self._reprojection_summary(),
+                      reprojection=None, ready_to_save=passed,
+                      readiness='excellent' if passed else 'collecting', summary=summary,
+                      held_out_validation=held_out)
         self._status_payload = status
         if hasattr(self, "automatic"):
             status = {**status, "automatic": dict(self.automatic.status)}
@@ -335,7 +346,7 @@ class DataCollector(Node):
                        self.sample_joints, self.sample_roles, self.sample_images):
             values.clear()
         self._last_uncertainty = self._last_calibration_detail = None
-        self._last_reprojection = self._last_acceptance = self._reprojection_state = None
+        self._last_reprojection = self._last_acceptance = None
 
     def drop_last_sample(self):
         for values in (self.robot_samples, self.tracking_samples, self.sample_metrics, self.sample_frames,
@@ -736,56 +747,17 @@ class DataCollector(Node):
         return [{'robot': self.robot_samples[i], 'tracking': self.tracking_samples[i],
                  'frames': self.sample_frames[i], 'joints': self.sample_joints[i]} for i in indices]
 
-    def _camera(self):
-        from .reprojection_calibration import Camera
-        if self._camera_model is None:
-            return None
-        return Camera.from_dict(self._camera_model)
-
     def _reprojection_summary(self):
         report = self._last_reprojection
         if not report:
             return None
-        keys = ('board_in_base', 'pose_metrics', 'geometry', 'algorithm', 'optimizer', 'upstream_commit', 'solver', 'reprojection_rms_px', 'training_views', 'rejected_views', 'board_spread',
-                'leave_one_out', 'validation_views', 'initial_delta_translation_m',
-                'initial_delta_rotation_deg', 'intrinsics', 'refinement_comparison',
-                'axxb_rejected_views', 'reprojection_rejected_views', 'kept_views')
+        keys = ('board_in_base', 'pose_metrics', 'geometry', 'algorithm', 'optimizer', 'upstream_commit', 'solver',
+                'training_views', 'validation_views')
         summary = {k: report.get(k) for k in keys if report.get(k) is not None}
         for key in ('board_spread', 'leave_one_out', 'validation_views'):
             if isinstance(summary.get(key), dict):
                 summary[key] = {k: v for k, v in summary[key].items() if not k.startswith('per_view')}
         return summary
-
-    def _solve_reprojection(self, closed_form, full=False, rejected_indices=()):
-        """Final estimate from corner pixels. `full` adds leave-one-out,
-        validation views and bootstrap (seconds); otherwise only the fit."""
-        from .reprojection_calibration import Dataset, calibrate, pose_matrix
-        if self.solver_name != 'reprojection':
-            return None
-        camera = self._camera()
-        training, validation = self.training_indices(), self.validation_indices()
-        if camera is None or any(not self.sample_frames[i] for i in training):
-            return None
-        order = training + validation
-        dataset = Dataset(self._dataset_samples(order), camera, self.calibration_type)
-        if len(dataset) != len(order):
-            return None
-        report = calibrate(dataset, pose_matrix(closed_form), estimate_intrinsics=self.estimate_intrinsics,
-                           validation_indices=list(range(len(training), len(order))),
-                           bootstrap_samples=self.bootstrap_samples if full else 0, leave_one_out=full,
-                           excluded_indices=rejected_indices, compare_refinement_cv=full)
-        solution = report.pop('_solution')
-        # Map dataset indices back to sample indices for reporting.
-        for key in ('rejected_views', 'axxb_rejected_views', 'reprojection_rejected_views', 'kept_views'):
-            report[key] = [order[i] for i in report[key]]
-        for fold in (report.get('refinement_comparison') or {}).get('folds', []):
-            fold['held_out'] = order[fold['held_out']]
-            fold['fit_indices'] = [order[i] for i in fold['fit_indices']]
-        report['training_sample_indices'] = training
-        report['validation_sample_indices'] = validation
-        report['closed_form_transform'] = list(closed_form)
-        self._reprojection_state = (dataset, solution)
-        return report
 
     def _get_intrinsic_calibration(self, full=False):
         from . import intrinsic_solver as solver
@@ -812,7 +784,6 @@ class DataCollector(Node):
             return None
         self._last_reprojection = report
         self._last_acceptance = solver.evaluate(report, require_validation=bool(getattr(getattr(self, 'automatic', None), 'active', False)))
-        self._reprojection_state = None
         self._last_uncertainty = report.get('uncertainty')
         self._last_calibration_detail = dict(transform=report['transform'], algorithm_used='SHAH+NONLINEAR',
                                              kept_indices=list(range(len(robot))), rejected_indices=[],
@@ -820,133 +791,15 @@ class DataCollector(Node):
         return report['transform']
 
     def get_calibration(self, full=False):
-        if self.solver_name == 'intrinsic_pose':
-            return self._get_intrinsic_calibration(full)
-        robot, tracking = self._training_samples()
-        if len(robot) < 4:
-            self.get_logger().info("Not enough samples yet...")
-            return None
-
-        self.get_logger().info("Estimating ...")
-        try:
-            detail = CalibrationBackend.compute_calibration_detailed(
-                samples_robot=robot, samples_tracking=tracking)
-        except (RuntimeError, ValueError) as exc:
-            # The backend translates OpenCV's cv2.error into RuntimeError, so
-            # a degenerate pose set surfaces here as a failed service call
-            # rather than as an exception escaping into the executor.
-            self.get_logger().error(f"Calibration failed: {exc}")
-            self._last_calibration_detail = None
-            return None
-
-        self._last_reprojection = None
-        try:
-            report = self._solve_reprojection(detail['transform'], full=full,
-                                              rejected_indices=detail['rejected_indices'])
-        except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
-            self.get_logger().error(f"Reprojection solve failed, keeping the closed-form estimate: {exc}")
-            report = None
-        if report is not None:
-            self._last_reprojection = report
-            detail = dict(detail)
-            detail['axxb_transform'] = detail['transform']
-            detail['transform'] = report['transform']
-            # Report residuals on the final survivor set, not the earlier
-            # AX=XB set if pixel refinement rejected more views.
-            global_to_training = {v: i for i, v in enumerate(report['training_sample_indices'])}
-            detail['kept_indices'] = [global_to_training[i] for i in report['kept_views']]
-            detail['rejected_indices'] = [global_to_training[i] for i in report['rejected_views']]
-            detail['residuals'] = CalibrationBackend.pairwise_residuals(
-                robot, tracking, report['transform'], indices=detail['kept_indices'])
-            self.get_logger().info(
-                f"Reprojection solve: RMS {report['reprojection_rms_px']:.2f} px over {report['training_views']} views, "
-                f"moved the AX=XB estimate by {report['initial_delta_translation_m'] * 1000:.2f} mm / "
-                f"{report['initial_delta_rotation_deg']:.3f} deg; board spread "
-                f"{report['board_spread']['position_rms_m'] * 1000:.2f} mm RMS")
-        self._last_calibration_detail = detail
-        if detail['rejected_indices']:
-            self.get_logger().warning(
-                f"Rejected {len(detail['rejected_indices'])} outlier sample(s) "
-                f"(indices {detail['rejected_indices']}) as inconsistent with the rest before fitting."
-            )
-        refinement = detail['refinement']
-        self.get_logger().info(
-            f"Hand-eye algorithm: {detail['algorithm_used']} (selected by leave-one-pose-out validation of "
-            "Tsai/Park/Horaud/Andreff/Daniilidis); nonlinear refinement moved the estimate by "
-            f"{refinement['delta_translation_m'] * 1000:.2f}mm / {refinement['delta_rotation_deg']:.3f}deg"
-        )
-        return detail['transform']
+        return self._get_intrinsic_calibration(full)
 
     def _compute_uncertainty(self, cal):
-        """Bootstrap the calibration uncertainty for the current sample set.
-
-        Returns None when disabled or when there is not enough data. Slow by
-        design (a full refit per resample), so callers decide when to pay it.
-        """
-        if self.solver_name == 'intrinsic_pose':
-            if cal is None:
-                return None
-            self._get_intrinsic_calibration(full=True)
-            return self._last_uncertainty
-        if self.bootstrap_samples <= 0:
+        """Pose bootstrap of the current training set (``bootstrap_samples`` refits;
+        seconds), so callers decide when to pay it. None without an estimate."""
+        if cal is None:
             return None
-        detail = self._last_calibration_detail
-        if cal is None or detail is None:
-            return None
-
-        robot, tracking = self._training_samples()
-        cache_key = (tuple(cal), detail['algorithm_used'], self.bootstrap_samples,
-                     tuple(map(tuple, robot)), tuple(map(tuple, tracking)))
-        cached = getattr(self, '_uncertainty_cache', None)
-        if cached is not None and cached[0] == cache_key:
-            self._last_uncertainty = cached[1]
-            return cached[1]
-        self.get_logger().info(
-            f"Estimating calibration uncertainty ({self.bootstrap_samples} bootstrap resamples), "
-            "this takes a few seconds..."
-        )
-        try:
-            state = self._reprojection_state
-            if (self._last_reprojection is not None and state is not None
-                    and list(cal) == list(self._last_reprojection['transform'])):
-                from .reprojection_calibration import ReprojectionSolver
-                solver = ReprojectionSolver(state[0], estimate_intrinsics=self.estimate_intrinsics)
-                uncertainty = solver.bootstrap(state[1], n=self.bootstrap_samples)
-                if uncertainty is not None:
-                    uncertainty['guidance'] = CalibrationBackend._uncertainty_guidance(
-                        uncertainty['worst_direction_sigma_m'], uncertainty['best_direction_sigma_m'],
-                        np.asarray(uncertainty['worst_direction_axis']))
-            else:
-                uncertainty = CalibrationBackend.bootstrap_uncertainty(
-                    samples_robot=robot,
-                    samples_tracking=tracking,
-                    nominal_transform=cal,
-                    algorithm=detail['algorithm_used'],
-                    n_bootstrap=self.bootstrap_samples,
-                )
-        except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
-            self.get_logger().warning(f"Uncertainty estimation failed: {exc}")
-            return None
-
-        if uncertainty is None:
-            self.get_logger().warning(
-                "Uncertainty estimation did not converge on enough resamples "
-                "(too few or too similar samples)."
-            )
-            return None
-
-        sig = uncertainty['translation_sigma_m']
-        rot_sig = uncertainty['rotation_sigma_deg']
-        self.get_logger().info(
-            "Calibration uncertainty (1 sigma, %d resamples): "
-            "translation +/- [%.2f, %.2f, %.2f] mm, rotation +/- [%.3f, %.3f, %.3f] deg"
-            % (uncertainty['n_bootstrap'], sig[0] * 1000, sig[1] * 1000, sig[2] * 1000,
-               rot_sig[0], rot_sig[1], rot_sig[2])
-        )
-        self.get_logger().info("Uncertainty guidance: " + uncertainty['guidance'])
-        self._last_uncertainty = uncertainty
-        self._uncertainty_cache = (cache_key, uncertainty)
-        return uncertainty
+        self._get_intrinsic_calibration(full=True)
+        return self._last_uncertainty
 
     def estimate_uncertainty_service_callback(self, req: Trigger.Request, resp: Trigger.Response):
         if (hasattr(self, 'automatic') and self.automatic.active
@@ -1015,24 +868,15 @@ class DataCollector(Node):
             limits = dict(self.acceptance_limits)
             if self.automatic.active:
                 limits['max_position_sigma_m'] = self.automatic.max_position_sigma
-            if self.solver_name == 'intrinsic_pose':
-                from .intrinsic_solver import evaluate
-                # Automatic runs: at least six initial plus the main views, the run's
-                # own gate (12 main views by default, so 20 would reject a run that
-                # kept only six or seven initial views).
-                min_samples = (6 + self.automatic.min_training_samples if self.automatic.active
-                               else max(20, limits['min_samples']))
-                verdict = evaluate(report, sigma_limit=limits['max_position_sigma_m'],
-                                   min_samples=min_samples, require_validation=self.automatic.active)
-            else:
-                verdict = acceptance_gate.evaluate(report, self.training_count(), limits)
-            if report is None and self.solver_name == 'axxb':
-                # Explicit legacy mode: judge on sample count and bootstrap only.
-                verdict = acceptance_gate.evaluate(
-                    {'uncertainty': uncertainty, 'board_spread': {'position_rms_m': 0.0},
-                     'leave_one_out': {'position_rms_m': 0.0, 'reprojection_rms_px': 0.0}},
-                    self.training_count(), limits)
-                verdict['summary'] += ' (legacy AX=XB mode: no held-out validation)'
+            from .intrinsic_solver import evaluate
+            # Automatic runs: at least six initial plus the main views, the run's
+            # own gate (12 main views by default, so 20 would reject a run that
+            # kept only six or seven initial views). Manual runs have no held-out
+            # views (every capture is training); the verdict says so explicitly.
+            min_samples = (6 + self.automatic.min_training_samples if self.automatic.active
+                           else max(20, limits['min_samples']))
+            verdict = evaluate(report, sigma_limit=limits['max_position_sigma_m'],
+                               min_samples=min_samples, require_validation=self.automatic.active)
             self._last_acceptance = verdict
             detail = self._last_calibration_detail or {}
             data = {
@@ -1061,12 +905,9 @@ class DataCollector(Node):
                 },
                 'solver': self.solver_name,
                 'algorithm_used': detail.get('algorithm_used'),
-                'algorithm_selection': detail.get('algorithm_selection'),
-                'axxb_transform': None if self.solver_name == 'intrinsic_pose' else detail.get('axxb_transform', detail.get('transform')),
                 'rejected_sample_indices': [self.training_indices()[i] for i in detail.get('rejected_indices', [])],
                 'nonlinear_refinement': detail.get('refinement'),
-                'reprojection': self._reprojection_summary() if self.solver_name != 'intrinsic_pose' else None,
-                'pose_calibration': self._reprojection_summary() if self.solver_name == 'intrinsic_pose' else None,
+                'pose_calibration': self._reprojection_summary(),
                 'uncertainty': uncertainty,
                 'acceptance': verdict,
                 'camera_latency': self.latency.stats(),

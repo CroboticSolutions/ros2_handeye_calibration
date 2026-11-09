@@ -490,6 +490,7 @@ def build_axis_status(
     tip_ready: bool,
     align_ready: bool,
     axis: dict[str, Any] | None,
+    orientation_only: bool = False,
 ) -> dict[str, Any]:
     """
     Readiness/checklist for the axis combine step (align-to-spike method).
@@ -499,13 +500,19 @@ def build_axis_status(
     spread_deg = axis.get("alignment_spread_deg") if axis else None
     sample_count = axis.get("sample_count") if axis else None
 
-    checklist: list[dict[str, Any]] = [
+    # Orientation only: the TCP position comes from elsewhere (manual entry or the
+    # active TCP), so the tip round is not needed.
+    if orientation_only:
+        tip_ready = True
+    checklist: list[dict[str, Any]] = [] if orientation_only else [
         {
             "id": "tip_round_ready",
             "label": "Tip round ready",
             "ok": tip_ready,
             "detail": "position of the tool tip is fitted" if tip_ready else "collect more tip touches",
         },
+    ]
+    checklist += [
         {
             "id": "align_round_ready",
             "label": "Alignment pose captured",
@@ -529,7 +536,12 @@ def build_axis_status(
         )
 
     guidance: list[str] = []
-    if not tip_ready or not align_ready:
+    if orientation_only and not align_ready:
+        guidance.append(
+            "Hold the tool collinear with the spike (tip on the spike tip) and capture "
+            "alignment poses, then compute the axis."
+        )
+    elif not tip_ready or not align_ready:
         guidance.append(
             "Do the tip round, then hold the tool collinear with the spike and capture "
             "an alignment pose before computing the axis."
@@ -596,8 +608,9 @@ def build_tool_tcp_status(
     """
     Top-level status for the GUI. Wraps the tip pivot round and (in axis mode)
     the axis-alignment round, plus the axis combine readiness. ``mode`` is
-    "position" (single-point, orientation defaults to the flange) or "axis"
-    (tip position + tool axis from the align-to-spike round). The alignment
+    "position" (tip position only), "axis" (tip position + tool axis from the
+    align-to-spike round) or "orientation" (tool axis only, no tip round; the
+    position comes from a manual entry or the active TCP at Apply). The alignment
     round is published under the "axis_ref" key for GUI backward-compat.
     """
     tip = build_pivot_status(flange_samples=tip_samples, pivot=tip_pivot)
@@ -612,7 +625,13 @@ def build_tool_tcp_status(
     if tip.get("fixed_point") is not None:
         axis_status["tip_fixed_point"] = tip["fixed_point"]
 
-    if mode == "axis":
+    if mode == "orientation":
+        axis_status = build_axis_status(tip_ready=True, align_ready=align["ready_to_save"],
+                                        axis=axis, orientation_only=True)
+        if tip.get("fixed_point") is not None:
+            axis_status["tip_fixed_point"] = tip["fixed_point"]
+        ready_to_save = axis_status["ok"]
+    elif mode == "axis":
         ready_to_save = axis_status["ok"]
     else:
         ready_to_save = tip["ready_to_save"]
