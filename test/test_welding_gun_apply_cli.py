@@ -1,3 +1,4 @@
+import shutil
 import numpy as np
 import pytest
 import yaml
@@ -133,7 +134,7 @@ def test_camera_on_unknown_link_is_refused(store):
 
 def test_camera_moved_to_link6_recomputes_both_origins(store, monkeypatch):
     nominal_inner = cli._matrix([.02, 0, 0], [0, 0, .1])
-    monkeypatch.setattr(cli, 'nominal_inner_chain', lambda _optical: nominal_inner)
+    monkeypatch.setattr(cli, 'nominal_inner_chain', lambda _optical, *_a: nominal_inner)
     T = cli._matrix([.0, -.05, .04], [.2, .1, -1.2])
     inner = cli._matrix([.01, .02, .03], [-1.57, 0, -1.57])
     path = write(store, 'l6.yaml', yaml.safe_load(open(_cam_yaml(store, T))) | {'robot_effector_frame': 'link6'})
@@ -146,7 +147,7 @@ def test_camera_moved_to_link6_recomputes_both_origins(store, monkeypatch):
 
 
 def test_sim_calibration_cannot_move_the_camera(store, monkeypatch):
-    monkeypatch.setattr(cli, 'nominal_inner_chain', lambda _optical: np.eye(4))
+    monkeypatch.setattr(cli, 'nominal_inner_chain', lambda _optical, *_a: np.eye(4))
     path = write(store, 'l6.yaml', CAM | {'robot_effector_frame': 'link6', 'transform': TCP_V1})
     with pytest.raises(SystemExit, match='real robot'):
         cli.apply_camera(path, 'nominal')
@@ -200,3 +201,44 @@ def test_tcp_cli_position_mm_flag(tcp_store, capsys):
     record = cli.calibration_store.active(cli.calibration_store.WELDING_GUN_TCP)
     np.testing.assert_allclose(np.fromstring(record['real']['xyz'], sep=' '), [0.03, 0, 0.11])
     assert record['composition']['position'] == 'manual'
+
+
+GEMINI_CAM = CAM | {'tracking_base_frame': 'gemini_color_optical_frame'}
+
+
+@pytest.fixture
+def gemini_store(store, monkeypatch):
+    default = store / 'gemini_default.yaml'
+    default.write_text(yaml.safe_dump(BASE | {'calibration_id': 'gemini-default'}))
+    monkeypatch.setattr(cli, 'GEMINI_DEFAULT_YAML', str(default))
+    return store
+
+
+def test_gemini_real_apply_uses_own_mount_and_driver_root(gemini_store):
+    T = cli._matrix([-.06, -.1, -.01], [1.7, 0, -1.56])
+    inner = cli._matrix([0, -.024, 0], [-1.5708, 0, -1.5708])
+    path = write(gemini_store, 'g.yaml', GEMINI_CAM | {'transform': dict(zip(
+        ('tx', 'ty', 'tz', 'qx', 'qy', 'qz', 'qw'),
+        [*T[:3, 3].tolist(), *Rotation.from_matrix(T[:3, :3]).as_quat().tolist()]))})
+    calibration_id, record = cli.apply_camera(path, 'real', inner, camera='gemini_336l')
+    assert record['child_link'] == 'gemini_link' and record['camera'] == 'gemini_336l'
+    np.testing.assert_allclose(cli._origin_matrix(record['real']) @ inner, T, atol=1e-9)
+    assert cli.calibration_store.active(cli.calibration_store.GEMINI_HANDEYE)['calibration_id'] == calibration_id
+    # The Femto store is untouched.
+    assert cli.calibration_store.versions(cli.calibration_store.FEMTO_HANDEYE) == []
+
+
+def test_gemini_base_frame_from_optical_prefix():
+    assert cli.camera_base_frame('gemini_336l', 'gemini_color_optical_frame') == 'gemini_link'
+    assert cli.camera_base_frame('gemini_336l', 'camera_color_optical_frame') == 'camera_link'
+    assert cli.camera_base_frame('femto_bolt', 'camera_color_optical_frame') == 'camera_base_link'
+    with pytest.raises(SystemExit):
+        cli.camera_base_frame('gemini_336l', 'oak_rgb_camera_frame')
+
+
+@pytest.mark.skipif(shutil.which('xacro') is None, reason='xacro not on PATH')
+def test_gemini_nominal_chain_matches_vendor_colour_offset():
+    m = cli.nominal_inner_chain('camera_color_optical_frame', 'gemini_336l')
+    np.testing.assert_allclose(m[:3, 3], [0, -0.02375, 0], atol=1e-9)
+    # Optical z (viewing direction) = camera_link +X.
+    np.testing.assert_allclose(m[:3, 2], [1, 0, 0], atol=1e-3)

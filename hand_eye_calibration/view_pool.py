@@ -1,7 +1,10 @@
 """Main/validation views for automatic hand-eye acquisition.
 
-One IK for every six-joint camera chain: ssik (``hand_teleop.analytic_ik.AnalyticIK``),
-which returns every branch (FK-checked there) on PiPER, CRX and UR. A camera before
+One analytic IK for every six-joint camera chain: ``arm_ik.make_solver(kind, ...)`` with
+``kind`` from the node parameter ``ik_backend`` ('eaik' UR, 'ssik' CRX and the default,
+'closed_form' PiPER; 'analytic' = deprecated alias of 'ssik'; 'service' = no analytic
+pool, the local random sampler). Every kind returns all principal branches, FK-checked
+against the URDF chain; the winding nearest the reference is taken here. A camera before
 the last joint (PiPER link5, UR wrist_2_link) cannot reach arbitrary 6-D poses; its
 views come from sampled joints (``joint_space_views``). Both share the limits below.
 
@@ -35,12 +38,31 @@ from scipy.spatial.transform import Rotation as R
 JOINT_LIMIT_MARGIN_RAD = 0.10
 DISTANCE_SCALE = (0.8, 1.15)          # camera-board distance relative to the reference view
 MIN_ELEVATION_DEG = 40.0              # camera direction above the board plane
-BATCH = 250                           # IK costs ~2 ms per target
+BATCH = 250                           # orbit samples per ik_many batch
 MAX_CANDIDATES = 5000
 POOL_PER_VIEW = 3                     # feasible candidates wanted per requested view
 ARM_JOINTS = 3                        # joints limited by max_arm_joint_change_deg
 WRIST_BEND_JOINT = 4                  # J5: stays on the reference's side of 0
 WRIST_CLEAR_RAD = np.deg2rad(10.)
+FK_CHECK_TOLERANCE = 1e-6             # m and matrix elements: solver chain vs the runner's effector FK
+
+IK_BACKENDS = ('service', 'eaik', 'ssik', 'closed_form')
+IK_BACKEND_ALIASES = {'analytic': 'ssik'}   # deprecated name of the ssik backend
+DEFAULT_IK_BACKEND = 'ssik'
+
+
+def normalize_ik_backend(value):
+    """``ik_backend`` parameter value -> one of IK_BACKENDS (shared with hand_teleop
+    and launch_server); ValueError for anything else."""
+    kind = str(value if value is not None else DEFAULT_IK_BACKEND).strip().lower() or DEFAULT_IK_BACKEND
+    kind = IK_BACKEND_ALIASES.get(kind, kind)
+    if kind not in IK_BACKENDS:
+        raise ValueError(f'ik_backend {value!r} is not one of {IK_BACKENDS} (or the alias \'analytic\')')
+    return kind
+
+
+class ViewPoolUnavailable(ValueError):
+    """The analytic view pool cannot be built for this chain; the message says why."""
 
 
 @dataclass(frozen=True)
@@ -192,56 +214,109 @@ def shortest_route(start, entries):
 
 
 class AnalyticIKViews:
-    """View pool for a six-joint camera chain: orbit samples, every ssik branch,
-    the branch nearest the reference inside the joint window."""
+    """View pool for a six-joint camera chain: orbit samples, every analytic branch
+    (``arm_ik``), the winding and branch nearest the reference inside the joint window."""
 
-    label = 'analytic IK (ssik)'
-
-    def __init__(self, analytic, lower, upper, limits=ViewLimits(), margin=JOINT_LIMIT_MARGIN_RAD):
-        self.analytic = analytic
+    def __init__(self, solver, lower, upper, limits=ViewLimits(), margin=JOINT_LIMIT_MARGIN_RAD):
+        self.solver = solver
+        self.kind = solver.kind
+        self.info = dict(getattr(solver, 'info', {}) or {})
+        self.label = f'analytic IK ({self.kind})'
         self.limits = limits
         self.lower = np.asarray(lower, float) + margin
         self.upper = np.asarray(upper, float) - margin
 
     @classmethod
-    def create(cls, urdf, base, effector, names, lower, upper, effector_fk, limits=ViewLimits()):
-        """Planner, or None without ssik or when the chain disagrees with ``effector_fk``."""
+    def build(cls, kind, urdf, base, effector, names, lower, upper, effector_fk, limits=ViewLimits()):
+        """The pool for ``kind`` on base -> effector; raises ViewPoolUnavailable saying why
+        (no URDF, arm_ik missing, unsupported chain, native backend missing, joint order
+        or FK disagreeing with the runner's ``effector_fk``)."""
+        kind = normalize_ik_backend(kind)
+        if kind == 'service':
+            raise ViewPoolUnavailable("ik_backend 'service' has no analytic view pool")
         if not urdf:
-            return None
+            raise ViewPoolUnavailable('no robot_description')
         try:
-            from hand_teleop.analytic_ik import AnalyticIK
-        except ImportError:
+            from arm_ik import NativeUnavailable, UnsupportedChain, make_solver
+        except ImportError as exc:
+            raise ViewPoolUnavailable(f'arm_ik is not installed ({exc})') from exc
+        try:
+            solver = make_solver(kind, urdf, base, effector)
+        except NativeUnavailable as exc:
+            raise ViewPoolUnavailable(f'{kind} native backend unavailable: {exc}') from exc
+        except UnsupportedChain as exc:
+            raise ViewPoolUnavailable(f'{kind} does not support {base} -> {effector}: {exc.reason}') from exc
+        except (ValueError, ImportError) as exc:
+            raise ViewPoolUnavailable(f'{kind} solver for {base} -> {effector} failed: {exc}') from exc
+        if list(solver.joint_names) != list(names):
+            raise ViewPoolUnavailable(f'{kind} chain joints {list(solver.joint_names)} differ from the robot joints '
+                                      f'{list(names)}')
+        lower, upper = np.asarray(lower, float), np.asarray(upper, float)
+        span = np.minimum(upper, np.pi) - np.maximum(lower, -np.pi)
+        probes = [(lower + upper) / 2] + [np.maximum(lower, -np.pi) + f * span for f in (.27, .71)]
+        for probe in probes:
+            if not np.allclose(solver.fk(probe), effector_fk(probe), atol=FK_CHECK_TOLERANCE):
+                raise ViewPoolUnavailable(f'{kind} chain FK disagrees with the effector FK at q={np.round(probe, 3)}')
+        return cls(solver, lower, upper, limits)
+
+    @classmethod
+    def create(cls, urdf, base, effector, names, lower, upper, effector_fk, limits=ViewLimits(),
+               kind=DEFAULT_IK_BACKEND):
+        """``build``, or None when the pool is unavailable."""
+        try:
+            return cls.build(kind, urdf, base, effector, names, lower, upper, effector_fk, limits)
+        except ViewPoolUnavailable:
             return None
-        analytic = AnalyticIK.from_urdf(urdf, base, effector)
-        if analytic is None or list(analytic.joint_names) != list(names):
-            return None
-        probe = (np.asarray(lower, float) + np.asarray(upper, float)) / 2
-        if not np.allclose(analytic.fk(probe), effector_fk(probe), atol=1e-6):
-            return None
-        return cls(analytic, lower, upper, limits)
+
+    def describe(self):
+        """One log line: solver kind and its info (family, native backend, model tolerance)."""
+        info = ', '.join(f'{k}={v}' for k, v in self.info.items() if k not in ('rr_cache_path',))
+        return (f'{self.label}: {self.solver.base} -> {self.solver.tip}, model tolerance '
+                f'{self.solver.model_tolerance_m * 1000:.3g} mm ({info})')
+
+    def solve(self, effectors, initial, lo, hi):
+        """Per effector pose (N, 4, 4): the in-window solution nearest ``initial``
+        (smallest largest joint change, winding nearest the reference) or None."""
+        from arm_ik import windings
+        solver = self.solver
+        out = []
+        for Q in solver.ik_many(effectors):
+            if not len(Q):
+                out.append(None)
+                continue
+            W = windings.nearest_winding(Q, initial, solver.lower, solver.upper)
+            W = W[np.isfinite(W).all(axis=1)]
+            W = W[np.all(W >= lo, axis=1) & np.all(W <= hi, axis=1)]
+            out.append(W[int(np.argmin(np.max(np.abs(W - initial), axis=1)))] if len(W) else None)
+        return out
 
     def pool(self, board, center, estimate, framing, reference, max_excursion, initial, rng, wanted,
              check=lambda: None):
         """[(joints, effector_pose)]: framed (13 % margin) camera poses inside the
-        shared limits, reachable inside the joint window (nearest branch)."""
+        shared limits, reachable inside the joint window (nearest branch). The pose is
+        the chain FK of the joints (within the solver's model tolerance of the target)."""
         initial = np.asarray(initial, float)
         lo, hi = joint_window_bounds(initial, self.lower, self.upper, self.limits)
         if np.any(lo >= hi):   # reference outside the limit margin
             return [], 0
         mount = np.linalg.inv(estimate)
-        # ssik needs an exact rotation (a rounded mount made every target unsolvable).
+        # Analytic IK needs an exact rotation (a rounded mount made every ssik target unsolvable).
         mount[:3, :3] = R.from_matrix(mount[:3, :3]).as_matrix()
         found, sampled = [], 0
         while len(found) < wanted and sampled < MAX_CANDIDATES:
             cameras = orbit_camera_poses(reference, center, rng, BATCH, self.limits)
             keep = view_filter(cameras, reference, center, board, max_excursion, self.limits)
-            for camera in cameras[keep]:
-                if not framing.contains(np.linalg.inv(camera) @ board, margin=.13):
-                    continue
-                effector = camera @ mount
-                solutions = [q for q in self.analytic.ik(effector) if np.all(q >= lo) and np.all(q <= hi)]
-                if solutions:
-                    found.append((min(solutions, key=lambda q: np.max(np.abs(q - initial))), effector))
+            framed = [camera for camera in cameras[keep]
+                      if framing.contains(np.linalg.inv(camera) @ board, margin=.13)]
+            if framed:
+                solutions = self.solve(np.array(framed) @ mount, initial, lo, hi)
+                Q = np.array([q for q in solutions if q is not None])
+                if len(Q):
+                    rotations, positions = self.solver.fk_many(Q)
+                    for q, rotation, position in zip(Q, rotations, positions):
+                        effector = np.eye(4)
+                        effector[:3, :3], effector[:3, 3] = rotation, position
+                        found.append((q, effector))
             sampled += BATCH
             check()
         return found, sampled

@@ -22,6 +22,7 @@ import yaml
 
 CURRENT = 'current.yaml'
 FEMTO_HANDEYE = 'femto_bolt_handeye'
+GEMINI_HANDEYE = 'gemini_336l_handeye'  # PiPER welding gun + Orbbec Gemini 336L
 WELDING_GUN_TCP = 'welding_gun_tcp'
 # FANUC CRX (robot crx10ia_l / crx10ia): wrist camera mounts and the welding TCP.
 CRX_FEMTO_HANDEYE = FEMTO_HANDEYE

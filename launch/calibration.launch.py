@@ -66,6 +66,7 @@ def _launch_calibration_setup(context, *_args, **_kwargs):
             {'auto_max_arm_joint_change_deg': float(lc['auto_max_arm_joint_change_deg'])},
             {'auto_max_wrist_joint_change_deg': float(lc['auto_max_wrist_joint_change_deg'])},
             {'auto_view_motion_tolerance': float(lc['auto_view_motion_tolerance'])},
+            {'ik_backend': lc['ik_backend']},
             {'camera_latency_s': float(lc['camera_latency_s'])},
             {'solver': lc['solver']},
             {'acceptance_mode': lc['acceptance_mode']},
@@ -175,6 +176,9 @@ def generate_launch_description():
                 default_value='false',
                 description='true only when using Gazebo/sim and /clock is published; false for real robots',
             ),
+            DeclareLaunchArgument('ik_backend', default_value='ssik',
+                                  description="Analytic IK of the six-joint view pool (arm_ik): eaik (UR), ssik (CRX), "
+                                              "closed_form (PiPER); 'service' = no analytic pool (local sampler)"),
             DeclareLaunchArgument('auto_group', default_value='', description='MoveIt group; empty discovers the group matching the robot chain'),
             DeclareLaunchArgument('auto_controller', default_value='', description='FollowJointTrajectory action; empty discovers the active chain controller'),
             DeclareLaunchArgument('auto_enabled', default_value='auto', description='Enable automatic eye-in-hand calibration'),

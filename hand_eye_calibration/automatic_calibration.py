@@ -90,7 +90,10 @@ class AutomaticCalibration:
                            'auto_heartbeat_timeout_s': 0.0, 'auto_max_camera_excursion_m': 0.30,
                            'auto_max_view_tilt_deg': 35.0, 'auto_max_view_roll_deg': 45.0,
                            'auto_max_arm_joint_change_deg': 45.0, 'auto_max_wrist_joint_change_deg': 60.0,
-                           'auto_view_motion_tolerance': 0.0}.items():
+                           'auto_view_motion_tolerance': 0.0,
+                           # Analytic IK of the six-joint camera view pool (view_pool, arm_ik):
+                           # 'eaik' UR, 'ssik' CRX (default), 'closed_form' PiPER, 'service' none.
+                           'ik_backend': 'ssik'}.items():
             node.declare_parameter(key, value)
         # Held-out views collected after the training set; never used in the fit.
         self.intrinsic_return_to_base = bool(node.get_parameter('intrinsic_return_to_base').value)
@@ -268,6 +271,8 @@ class AutomaticCalibration:
                 or not 0 <= view_limits.selection_tolerance < 1):
             raise ValueError('Invalid automatic calibration view limits.')
         self.view_limits = view_limits
+        from .view_pool import normalize_ik_backend
+        self.ik_backend = normalize_ik_backend(node.get_parameter('ik_backend').value)
         self.validation_views, self.max_camera_excursion = validation_views, max_camera_excursion
         self.max_position_sigma = max_position_sigma
         self.min_training_samples, self.max_training_samples = min_training_samples, max_training_samples

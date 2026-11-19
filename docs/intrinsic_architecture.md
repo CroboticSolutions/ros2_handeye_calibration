@@ -25,8 +25,10 @@ are not used. See `THIRD_PARTY_NOTICES.md` and `LICENSE.intrinsic`.
    information, compute the initial joint pose estimate. Reject it for planning
    if maximum pose error exceeds 10 mm or 6°.
 5. Freeze that planning estimate. Collect 12 main poses (`auto_min_training_samples`)
-   from the view pool (`view_pool.py`: ssik for a six-joint camera chain, sampled
-   joints + FK for a camera before the last joint; no ssik → error before motion;
+   from the view pool (`view_pool.py`: analytic IK from `arm_ik` for a six-joint camera
+   chain, kind from the node parameter `ik_backend` — `eaik` UR, `ssik` CRX and default,
+   `closed_form` PiPER, `service` = no analytic pool, local sampler; sampled
+   joints + FK for a camera before the last joint; solver unavailable → error before motion;
    the local box of half-size 60/60/40 mm with tilts ±15°/±15°/±35° only when the
    pool runs out). Limits, the same on every robot and relative to the start view:
    optical-axis tilt ≤ `auto_max_view_tilt_deg` (35°), roll about it ≤

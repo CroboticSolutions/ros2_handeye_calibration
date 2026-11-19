@@ -10,7 +10,8 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
 from .visibility import BoardFraming, CameraKinematics
-from .view_pool import AnalyticIKViews, POOL_PER_VIEW, ViewLimits, joint_window_bounds, select_view, shortest_route
+from .view_pool import (AnalyticIKViews, POOL_PER_VIEW, ViewLimits, ViewPoolUnavailable, joint_window_bounds,
+                        normalize_ik_backend, select_view, shortest_route)
 from .joint_space_views import JointSpaceViews
 from .motion_planning import SAMPLER_JOINT_MARGIN_RAD
 from . import intrinsic_solver as solver
@@ -72,21 +73,35 @@ class IntrinsicSession:
         # Camera before the last joint (Piper on link5): fewer than six joints move it, so
         # arbitrary 6-D targets are unreachable; views come from sampled joints instead.
         self.underactuated=sum(kind!='fixed' for _,_,kind,_ in getattr(self.fk,'chain',[(0,0,'revolute',0)]*6))<6
-        # Main/validation views (view_pool): every ssik branch for a six-joint camera chain,
-        # sampled joints + FK for a camera before the last joint (joint_space_views); both
-        # under the same ViewLimits. Without a chain (no URDF), the local random sampler.
+        # Main/validation views (view_pool): every analytic IK branch (arm_ik, kind from the
+        # node parameter ik_backend, default ssik) for a six-joint camera chain, sampled
+        # joints + FK for a camera before the last joint (joint_space_views); both under
+        # the same ViewLimits. Without a chain (no URDF) or with ik_backend 'service', the
+        # local random sampler.
         self.limits=getattr(runner,'view_limits',None) or ViewLimits()
-        self.view_pool=None
+        self.view_pool=None;self.no_pool_reason=None
+        backend=normalize_ik_backend(getattr(runner,'ik_backend',None))
+        log=self.n.get_logger() if hasattr(self.n,'get_logger') else None
+        chain=f'{self.n.robot_base_frame} -> {self.n.robot_effector_frame}'
         if self.underactuated and hasattr(self.fk,'chain'):
             self.view_pool=JointSpaceViews(self.fk,runner.names,runner.lower,runner.upper,self.limits)
+            if log:log.info(f'Hand-eye view pool: {self.view_pool.label} for {chain} (camera before the '
+                            f'last joint: no 6-D IK; ik_backend {backend} not used)')
         elif not self.underactuated and getattr(runner,'robot_description',None):
-            self.view_pool=AnalyticIKViews.create(
-                runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
-                runner.names,runner.lower,runner.upper,self.fk.camera,self.limits)
-            if self.view_pool is None:
-                raise ValueError(f'Analytic IK (ssik) is unavailable for {self.n.robot_base_frame} -> '
-                                 f'{self.n.robot_effector_frame} (pip install ssik==8.2.0, or the URDF chain '
-                                 'disagrees with the joint names); no motion sent')
+            if backend=='service':
+                self.no_pool_reason="ik_backend 'service': no analytic view pool"
+                if log:log.warning(f'Hand-eye view pool: none for {chain} ({self.no_pool_reason}); '
+                                   'local random sampler with numeric camera IK')
+            else:
+                try:
+                    self.view_pool=AnalyticIKViews.build(
+                        backend,runner.robot_description,self.n.robot_base_frame,self.n.robot_effector_frame,
+                        runner.names,runner.lower,runner.upper,self.fk.camera,self.limits)
+                except ViewPoolUnavailable as exc:
+                    raise ValueError(f'Analytic IK ({backend}) is unavailable for {chain}: {exc} '
+                                     '(set ik_backend to a kind that fits this robot: eaik UR, ssik CRX, '
+                                     'closed_form PiPER); no motion sent') from exc
+                if log:log.info(f'Hand-eye view pool: {self.view_pool.describe()}')
         self.pool_left={}
         self.initial=self.r.joint_positions().copy()
         self.views=[];self.validation=[];self.estimate=None;self.board=None
@@ -285,7 +300,7 @@ class IntrinsicSession:
             if collected<count:
                 self.local_sampler_warning(f'View pool exhausted at {collected}/{count} {phase} views')
         else:
-            self.local_sampler_warning('No wide view pool for this robot chain')
+            self.local_sampler_warning(getattr(self,'no_pool_reason',None) or 'No wide view pool for this robot chain')
         while collected<count and tries<count*20:
             self.r.check();tries+=1
             desired=random_camera_pose(reference,center,self.rng,np.array([.06,.06,.04]))

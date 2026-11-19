@@ -11,6 +11,12 @@ above the spike, and quantitatively as the validation residual.
 Execution reuses the automatic hand-eye trajectory safety: MoveIt collision
 checks on every segment, speed/acceleration caps, controller cancel on stop,
 optional operator heartbeat.
+
+``tcp_motion_ik`` selects the IK of the move: 'moveit' (default) is the Cartesian
+request above (numeric KDL IK); 'analytic' (experimental, off by default) solves the
+same waypoints densified about the tip with arm_ik (kind from ``ik_backend``),
+joint-continuous via ``solver.nearest``, every state checked with GetStateValidity
+(``tcp_analytic_path``).
 """
 import copy
 import threading
@@ -33,7 +39,13 @@ from std_msgs.msg import String
 
 from .automatic_calibration import AutomaticCalibration, Stopped
 from .robot_configuration import chain_joints, matching_controller, matching_group
-from . import tcp_quality
+from . import tcp_analytic_path, tcp_quality
+from .view_pool import normalize_ik_backend
+
+
+def rotation_angle(R_a, R_b):
+    """Angle (rad) between two rotation matrices."""
+    return float(np.arccos(np.clip((np.trace(np.asarray(R_a).T @ np.asarray(R_b)) - 1) / 2, -1.0, 1.0)))
 
 
 class TcpMotion:
@@ -46,8 +58,12 @@ class TcpMotion:
     joint_positions = AutomaticCalibration.joint_positions
 
     def __init__(self, node, base_frame, flange_frame, group='', controller='', check_collisions=True,
-                 heartbeat_timeout=0.0):
+                 heartbeat_timeout=0.0, motion_ik='moveit', ik_backend='ssik'):
         self.node = node
+        self.motion_ik = tcp_analytic_path.normalize_tcp_motion_ik(motion_ik)
+        self.ik_backend = normalize_ik_backend(ik_backend)
+        self.urdf = None
+        self.solver = None
         self.base_frame, self.flange_frame = base_frame, flange_frame
         self.group_param, self.controller_param = group, controller
         self.check_collisions = bool(check_collisions)
@@ -112,7 +128,8 @@ class TcpMotion:
         if not self.description.wait_for_service(timeout_sec=2):
             raise RuntimeError('Robot description is unavailable.')
         urdf = self.wait(self.description.call_async(GetParameters.Request(names=['robot_description'])), 3)
-        root = ET.fromstring(urdf.values[0].string_value)
+        self.urdf = urdf.values[0].string_value
+        root = ET.fromstring(self.urdf)
         self.names = chain_joints(root, self.base_frame, self.flange_frame)
         limits = [root.find(f"joint[@name='{n}']/limit") for n in self.names]
         if any(limit is None for limit in limits):
@@ -176,6 +193,86 @@ class TcpMotion:
                 setattr(point, field, [values[i] for i in order])
         return trajectory
 
+    def analytic_solver(self):
+        """arm_ik solver (kind ``ik_backend``) for base -> flange, built once and logged."""
+        if self.solver is not None:
+            return self.solver
+        if self.ik_backend == 'service':
+            raise RuntimeError("tcp_motion_ik 'analytic' needs an analytic ik_backend (eaik, ssik, closed_form), "
+                               "not 'service'; no motion was sent.")
+        from arm_ik import NativeUnavailable, UnsupportedChain, make_solver
+        chain = f'{self.base_frame} -> {self.flange_frame}'
+        try:
+            solver = make_solver(self.ik_backend, self.urdf, self.base_frame, self.flange_frame)
+        except UnsupportedChain as exc:
+            raise RuntimeError(f'Analytic IK ({self.ik_backend}) does not support {chain}: {exc.reason}; '
+                               'no motion was sent.') from exc
+        except (NativeUnavailable, ValueError, ImportError) as exc:
+            raise RuntimeError(f'Analytic IK ({self.ik_backend}) for {chain} failed: {exc}; no motion was sent.') from exc
+        if list(solver.joint_names) != list(self.names):
+            raise RuntimeError(f'Analytic IK chain joints {solver.joint_names} differ from {self.names}; '
+                               'no motion was sent.')
+        self.node.get_logger().info(
+            f'TCP reorientation: analytic IK {solver.kind} for {chain}, model tolerance '
+            f'{solver.model_tolerance_m * 1000:.3g} mm, info {solver.info}')
+        self.solver = solver
+        return solver
+
+    def state_valid(self, q, feedback):
+        req = GetStateValidity.Request()
+        req.group_name = self.move_group
+        req.robot_state.is_diff = True  # retain attached tools from the scene
+        req.robot_state.joint_state = copy.deepcopy(feedback)
+        values = dict(zip(self.names, q))
+        req.robot_state.joint_state.position = [float(values.get(n, p)) for n, p in zip(feedback.name, feedback.position)]
+        result = self.wait(self.validity.call_async(req), 3)
+        return result is not None and result.valid
+
+    def plan_analytic(self, current_flange, phases, tcp_translation, speed_scale=0.1):
+        """Timed JointTrajectory through the flange waypoint ``phases`` (lift, rotate,
+        descend) with analytic IK; raises before any motion when a pose is unreachable,
+        a joint would jump, or a state is invalid in the MoveIt scene."""
+        from rclpy.duration import Duration
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+        solver = self.analytic_solver()
+        if not self.validity.wait_for_service(timeout_sec=2):
+            raise RuntimeError('MoveIt /check_state_validity is unavailable; no motion was sent.')
+        feedback = copy.deepcopy(self.joints)
+        start = self.joint_positions()
+        # The URDF chain must agree with the measured flange (TF): same frames, same model.
+        measured = tcp_analytic_path.pose_matrix(current_flange)
+        model = solver.fk(start)
+        if (np.linalg.norm(model[:3, 3] - measured[:3, 3]) > 1e-3
+                or rotation_angle(model[:3, :3], measured[:3, :3]) > np.deg2rad(0.5)):
+            raise RuntimeError('URDF chain FK disagrees with the measured flange pose; no motion was sent.')
+        joint_phases, previous_pose, q = [], np.asarray(current_flange, float), start
+        for waypoints in phases:
+            if not len(waypoints):
+                continue
+            poses = tcp_analytic_path.dense_flange_poses(previous_pose, waypoints, tcp_translation)
+            path = tcp_analytic_path.solve_continuous(solver, poses, q)
+            joint_phases.append(path)
+            previous_pose, q = np.asarray(waypoints[-1], float), path[-1]
+        states = [p for phase in joint_phases for p in phase[1:]]
+        self.update('planning', f'Checking {len(states)} analytic IK states in the MoveIt scene.')
+        for i, state in enumerate(states):
+            self.check()
+            if not self.state_valid(state, feedback):
+                raise RuntimeError(f'Analytic reorientation state {i + 1}/{len(states)} is in collision or invalid '
+                                   'in the MoveIt scene; no motion was sent.')
+        scale = max(.01, min(1., float(speed_scale)))
+        times, positions, velocities, accelerations = tcp_analytic_path.timed_phases(
+            joint_phases, np.minimum(scale * self.velocity_limits, .18), .36 * scale)
+        trajectory = JointTrajectory()
+        trajectory.joint_names = list(self.names)
+        for t, p, v, a in zip(times, positions, velocities, accelerations):
+            point = JointTrajectoryPoint()
+            point.positions, point.velocities, point.accelerations = (list(map(float, p)), list(map(float, v)),
+                                                                      list(map(float, a)))
+            point.time_from_start = Duration(seconds=float(t)).to_msg()
+            trajectory.points.append(point)
+        return trajectory
+
     # -- one reorientation step ------------------------------------------------
     def run_step(self, current_flange, target_quat, tcp_translation, spike_point, spike_axis,
                  clearance, standoff, on_done):
@@ -192,19 +289,20 @@ class TcpMotion:
                 tip_current = np.asarray(current_flange[:3]) + Rotation.from_quat(R_now).apply(t)
                 high = spike + clearance * n
                 low = spike + standoff * n
-                waypoints = []
                 # 1. lift the tip straight up to the clearance height (keep orientation)
                 lift_from = max(float((tip_current - spike) @ n), standoff)
-                for s in np.linspace(0, 1, 4)[1:]:
-                    tip = spike + (lift_from + s * (clearance - lift_from)) * n
-                    waypoints.append(tip_now(tip, R_now, t))
+                lift = [tip_now(spike + (lift_from + s * (clearance - lift_from)) * n, R_now, t)
+                        for s in np.linspace(0, 1, 4)[1:]]
                 # 2. rotate about the tip at clearance height
-                waypoints += tcp_quality.tip_preserving_waypoints(R_now, target_quat, high, t, steps=10)
+                rotate = tcp_quality.tip_preserving_waypoints(R_now, target_quat, high, t, steps=10)
                 # 3. descend to the stand-off
-                for s in np.linspace(0, 1, 4)[1:]:
-                    waypoints.append(tip_now(high + s * (low - high), target_quat, t))
-                self.update('planning', 'Planning the reorientation path with MoveIt.')
-                trajectory = self.plan_cartesian(waypoints)
+                descend = [tip_now(high + s * (low - high), target_quat, t) for s in np.linspace(0, 1, 4)[1:]]
+                if self.motion_ik == 'analytic':
+                    self.update('planning', f'Planning the reorientation path with analytic IK ({self.ik_backend}).')
+                    trajectory = self.plan_analytic(np.asarray(current_flange, float), [lift, rotate, descend], t)
+                else:
+                    self.update('planning', 'Planning the reorientation path with MoveIt.')
+                    trajectory = self.plan_cartesian(lift + rotate + descend)
                 self.update('moving', 'Moving slowly to the reoriented pose above the spike.')
                 self.move_planned(trajectory)
                 self.update('done', f'At the reoriented pose, tip {standoff * 1000:.0f} mm above the spike. '

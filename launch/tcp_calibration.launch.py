@@ -35,6 +35,7 @@ def _launch_tcp_calibration_setup(context, *_args, **_kwargs):
             {'cad_axis_angle_deg': float(lc['cad_axis_angle_deg'])},
             {'acceptance_mode': lc['acceptance_mode']},
             {'dataset_dir': os.path.expanduser(lc['dataset_dir'])},
+            {'ik_backend': lc['ik_backend']},
         ],
     )
     return [pivot_node]
@@ -98,6 +99,9 @@ def generate_launch_description():
                                   description='Nominal torch-neck angle vs flange Z; <0 disables the CAD check'),
             DeclareLaunchArgument('acceptance_mode', default_value='enforce'),
             DeclareLaunchArgument('dataset_dir', default_value='~/.ros/tool_tcp_calibration_runs'),
+            DeclareLaunchArgument('ik_backend', default_value='ssik',
+                                  description="arm_ik kind for the experimental node param tcp_motion_ik:=analytic: eaik (UR), ssik (CRX), "
+                                              'closed_form (PiPER)'),
             OpaqueFunction(function=_launch_tcp_calibration_setup),
         ]
     )

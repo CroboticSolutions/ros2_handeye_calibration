@@ -125,6 +125,11 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         self.declare_parameter('auto_controller', '')
         self.declare_parameter('auto_check_collisions', True)
         self.declare_parameter('motion_heartbeat_timeout_s', 0.0)
+        # IK of the reorientation move: 'moveit' (default, /compute_cartesian_path) or
+        # 'analytic' (experimental, off until validated: arm_ik kind from ik_backend,
+        # 'eaik' UR, 'ssik' CRX, 'closed_form' PiPER; tcp_analytic_path).
+        self.declare_parameter('tcp_motion_ik', 'moveit')
+        self.declare_parameter('ik_backend', 'ssik')
 
         self.robot_base_frame = str(self.get_parameter('robot_base_frame').value)
         self.robot_flange_frame = str(self.get_parameter('robot_flange_frame').value)
@@ -157,7 +162,12 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
             group=str(self.get_parameter('auto_group').value),
             controller=str(self.get_parameter('auto_controller').value),
             check_collisions=bool(self.get_parameter('auto_check_collisions').value),
-            heartbeat_timeout=float(self.get_parameter('motion_heartbeat_timeout_s').value))
+            heartbeat_timeout=float(self.get_parameter('motion_heartbeat_timeout_s').value),
+            motion_ik=str(self.get_parameter('tcp_motion_ik').value),
+            ik_backend=str(self.get_parameter('ik_backend').value))
+        if self.motion.motion_ik != 'moveit':
+            self.get_logger().warning(f'TCP reorientation uses EXPERIMENTAL analytic IK ({self.motion.ik_backend}) '
+                                      'instead of the MoveIt Cartesian path (tcp_motion_ik).')
         self.reorient_index = 0
 
         # Separate from the TransformListener's default group: TF updates must

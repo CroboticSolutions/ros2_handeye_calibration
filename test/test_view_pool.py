@@ -1,4 +1,4 @@
-"""View pool for automatic hand-eye acquisition: ssik on PiPER and CRX, shared limits."""
+"""View pool for automatic hand-eye acquisition: arm_ik ssik (default) on PiPER and CRX, shared limits."""
 import itertools
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -8,10 +8,11 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+pytest.importorskip('arm_ik')
 pytest.importorskip('ssik')
 from hand_eye_calibration.view_pool import (  # noqa: E402
     DISTANCE_SCALE, JOINT_LIMIT_MARGIN_RAD, MIN_ELEVATION_DEG, WRIST_CLEAR_RAD, AnalyticIKViews, ViewLimits,
-    joint_window_bounds, orbit_camera_poses, select_view, shortest_route, tilt_and_roll, weakest_observability)
+    ViewPoolUnavailable, joint_window_bounds, orbit_camera_poses, select_view, shortest_route, tilt_and_roll, weakest_observability)
 from hand_eye_calibration.visibility import BoardFraming, CameraKinematics  # noqa: E402
 
 URDF = (Path(__file__).resolve().parents[3] / 'robots/piper_ros/src/robot_description/'
@@ -205,18 +206,36 @@ def _session_runner(monkeypatch):
 def test_session_uses_analytic_views_with_the_runner_limits(monkeypatch):
     acquisition, r = _session_runner(monkeypatch)
     seen = {}
-    monkeypatch.setattr(AnalyticIKViews, 'create',
-                        classmethod(lambda cls, *a, **kw: seen.setdefault('limits', a[-1]) and 'pool'))
+    pool = NS(describe=lambda: 'analytic IK (ssik)', label='analytic IK (ssik)')
+    monkeypatch.setattr(AnalyticIKViews, 'build',
+                        classmethod(lambda cls, kind, *a, **kw: seen.update(kind=kind, limits=a[-1]) or pool))
     r.view_limits = ViewLimits(max_tilt_deg=20.)
-    assert acquisition.IntrinsicSession(r, None).view_pool == 'pool'
+    assert acquisition.IntrinsicSession(r, None).view_pool is pool
     assert seen['limits'].max_tilt_deg == 20.
+    assert seen['kind'] == 'ssik'                        # default without ik_backend
+    r.ik_backend = 'eaik'
+    acquisition.IntrinsicSession(r, None)
+    assert seen['kind'] == 'eaik'
+    r.ik_backend = 'analytic'                            # deprecated alias
+    acquisition.IntrinsicSession(r, None)
+    assert seen['kind'] == 'ssik'
+
+
+def test_session_with_service_backend_has_no_analytic_pool(monkeypatch):
+    acquisition, r = _session_runner(monkeypatch)
+    monkeypatch.setattr(AnalyticIKViews, 'build', classmethod(lambda cls, *a, **kw: pytest.fail('no pool for service')))
+    r.ik_backend = 'service'
+    session = acquisition.IntrinsicSession(r, None)
+    assert session.view_pool is None and 'service' in session.no_pool_reason
 
 
 def test_session_refuses_to_move_without_ssik(monkeypatch):
     """No silent local sampler for a six-joint chain (CRX 21.10.: sigma 2.7-6.7 mm)."""
     acquisition, r = _session_runner(monkeypatch)
-    monkeypatch.setattr(AnalyticIKViews, 'create', classmethod(lambda cls, *a, **kw: None))
-    with pytest.raises(ValueError, match='ssik'):
+    def unavailable(cls, kind, *a, **kw):
+        raise ViewPoolUnavailable(f'{kind} native backend unavailable: test')
+    monkeypatch.setattr(AnalyticIKViews, 'build', classmethod(unavailable))
+    with pytest.raises(ValueError, match=r'Analytic IK \(ssik\).*native backend unavailable.*no motion sent'):
         acquisition.IntrinsicSession(r, None)
 
 
@@ -301,7 +320,7 @@ def test_joint_window_keeps_the_wrist_side_and_the_limit_margin():
     assert lo[5] == hi[5] == .5                                 # a joint after the camera stays put
 
 
-CRX_URDF = Path(__file__).resolve().parents[3] / 'perception/hand_teleop/tests/data/crx10ia_l.urdf'
+CRX_URDF = Path(__file__).resolve().parents[3] / 'robots/arm_ik/test/data/crx10ia_l.urdf'
 CRX_NAMES = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6']
 
 
@@ -316,13 +335,14 @@ def test_analytic_views_on_the_crx_give_exact_in_window_solutions():
     lo, hi = joint_window_bounds(q0, views.lower, views.upper, views.limits)
     step = np.r_[.2, -.1, .1, .3, .2, -.4]
     target = fk.camera(q0 + step)
-    solutions = views.analytic.ik(target)
-    assert solutions
+    solutions = views.solver.ik(target)
+    assert len(solutions)
     for q in solutions:
         np.testing.assert_allclose(fk.camera(q), target, atol=1e-6)
     inside = [q for q in solutions if np.all(q >= lo) and np.all(q <= hi)]
     assert len(inside) == 1                              # the window holds one branch here
     np.testing.assert_allclose(inside[0], q0 + step, atol=1e-6)
+    np.testing.assert_allclose(views.solve(target[None], q0, lo, hi)[0], q0 + step, atol=1e-6)
     # Another chain (or a different effector FK) is refused.
     assert AnalyticIKViews.create(urdf, 'base_link', 'flange', CRX_NAMES, lower, upper,
                                   lambda q: np.eye(4)) is None

@@ -15,6 +15,10 @@ camera  The Femto origin (parent link -> camera_base_link) is not in any
         --target picks which origin is recomputed (real by default; a sim stack
         uses nominal); the other one is carried over from the active version.
         `list` and `activate <id>` show and roll back versions.
+        --camera picks the camera model: femto_bolt (default; mount
+        femto_bolt_handeye, origin to camera_base_link) or gemini_336l (mount
+        gemini_336l_handeye, origin to the driver root <prefix>_link: gemini_link
+        on the real robot, camera_link in simulation).
         The parent link is the calibration's robot_effector_frame (link5 or
         link6, picked in the GUI) and is stored as the version's parent_link,
         which the xacro mounts the camera on. Moving the camera to the other
@@ -54,17 +58,57 @@ from hand_eye_calibration.apply_gate import require_acceptance
 PIPER_URDF = '/root/arms_ws/src/robots/piper_ros/src/robot_description/piper_description/urdf'
 FEMTO_DEFAULT_YAML = f'{os.path.dirname(PIPER_URDF)}/config/calibration/femto_bolt_handeye_default.yaml'
 TCP_DEFAULT_YAML = f'{os.path.dirname(PIPER_URDF)}/config/calibration/welding_gun_tcp_default.yaml'
+GEMINI_DEFAULT_YAML = f'{os.path.dirname(PIPER_URDF)}/config/calibration/gemini_336l_handeye_default.yaml'
+GEMINI_MACRO = f'{PIPER_URDF}/include/piper_gemini_336l_handeye_macros.xacro'
 GUN_XACRO = f'{PIPER_URDF}/piper_welding_gun.urdf.xacro'
 CAMERA_BASE = 'camera_base_link'
-# Links the Femto can be mounted on (GUI hand-eye "Camera mounted on").
+# Links the Femto / Gemini can be mounted on (GUI hand-eye "Camera mounted on").
 CAMERA_PARENTS = ('link5', 'link6')
+# Welding-gun wrist cameras (robot description wrist_camera values) -> store mount.
+CAMERAS = ('femto_bolt', 'gemini_336l')
+CAMERA_MOUNTS = {'femto_bolt': calibration_store.FEMTO_HANDEYE,
+                 'gemini_336l': calibration_store.GEMINI_HANDEYE}
+_OPTICAL_SUFFIXES = ('_color_optical_frame', '_depth_optical_frame',
+                     '_left_ir_optical_frame', '_right_ir_optical_frame')
+
+
+def _xacro_parent_default(arg, gun_xacro):
+    with open(gun_xacro) as f:
+        match = re.search(rf'<xacro:arg name="{arg}" default="([^"]+)"', f.read())
+    return match.group(1) if match else 'link6'
 
 
 def femto_parent_link(gun_xacro=GUN_XACRO):
     """Fallback Femto parent declared in the welding-gun xacro, for store versions without parent_link."""
-    with open(gun_xacro) as f:
-        match = re.search(r'<xacro:arg name="femto_parent_link" default="([^"]+)"', f.read())
-    return match.group(1) if match else 'link6'
+    return _xacro_parent_default('femto_parent_link', gun_xacro)
+
+
+def camera_parent_link(camera='femto_bolt', gun_xacro=GUN_XACRO):
+    """Fallback parent link of a welding-gun camera (xacro <camera>_parent_link default)."""
+    if camera == 'femto_bolt':
+        return femto_parent_link(gun_xacro)
+    return _xacro_parent_default('gemini_parent_link', gun_xacro)
+
+
+def camera_default_yaml(camera='femto_bolt'):
+    return FEMTO_DEFAULT_YAML if camera == 'femto_bolt' else GEMINI_DEFAULT_YAML
+
+
+def camera_mount(camera='femto_bolt'):
+    if camera not in CAMERA_MOUNTS:
+        raise SystemExit(f'Unknown welding-gun camera {camera!r}; expected one of {CAMERAS}.')
+    return CAMERA_MOUNTS[camera]
+
+
+def camera_base_frame(camera, optical_frame):
+    """Frame the store origin ends on: Femto camera_base_link; Gemini the driver root
+    <prefix>_link of the optical frame's prefix (gemini_link real, camera_link sim)."""
+    if camera == 'femto_bolt':
+        return CAMERA_BASE
+    for suffix in _OPTICAL_SUFFIXES:
+        if optical_frame.endswith(suffix):
+            return optical_frame[:-len(suffix)] + '_link'
+    raise SystemExit(f'Cannot derive the Gemini root frame from optical frame {optical_frame!r}.')
 
 
 def _matrix(xyz, rpy):
@@ -107,24 +151,43 @@ def chain_from_urdf(urdf_text, child, parent):
     return out
 
 
-def nominal_inner_chain(optical_frame):
-    """camera_base_link -> optical from orbbec_description's femto_bolt macro."""
-    wrapper = ('<?xml version="1.0"?><robot xmlns:xacro="http://ros.org/wiki/xacro" name="w">'
-               '<link name="p"/><xacro:include filename="$(find orbbec_description)/urdf/femto_bolt.urdf.xacro"/>'
-               '<xacro:femto_bolt prefix="camera" parent="p" use_nominal_extrinsics="true">'
-               '<origin xyz="0 0 0" rpy="0 0 0"/></xacro:femto_bolt></robot>')
-    with tempfile.NamedTemporaryFile('w', suffix='.xacro', delete=False) as f:
-        f.write(wrapper)
-        path = f.name
+def _xacro_chain(wrapper, optical_frame, base, extra_files=()):
+    paths = []
     try:
-        urdf = subprocess.run(['xacro', path], check=True, capture_output=True, text=True, timeout=30).stdout
+        with tempfile.NamedTemporaryFile('w', suffix='.xacro', delete=False) as f:
+            f.write(wrapper)
+            paths.append(f.name)
+        paths.extend(extra_files)
+        urdf = subprocess.run(['xacro', paths[0]], check=True, capture_output=True, text=True, timeout=30).stdout
     finally:
-        os.unlink(path)
-    return chain_from_urdf(urdf, optical_frame, CAMERA_BASE)
+        for path in paths:
+            os.unlink(path)
+    return chain_from_urdf(urdf, optical_frame, base)
 
 
-def live_inner_chain(optical_frame, timeout_s=5.0):
-    """camera_base_link -> optical as the running system publishes it."""
+def nominal_inner_chain(optical_frame, camera='femto_bolt'):
+    """Camera root -> optical from the nominal camera model: camera_base_link through
+    orbbec_description's femto_bolt macro, or <prefix>_link through the PiPER Gemini macro."""
+    if camera == 'femto_bolt':
+        wrapper = ('<?xml version="1.0"?><robot xmlns:xacro="http://ros.org/wiki/xacro" name="w">'
+                   '<link name="p"/><xacro:include filename="$(find orbbec_description)/urdf/femto_bolt.urdf.xacro"/>'
+                   '<xacro:femto_bolt prefix="camera" parent="p" use_nominal_extrinsics="true">'
+                   '<origin xyz="0 0 0" rpy="0 0 0"/></xacro:femto_bolt></robot>')
+        return _xacro_chain(wrapper, optical_frame, CAMERA_BASE)
+    base = camera_base_frame(camera, optical_frame)
+    with tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False) as f:
+        yaml.safe_dump({'parent_link': 'p', 'real': {'xyz': '0 0 0', 'rpy': '0 0 0'},
+                        'nominal': {'xyz': '0 0 0', 'rpy': '0 0 0'}}, f)
+        identity = f.name
+    wrapper = ('<?xml version="1.0"?><robot xmlns:xacro="http://ros.org/wiki/xacro" name="w">'
+               f'<link name="p"/><xacro:include filename="{GEMINI_MACRO}"/>'
+               f'<xacro:piper_mount_gemini_336l_handeye default_parent_link="p" calibration_file="{identity}" '
+               f'prefix="{base[:-len("_link")]}" use_nominal_extrinsics="true"/></robot>')
+    return _xacro_chain(wrapper, optical_frame, base, extra_files=(identity,))
+
+
+def live_inner_chain(optical_frame, timeout_s=5.0, base=CAMERA_BASE):
+    """Camera root (camera_base_link / <prefix>_link) -> optical as the running system publishes it."""
     import rclpy
     from rclpy.duration import Duration
     from tf2_ros import Buffer, TransformListener
@@ -138,7 +201,7 @@ def live_inner_chain(optical_frame, timeout_s=5.0):
         while time.monotonic() < end:
             rclpy.spin_once(node, timeout_sec=0.1)
             try:
-                t = buffer.lookup_transform(CAMERA_BASE, optical_frame, rclpy.time.Time(), Duration(seconds=0.1))
+                t = buffer.lookup_transform(base, optical_frame, rclpy.time.Time(), Duration(seconds=0.1))
             except Exception:  # noqa: BLE001 - keep waiting for TF
                 continue
             q, p = t.transform.rotation, t.transform.translation
@@ -146,7 +209,7 @@ def live_inner_chain(optical_frame, timeout_s=5.0):
             m[:3, :3] = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()
             m[:3, 3] = [p.x, p.y, p.z]
             return m
-        raise SystemExit(f'TF {CAMERA_BASE} -> {optical_frame} not available; is the Femto driver running?')
+        raise SystemExit(f'TF {base} -> {optical_frame} not available; is the camera driver running?')
     finally:
         node.destroy_node()
         rclpy.shutdown()
@@ -181,14 +244,16 @@ def _metrics(data):
     }
 
 
-def camera_record(data, T_cal, calibration_yaml, base, inner_real=None, inner_nominal=None, label=None):
+def camera_record(data, T_cal, calibration_yaml, base, inner_real=None, inner_nominal=None, label=None,
+                  camera='femto_bolt'):
     """New store version: recompute the requested origins, carry the rest over from base."""
     parent = data.get('robot_effector_frame')
     record = {
         'label': label,
         'kind': 'camera_mount',
+        'camera': camera,
         'parent_link': parent,
-        'child_link': CAMERA_BASE,
+        'child_link': camera_base_frame(camera, data.get('tracking_base_frame') or ''),
         'real': dict(base['real']),
         'nominal': dict(base['nominal']),
         'updated': [],
@@ -202,7 +267,7 @@ def camera_record(data, T_cal, calibration_yaml, base, inner_real=None, inner_no
         mm, deg = _delta(base[name], record[name])
         record['delta_from_previous'][name] = {'translation_mm': round(mm, 3), 'rotation_deg': round(deg, 4)}
         record[f'inner_chain_{name}'] = {'xyz': _fmt(inner[:3, 3]), 'quat_xyzw': _fmt(Rotation.from_matrix(inner[:3, :3]).as_quat())}
-    previous_parent = base.get('parent_link') or femto_parent_link()
+    previous_parent = base.get('parent_link') or camera_parent_link(camera)
     if previous_parent != parent:
         # The carried-over origin would be relative to the old link.
         if sorted(record['updated']) != ['nominal', 'real']:
@@ -223,32 +288,41 @@ def camera_record(data, T_cal, calibration_yaml, base, inner_real=None, inner_no
     return record
 
 
-def apply_camera(calibration_yaml, target='real', inner_real=None, force=False, label=None, activate=True):
+def apply_camera(calibration_yaml, target='real', inner_real=None, force=False, label=None, activate=True,
+                 camera='femto_bolt'):
     """Write (and by default activate) a store version. Returns (calibration_id, record)."""
+    mount = camera_mount(camera)
+    default_yaml = camera_default_yaml(camera)
     data, T = load_calibration(calibration_yaml, force)
     parent = data.get('robot_effector_frame')
     if parent not in CAMERA_PARENTS or data.get('calibration_type') != 'eye-in-hand':
         raise SystemExit(f'Expected an eye-in-hand calibration relative to one of {CAMERA_PARENTS} '
-                         f'(the Femto mount links), got {parent!r}.')
+                         f'(the {camera} mount links), got {parent!r}.')
     optical = data['tracking_base_frame']
-    calibration_store.ensure_seeded(calibration_store.FEMTO_HANDEYE, FEMTO_DEFAULT_YAML)
-    base = calibration_store.active(calibration_store.FEMTO_HANDEYE, FEMTO_DEFAULT_YAML)
+    calibration_store.ensure_seeded(mount, default_yaml)
+    base = calibration_store.active(mount, default_yaml)
     if base is None:
-        raise SystemExit(f'No active Femto calibration and no default at {FEMTO_DEFAULT_YAML}.')
-    moved = (base.get('parent_link') or femto_parent_link()) != parent
+        raise SystemExit(f'No active {camera} calibration and no default at {default_yaml}.')
+    moved = (base.get('parent_link') or camera_parent_link(camera)) != parent
     real = nominal = None
     if target in ('real', 'both'):
-        real = inner_real if inner_real is not None else live_inner_chain(optical)
+        real = (inner_real if inner_real is not None
+                else live_inner_chain(optical, base=camera_base_frame(camera, optical)))
     elif moved:
         # Sim and real share the store: a sim calibration must not move the real camera.
         raise SystemExit(f'The active calibration mounts the camera on {base.get("parent_link")}, this one '
                          f'is on {parent}. Changing the mount link needs a calibration on the real robot.')
     if target in ('nominal', 'both') or moved:
-        nominal = nominal_inner_chain(optical)
-    record = camera_record(data, T, calibration_yaml, base, real, nominal, label)
-    calibration_id, _path, record = calibration_store.save_version(calibration_store.FEMTO_HANDEYE, record)
+        # The simulated chain uses the "camera" prefix, the real one the driver's.
+        nominal_optical = optical
+        if camera != 'femto_bolt':
+            prefix = camera_base_frame(camera, optical)[:-len('_link')]
+            nominal_optical = 'camera' + optical[len(prefix):]
+        nominal = nominal_inner_chain(nominal_optical, camera)
+    record = camera_record(data, T, calibration_yaml, base, real, nominal, label, camera)
+    calibration_id, _path, record = calibration_store.save_version(mount, record)
     if activate:
-        calibration_store.activate(calibration_store.FEMTO_HANDEYE, calibration_id)
+        calibration_store.activate(mount, calibration_id)
     return calibration_id, record
 
 
@@ -385,7 +459,7 @@ def main(argv=None):
     cam.add_argument('calibration_yaml', nargs='?', default='~/.ros/hand_eye_calibration.yaml')
     cam.add_argument('--target', choices=('real', 'nominal', 'both'), default='real',
                      help='origin to recompute: real (driver TF), nominal (simulation) or both')
-    cam.add_argument('--inner-real', help='camera_base_link->optical as "x y z qx qy qz qw" (default: live TF)')
+    cam.add_argument('--inner-real', help='camera root->optical as "x y z qx qy qz qw" (default: live TF)')
     tcp = sub.add_parser('tcp')
     tcp.add_argument('calibration_yaml', nargs='?', default='~/.ros/tool_tcp_calibration.yaml')
     tcp.add_argument('--target', choices=('real', 'sim'), default='real')
@@ -403,6 +477,9 @@ def main(argv=None):
     act.add_argument('calibration_id')
     for p in (lst, act):
         p.add_argument('--mount', choices=tuple(_MOUNTS), default='camera')
+    for p in (cam, lst, act):
+        p.add_argument('--camera', choices=CAMERAS, default='femto_bolt',
+                       help='welding-gun camera model (store mount femto_bolt_handeye / gemini_336l_handeye)')
     args = parser.parse_args(argv)
 
     if args.kind == 'camera':
@@ -413,8 +490,8 @@ def main(argv=None):
             inner[:3, :3] = Rotation.from_quat(v[3:]).as_matrix()
             inner[:3, 3] = v[:3]
         calibration_id, record = apply_camera(args.calibration_yaml, args.target, inner, args.force,
-                                              args.label, not args.no_activate)
-        _print_version(calibration_id, record, calibration_store.FEMTO_HANDEYE, not args.no_activate)
+                                              args.label, not args.no_activate, args.camera)
+        _print_version(calibration_id, record, camera_mount(args.camera), not args.no_activate)
         return 0
     if args.kind in ('tcp', 'tcp-offset'):
         if args.kind == 'tcp':
@@ -426,7 +503,7 @@ def main(argv=None):
                                                 not args.no_activate)
         _print_version(calibration_id, record, calibration_store.WELDING_GUN_TCP, not args.no_activate)
         return 0
-    mount = _MOUNTS[args.mount]
+    mount = camera_mount(args.camera) if args.mount == 'camera' else _MOUNTS[args.mount]
     if args.kind == 'list':
         for v in calibration_store.versions(mount):
             print(f'{"*" if v["active"] else " "} {v["calibrationId"]}  {v["createdUtc"]}  '
