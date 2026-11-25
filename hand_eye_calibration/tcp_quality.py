@@ -150,9 +150,13 @@ def evaluate(pivot, spans, validation, axis=None, axis_mode=False, cad_deviation
                              loo is not None and math.isfinite(loo) and loo <= limits['max_loo_shift_m'],
                              'largest TCP change when one touch is left out'))
     count = 0 if not validation else validation.get('sample_count', 0)
-    checks.append(_check('validation_samples', count, limits['min_validation_samples'],
-                         count >= limits['min_validation_samples'], 'reorientation touches (not in the fit)'))
-    if validation:
+    # Validation touches are optional: the GUI calibrates tip (+ axis) and then
+    # Save; the TCP in use is verified later with the rotation check (user,
+    # 2026-11-25). Touches that were taken still have to pass.
+    if count > 0:
+        checks.append(_check('validation_samples', count, limits['min_validation_samples'],
+                             count >= limits['min_validation_samples'], 'reorientation touches (not in the fit)'))
+    if count > 0:
         worst = validation.get('max_residual_m')
         checks.append(_check('validation_max_m', worst, limits['max_validation_m'],
                              worst is not None and worst <= limits['max_validation_m'], 'tip stays on the spike'))

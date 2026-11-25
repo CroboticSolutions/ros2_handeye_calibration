@@ -52,7 +52,13 @@ def test_gate_rejects_single_axis_set_and_accepts_diverse_validated_set():
     validation = PivotCalibrationBackend.validate_pivot(touches(3, seed=5, noise=0.0002), pivot)
     verdict = tcp_quality.evaluate(pivot, tcp_quality.rotation_spans_deg(good), validation)
     assert verdict['passed'], verdict['summary']
-    assert not tcp_quality.evaluate(pivot, tcp_quality.rotation_spans_deg(good), None)['passed']
+    # Validation touches are optional (verified later with the rotation check) ...
+    unvalidated = tcp_quality.evaluate(pivot, tcp_quality.rotation_spans_deg(good), None)
+    assert unvalidated['passed'], unvalidated['summary']
+    assert not any(c['name'].startswith('validation') for c in unvalidated['checks'])
+    # ... but touches that were taken must still be enough and keep the tip on the spike.
+    too_few = PivotCalibrationBackend.validate_pivot(touches(1, seed=5, noise=0.0002), pivot)
+    assert not tcp_quality.evaluate(pivot, tcp_quality.rotation_spans_deg(good), too_few)['passed']
 
 
 def test_bend_plane_frame_puts_x_in_the_neck_plane():
@@ -127,6 +133,14 @@ def test_node_rejects_the_first_gun_tcp_pattern_and_accepts_a_good_run(node):
     n, cal = node
     n.samples['tip'] = touches(4, axes=1, noise=0.001)
     n.sample_metadata['tip'] = [{}] * 4
+    # Default (warn): the checks are information; the TCP is saved with a warning.
+    assert n.acceptance_mode == 'warn'
+    response = n.save_calibration_cb(Trigger.Request(), Trigger.Response())
+    assert response.success and 'WARNING' in response.message
+    assert not yaml.safe_load(cal.read_text())['acceptance']['passed']
+    cal.write_text('previous: true\n')
+    # enforce: a failing fit goes to .rejected.yaml and the saved TCP stays.
+    n.acceptance_mode = 'enforce'
     response = n.save_calibration_cb(Trigger.Request(), Trigger.Response())
     assert not response.success and 'Acceptance failed' in response.message
     assert cal.read_text() == 'previous: true\n'

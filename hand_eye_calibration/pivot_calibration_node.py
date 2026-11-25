@@ -51,6 +51,7 @@ from . import tcp_quality
 from .calibration_dataset import plain
 from .charuco_touchoff_node import CHARUCO_ROUND, CharucoTouchoffMixin
 from .rotation_check_node import RotationCheckMixin
+from .continuous_pivot_node import ContinuousPivotMixin
 
 TIP_ROUND = "tip"
 # The axis-alignment round keeps the historical key "axis_ref" so the GUI
@@ -76,7 +77,7 @@ def _parse_axis(value) -> list:
     return nums
 
 
-class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
+class PivotCollector(ContinuousPivotMixin, CharucoTouchoffMixin, RotationCheckMixin, Node):
 
     def __init__(self):
         mname = "tool_tcp_calibration"
@@ -103,7 +104,9 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         self.declare_parameter('duplicate_orientation_limit_deg', 5.0)
         self.declare_parameter('max_tf_age_s', 0.25)
         # Acceptance gate (tcp_quality.DEFAULT_LIMITS); 'warn' saves anyway.
-        self.declare_parameter('acceptance_mode', 'enforce')
+        # warn: checks are reported, Save always writes the TCP and Apply is the
+        # operator's call (user, 2026-11-25). enforce: failing fits go to .rejected.yaml.
+        self.declare_parameter('acceptance_mode', 'warn')
         for key, value in tcp_quality.DEFAULT_LIMITS.items():
             self.declare_parameter('accept_' + key, value)
         self.declare_parameter('dataset_dir', os.path.expanduser('~/.ros/tool_tcp_calibration_runs'))
@@ -232,6 +235,7 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         self._preflight_logged = False
         self._init_charuco(mname)
         self._init_rotation_check(mname)
+        self._init_continuous(mname)
         self.create_timer(2.0, self._preflight_timer_cb)
         self._publish_status()
 
@@ -273,7 +277,10 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         return "position"
 
     def _publish_status(self):
-        tip_pivot = self._compute_round(TIP_ROUND)
+        # While a continuous run records, the full robust fit (~1 s per 50 poses)
+        # waits for Stop; the status carries the quick estimate instead.
+        recording = getattr(self, 'cp', None) is not None and self.cp['active']
+        tip_pivot = None if recording else self._compute_round(TIP_ROUND)
         validation_result = (
             PivotCalibrationBackend.validate_pivot(
                 self.samples[VALIDATION_ROUND], tip_pivot)
@@ -305,6 +312,7 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
         status['charuco'] = self._charuco_status()
         status['orientation_only'] = self.orientation_only
         status['rotation_check'] = self._rotation_check_status()
+        status['continuous'] = self._continuous_status()
         # Save stays possible with a fit: the node then writes the active file
         # only if acceptance passes, otherwise a .rejected.yaml candidate + dataset.
         msg = String()
@@ -425,6 +433,10 @@ class PivotCollector(CharucoTouchoffMixin, RotationCheckMixin, Node):
     def capture_point_cb(self, req: Trigger.Request, resp: Trigger.Response):
         if self.active_round == CHARUCO_ROUND:
             return self.cto_capture_cb(req, resp)
+        if self.cp['active']:
+            resp.success = False
+            resp.message = 'Continuous recording is running: press Stop first.'
+            return resp
         try:
             aggregate = self._capture_burst()
         except (TransformException, ValueError) as ex:

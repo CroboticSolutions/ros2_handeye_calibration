@@ -97,7 +97,7 @@ def generate_launch_description():
                                   description='>0: reorientation motion stops when the GUI heartbeat is silent this long'),
             DeclareLaunchArgument('cad_axis_angle_deg', default_value='35.0',
                                   description='Nominal torch-neck angle vs flange Z; <0 disables the CAD check'),
-            DeclareLaunchArgument('acceptance_mode', default_value='enforce'),
+            DeclareLaunchArgument('acceptance_mode', default_value='warn'),
             DeclareLaunchArgument('dataset_dir', default_value='~/.ros/tool_tcp_calibration_runs'),
             DeclareLaunchArgument('ik_backend', default_value='ssik',
                                   description="arm_ik kind for the experimental node param tcp_motion_ik:=analytic: eaik (UR), ssik (CRX), "
